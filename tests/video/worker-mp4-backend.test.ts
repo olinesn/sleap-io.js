@@ -211,6 +211,47 @@ describe("WorkerMp4BoxBackend getFrame", () => {
   });
 });
 
+describe("WorkerMp4BoxBackend pinned reads (embedding)", () => {
+  it("a newer demand does not cancel a pinned read", async () => {
+    const { fake, backend } = await makeReadyBackend();
+    const pinned = backend.getFrame(50, { pinned: true });
+    await tick();
+    const pinnedReq = fake.lastOfType("decode")?.reqId as number;
+
+    const ui = backend.getFrame(500); // e.g. the app showing another frame
+    await tick();
+
+    expect(
+      fake.posted.some((m) => m.type === "abort" && m.reqId === pinnedReq),
+    ).toBe(false);
+    const bmp = fakeBitmap("f50");
+    fake.emit({ type: "bitmap", reqId: pinnedReq, frame: 50, bitmap: bmp });
+    await expect(pinned).resolves.toBe(bmp);
+
+    const uiReq = fake.lastOfType("decode")?.reqId as number;
+    const bmp500 = fakeBitmap("f500");
+    fake.emit({ type: "bitmap", reqId: uiReq, frame: 500, bitmap: bmp500 });
+    await expect(ui).resolves.toBe(bmp500);
+  });
+
+  it("a pinned read does not cancel an older demand either", async () => {
+    const { fake, backend } = await makeReadyBackend();
+    const ui = backend.getFrame(50);
+    await tick();
+    const uiReq = fake.lastOfType("decode")?.reqId as number;
+
+    backend.getFrame(500, { pinned: true });
+    await tick();
+
+    expect(
+      fake.posted.some((m) => m.type === "abort" && m.reqId === uiReq),
+    ).toBe(false);
+    const bmp = fakeBitmap("f50");
+    fake.emit({ type: "bitmap", reqId: uiReq, frame: 50, bitmap: bmp });
+    await expect(ui).resolves.toBe(bmp);
+  });
+});
+
 describe("WorkerMp4BoxBackend abort", () => {
   it("posts abort and resolves when the caller's signal fires", async () => {
     const { fake, backend } = await makeReadyBackend();

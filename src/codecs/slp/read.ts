@@ -59,6 +59,10 @@ import { Embedding } from "../../model/embedding.js";
 import { LazyDataStore, LazyFrameList } from "../../model/lazy.js";
 import { buildVideoIdMap } from "../../model/video-id-map.js";
 import {
+  markNegativeFrames,
+  negativeFrameKeys,
+} from "../../model/negative-frames.js";
+import {
   type ROI,
   UserROI,
   PredictedROI,
@@ -222,22 +226,15 @@ export async function readSlp(
       formatId,
     });
 
-    // Read negative frames
+    // Read negative frames (video ids resolved like /frames', see helper)
     const negativeFramesDs = file.get("negative_frames");
     if (negativeFramesDs) {
-      const negData = normalizeStructDataset(negativeFramesDs);
-      const videoIds = negData.video_id ?? negData.video ?? [];
-      const frameIdxs = negData.frame_idx ?? [];
-      const negativeSet = new Set<string>();
-      for (let i = 0; i < frameIdxs.length; i++) {
-        negativeSet.add(`${Number(videoIds[i])}:${Number(frameIdxs[i])}`);
-      }
-      for (const frame of labeledFrames) {
-        const videoIndex = Math.max(0, videos.indexOf(frame.video));
-        if (negativeSet.has(`${videoIndex}:${frame.frameIdx}`)) {
-          frame.isNegative = true;
-        }
-      }
+      markNegativeFrames(
+        labeledFrames,
+        negativeFrameKeys(normalizeStructDataset(negativeFramesDs)),
+        framesData,
+        videos,
+      );
     }
 
     report(5); // Reading identities
@@ -521,17 +518,11 @@ export async function readSlpLazy(
       emscripten,
     );
 
-    // Read negative frames
-    const negativeFrames = new Set<string>();
+    // Read negative frames (raw video ids; the store resolves them per frame)
     const negativeFramesDs = file.get("negative_frames");
-    if (negativeFramesDs) {
-      const negData = normalizeStructDataset(negativeFramesDs);
-      const videoIds = negData.video_id ?? negData.video ?? [];
-      const frameIdxs = negData.frame_idx ?? [];
-      for (let i = 0; i < frameIdxs.length; i++) {
-        negativeFrames.add(`${Number(videoIds[i])}:${Number(frameIdxs[i])}`);
-      }
-    }
+    const negativeFrames = negativeFramesDs
+      ? negativeFrameKeys(normalizeStructDataset(negativeFramesDs))
+      : new Set<string>();
 
     const store = new LazyDataStore({
       framesData,

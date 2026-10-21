@@ -85,6 +85,12 @@ const SPAWNED_ON = 0;
 export type SlpWriteOptions = {
   embed?: boolean | string;
   restoreOriginalVideos?: boolean;
+  /**
+   * Called as frame images are read and encoded for embedding from a
+   * continuous video (`current` of `total` frames). Already-embedded videos
+   * copy their stored images in one go and don't report.
+   */
+  onProgress?: (current: number, total: number, message?: string) => void;
 };
 
 /**
@@ -553,9 +559,10 @@ function writeSlpToFileLazy(file: any, labels: Labels): void {
  *
  * Supported embed modes:
  * - `true` or `"all"` - Embed all labeled frames
- * - `"user"` - Embed only frames with user instances
+ * - `"user"` - Embed only user-labeled frames ({@link Labels.userLabeledFrames}:
+ *   user instances, negative frames, user centroids/boxes/masks/ROIs)
  * - `"suggestions"` - Embed only suggestion frames
- * - `"user+suggestions"` - Embed user instance frames and suggestion frames
+ * - `"user+suggestions"` - Embed user-labeled frames and suggestion frames
  * - `"all+suggestions"` - Embed all labeled frames AND all suggestion frames
  * - `"source"` - Restore original video paths (no embedding)
  *
@@ -1817,7 +1824,9 @@ async function writeSlpBytes(
   // Plan which videos to embed (raw-copy preserved ones + any new-embed target).
   // The plan reads raw blobs from `labels.videos` (the ORIGINAL videos), not the
   // source-mode `writeLabels` copy — but source mode never embeds (plan is null).
-  const plan = doEmbed ? await planEmbedding(labels, embedMode) : null;
+  const plan = doEmbed
+    ? await planEmbedding(labels, embedMode, options?.onProgress)
+    : null;
 
   const fs = getH5FileSystem(module);
   const file = new module.File(memPath, "w");
@@ -3631,9 +3640,21 @@ export function writeLabelTablesInPlace(
 async function planEmbedding(
   labels: Labels,
   embedMode: boolean | string,
+  onProgress?: SlpWriteOptions["onProgress"],
 ): Promise<EmbedPlan> {
   const plan: EmbedPlan = new Map();
   const isRealMode = embedMode !== false && embedMode !== "source";
+  // Progress spans every frame read from a continuous video, across videos.
+  const toEncode = labels.videos.map((video, vi) =>
+    isRealMode && video.backend && !isRawCopyable(video)
+      ? selectEmbedFrames(labels, vi, embedMode)
+      : [],
+  );
+  const progress = {
+    done: 0,
+    total: toEncode.reduce((n, frames) => n + frames.length, 0),
+    report: onProgress,
+  };
   for (let vi = 0; vi < labels.videos.length; vi++) {
     const video = labels.videos[vi];
     if (isRawCopyable(video)) {
@@ -3657,9 +3678,9 @@ async function planEmbedding(
       // overriding any codec-ish `backendMetadata.format`, or the reader would
       // mis-decode.
       const { frameData, encodedFormat } = await collectEncodedFrames(
-        labels,
-        vi,
-        embedMode,
+        video,
+        toEncode[vi],
+        progress,
       );
       if (frameData.size === 0) continue;
       const frameNumbers = [...frameData.keys()].sort((a, b) => a - b);
@@ -3822,22 +3843,16 @@ export async function buildSerializableEmbedPlan(
 }
 
 /**
- * Collect encoded frame bytes for a NEW embed of one continuous video, reading
- * each selected frame via `getFrame` + {@link frameToBytes} (the legacy path).
- * Selection mirrors the per-video body of the old `collectFramesForEmbedding`.
+ * The frame indices of video `videoIndex` whose images `embedMode` embeds,
+ * sorted. `"user"` / `"user+suggestions"` take every user-labeled frame
+ * (`isUserLabeled`: user instances, negative frames, user centroids/boxes/
+ * masks/ROIs), as sleap-io's `user_labeled_frames`.
  */
-async function collectEncodedFrames(
+function selectEmbedFrames(
   labels: Labels,
   videoIndex: number,
   embedMode: boolean | string,
-): Promise<{
-  frameData: Map<number, Uint8Array>;
-  encodedFormat: string | null;
-}> {
-  const frameData = new Map<number, Uint8Array>();
-  const video = labels.videos[videoIndex];
-  if (!video?.backend) return { frameData, encodedFormat: null };
-
+): number[] {
   const mode = embedMode === true ? "all" : String(embedMode).toLowerCase();
   const frameIndices = new Set<number>();
   // "all" and "all+suggestions" both include every labeled frame; the latter
@@ -3853,10 +3868,10 @@ async function collectEncodedFrames(
     let include = false;
     if (includeAllLabeled) {
       include = true;
-    } else if (mode === "user") {
-      include = frame.hasUserInstances;
-    } else if (mode === "user+suggestions") {
-      include = frame.hasUserInstances;
+    } else if (mode === "user" || mode === "user+suggestions") {
+      // Any user labeling — instances, negative flag, user centroids/boxes/
+      // masks/ROIs — as sleap-io's `user_labeled_frames` (slp.py embed).
+      include = frame.isUserLabeled;
     } // "suggestions": added below
     if (include) frameIndices.add(frame.frameIdx);
   }
@@ -3867,16 +3882,57 @@ async function collectEncodedFrames(
       frameIndices.add(suggestion.frameIdx);
     }
   }
+  return Array.from(frameIndices).sort((a, b) => a - b);
+}
+
+/** Read attempts per frame before giving up — a decoder may drop a read. */
+const EMBED_READ_ATTEMPTS = 3;
+
+/**
+ * Collect encoded frame bytes for a NEW embed of one continuous video, reading
+ * each of `sortedFrames` (from {@link selectEmbedFrames}) via `getFrame` +
+ * {@link frameToBytes} (the legacy path). Reads are `pinned` and retried, and a
+ * frame inside the video that still can't be read fails the save rather than
+ * leaving a package that silently lacks its image.
+ */
+async function collectEncodedFrames(
+  video: Video,
+  sortedFrames: number[],
+  progress: {
+    done: number;
+    total: number;
+    report?: SlpWriteOptions["onProgress"];
+  },
+): Promise<{
+  frameData: Map<number, Uint8Array>;
+  encodedFormat: string | null;
+}> {
+  const frameData = new Map<number, Uint8Array>();
+  if (!video?.backend) return { frameData, encodedFormat: null };
 
   // True once any frame was re-encoded from raw pixels (an ImageBitmap or
   // ImageData) — those bytes are PNG, so the recorded `format` MUST be "png".
   // A frame returned as ready-made encoded bytes (e.g. an already-embedded
   // source) is stored verbatim and does NOT flip this.
   let encodedToPng = false;
-  const sortedFrames = Array.from(frameIndices).sort((a, b) => a - b);
+  const frameCount = video.shape?.[0];
+  const unreadable: number[] = [];
   for (const frameIdx of sortedFrames) {
-    const frame = await video.getFrame(frameIdx);
-    if (!frame) continue;
+    // `pinned`: the app may keep showing other frames meanwhile, and the mp4/
+    // AVI decoders otherwise cancel an older read for the newest one.
+    let frame: Awaited<ReturnType<Video["getFrame"]>> = null;
+    for (let attempt = 0; attempt < EMBED_READ_ATTEMPTS && !frame; attempt++) {
+      frame = await video.getFrame(frameIdx, { pinned: true, prefetch: false });
+    }
+    progress.done += 1;
+    progress.report?.(progress.done, progress.total, "Embedding frames");
+    if (!frame) {
+      // A frame past the video's end has no image to embed; one inside it
+      // should — writing the package without it would silently lose it.
+      if (frameCount == null || frameIdx < frameCount)
+        unreadable.push(frameIdx);
+      continue;
+    }
     let bytes = frameToBytes(frame);
     if (!bytes) {
       // The MediaBunny/Mp4Box (and image/seq) backends return raw pixels
@@ -3891,6 +3947,18 @@ async function collectEncodedFrames(
       }
     }
     if (bytes) frameData.set(frameIdx, bytes);
+  }
+  if (unreadable.length > 0) {
+    const name = Array.isArray(video.filename)
+      ? video.filename[0]
+      : video.filename;
+    const list =
+      unreadable.slice(0, 10).join(", ") +
+      (unreadable.length > 10 ? ", …" : "");
+    throw new Error(
+      `Couldn't read ${unreadable.length} frame image(s) from "${name}" to embed ` +
+        `(frame ${list}). The package was not written.`,
+    );
   }
   return { frameData, encodedFormat: encodedToPng ? "png" : null };
 }

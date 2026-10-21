@@ -74,6 +74,8 @@ interface PendingRead {
   target: number;
   resolve: (frame: VideoFrame | null) => void;
   settled: boolean;
+  /** A `pinned` read: exempt from drop-stale. */
+  pinned: boolean;
 }
 
 export class WorkerMp4BoxBackend implements VideoBackend {
@@ -239,15 +241,18 @@ export class WorkerMp4BoxBackend implements VideoBackend {
     // seconds later against a long-moved playhead (the frame shown then mismatches
     // the labels). Settle their promises now with whatever's cached. This mirrors
     // the on-main backend's `latestRequestedFrame` drop-stale.
-    if (this.pending.size > 0) {
+    // Pinned reads (embedding) are exempt both ways: a pinned read never
+    // supersedes the others, and is never superseded itself.
+    if (!opts?.pinned && this.pending.size > 0) {
       for (const [staleId, stale] of this.pending) {
+        if (stale.pinned) continue;
         this.worker.postMessage({ type: "abort", reqId: staleId });
         if (!stale.settled) {
           stale.settled = true;
           stale.resolve(this.cache.get(stale.target) ?? null);
         }
+        this.pending.delete(staleId);
       }
-      this.pending.clear();
     }
 
     this.reqCounter += 1;
@@ -271,7 +276,12 @@ export class WorkerMp4BoxBackend implements VideoBackend {
     }
 
     const promise = new Promise<VideoFrame | null>((resolve) => {
-      this.pending.set(reqId, { target: frameIndex, resolve, settled: false });
+      this.pending.set(reqId, {
+        target: frameIndex,
+        resolve,
+        settled: false,
+        pinned: opts?.pinned === true,
+      });
     });
 
     if (opts?.signal) {

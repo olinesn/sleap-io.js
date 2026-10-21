@@ -709,6 +709,16 @@ export class Labels {
     }
   }
 
+  /**
+   * Frames with any user labeling: user instances, a negative (background)
+   * flag, or user centroids / boxes / masks / ROIs / label images. sleap-io's
+   * `user_labeled_frames` — what `embed: "user"` embeds.
+   */
+  get userLabeledFrames(): LabeledFrame[] {
+    if (this._lazyFrameList) this.materialize();
+    return this.labeledFrames.filter((f) => f.isUserLabeled);
+  }
+
   get negativeFrames(): LabeledFrame[] {
     if (this._lazyFrameList) this.materialize();
     return this.labeledFrames.filter((f) => f.isNegative);

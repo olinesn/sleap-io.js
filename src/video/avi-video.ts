@@ -210,7 +210,7 @@ export class AviVideoBackend implements VideoBackend {
 
   async getFrame(
     frameIndex: number,
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; pinned?: boolean },
   ): Promise<VideoFrame | null> {
     if (frameIndex < 0 || frameIndex >= this.frameCount) return null;
 
@@ -222,14 +222,16 @@ export class AviVideoBackend implements VideoBackend {
       return cached;
     }
 
-    this.latestRequested = frameIndex;
+    // A pinned read (embedding) neither supersedes the newest read nor bails
+    // when a newer one arrives (`GetFrameOptions.pinned`).
+    if (!opts?.pinned) this.latestRequested = frameIndex;
     if (this.mode === "mjpeg") {
       return this.enqueue(() =>
         this.decodeMjpegFrame(frameIndex, opts?.signal),
       );
     }
     return this.enqueue(() =>
-      this.decodeWebCodecsFrame(frameIndex, opts?.signal),
+      this.decodeWebCodecsFrame(frameIndex, opts?.signal, opts?.pinned),
     );
   }
 
@@ -266,6 +268,7 @@ export class AviVideoBackend implements VideoBackend {
   private async decodeWebCodecsFrame(
     target: number,
     signal?: AbortSignal,
+    pinned = false,
   ): Promise<VideoFrame | null> {
     if (!this.demuxer || !this.decoderConfig) {
       throw new Error("Backend not initialized");
@@ -308,7 +311,8 @@ export class AviVideoBackend implements VideoBackend {
         .getReader();
       for (;;) {
         // A newer request during a scrub supersedes this decode — bail early.
-        if (signal?.aborted || this.latestRequested !== target) break;
+        if (signal?.aborted || (!pinned && this.latestRequested !== target))
+          break;
         const { done, value } = await reader.read();
         if (done) break;
         decoder.decode(value);

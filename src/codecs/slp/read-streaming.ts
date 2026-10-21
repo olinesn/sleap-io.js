@@ -43,6 +43,10 @@ import { buildCentroidTuples } from "./centroids.js";
 import { LazyDataStore, LazyFrameList } from "../../model/lazy.js";
 import { buildVideoIdMap } from "../../model/video-id-map.js";
 import {
+  markNegativeFrames,
+  negativeFrameKeys,
+} from "../../model/negative-frames.js";
+import {
   Instance,
   PredictedInstance,
   type Track,
@@ -359,6 +363,9 @@ export async function readFromStreamingFile(
   report(6);
   const pointsData = await readStructDatasetStreaming(file, "points");
   const predPointsData = await readStructDatasetStreaming(file, "pred_points");
+  const negativeFrames = negativeFrameKeys(
+    await readStructDatasetStreaming(file, "negative_frames"),
+  );
 
   // Build labeled frames eagerly, or (lazy mode) wrap the columnar tables in a
   // LazyDataStore and defer LabeledFrame/Instance construction to first access.
@@ -373,8 +380,7 @@ export async function readFromStreamingFile(
         tracks,
         videos,
         formatId,
-        // The streaming reader reads no negative_frames — leave empty (matches
-        // the eager streaming build, which never sets isNegative either).
+        negativeFrames,
       })
     : undefined;
   const labeledFrames = lazyStore
@@ -389,6 +395,9 @@ export async function readFromStreamingFile(
         videos,
         formatId,
       });
+  if (labeledFrames) {
+    markNegativeFrames(labeledFrames, negativeFrames, framesData, videos);
+  }
 
   // Read identities
   report(8);

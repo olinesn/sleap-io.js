@@ -400,3 +400,98 @@ describe("Embedding a continuous (mp4-style) backend that returns raw pixels", (
     expect(idxs).toContain(7);
   });
 });
+
+describe("Embedding reads every frame (pinned, retried, never silently dropped)", () => {
+  function labelsWith(backend: unknown, frameIdxs: number[]): Labels {
+    const video = new Video({
+      filename: "external.mp4",
+      backend: backend as VideoBackend,
+    });
+    const skeleton = new Skeleton({ nodes: ["A"] });
+    return new Labels({
+      labeledFrames: frameIdxs.map(
+        (frameIdx) =>
+          new LabeledFrame({
+            video,
+            frameIdx,
+            instances: [new Instance({ points: { A: [1, 1] }, skeleton })],
+          }),
+      ),
+      videos: [video],
+      skeletons: [skeleton],
+    });
+  }
+  const pixels = () => ({
+    data: new Uint8ClampedArray(4 * 4 * 4).fill(9),
+    width: 4,
+    height: 4,
+  });
+
+  it("reads with { pinned: true } so a newer UI read can't cancel them", async () => {
+    const opts: unknown[] = [];
+    const backend = {
+      filename: "external.mp4",
+      shape: [10, 4, 4, 3],
+      async getFrame(_idx: number, o?: unknown) {
+        opts.push(o);
+        return pixels();
+      },
+    };
+    await saveSlpToBytes(labelsWith(backend, [1, 2]), { embed: "user" });
+    expect(opts).toHaveLength(2);
+    expect(
+      opts.every((o) => (o as { pinned?: boolean })?.pinned === true),
+    ).toBe(true);
+  });
+
+  it("retries a frame that comes back null, and embeds it", async () => {
+    let failsLeft = 1;
+    const backend = {
+      filename: "external.mp4",
+      shape: [10, 4, 4, 3],
+      async getFrame(idx: number) {
+        if (idx === 2 && failsLeft-- > 0) return null;
+        return pixels();
+      },
+    };
+    const bytes = await saveSlpToBytes(labelsWith(backend, [1, 2]), {
+      embed: "user",
+    });
+    const reloaded = await readSlp(new Uint8Array(bytes).buffer, {
+      openVideos: true,
+    });
+    expect(reloaded.videos[0].embeddedFrameIndices).toEqual([1, 2]);
+  });
+
+  it("fails, naming the frames, rather than writing a package missing images", async () => {
+    const backend = {
+      filename: "external.mp4",
+      shape: [10, 4, 4, 3],
+      async getFrame(idx: number) {
+        return idx === 2 ? null : pixels();
+      },
+    };
+    await expect(
+      saveSlpToBytes(labelsWith(backend, [1, 2]), { embed: "user" }),
+    ).rejects.toThrow(/frame 2/);
+  });
+
+  it("reports embedding progress", async () => {
+    const backend = {
+      filename: "external.mp4",
+      shape: [10, 4, 4, 3],
+      async getFrame() {
+        return pixels();
+      },
+    };
+    const seen: Array<[number, number]> = [];
+    await saveSlpToBytes(labelsWith(backend, [1, 2, 3]), {
+      embed: "user",
+      onProgress: (current, total) => seen.push([current, total]),
+    });
+    expect(seen.at(-1)).toEqual([3, 3]);
+    expect(seen.map(([c]) => c)).toEqual(
+      [...seen.map(([c]) => c)].sort((a, b) => a - b),
+    );
+  });
+});

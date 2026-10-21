@@ -319,8 +319,9 @@ export class LazyDataStore {
       labelImages,
       rois,
     });
-    const negKey = annKey;
-    if (this.negativeFrames.has(negKey)) {
+    // `negativeFrames` holds raw `/negative_frames` ids (copied through on a
+    // lazy save), so match on the raw `/frames` id, not the resolved index.
+    if (this.negativeFrames.has(`${rawVideoId}:${frameIndex}`)) {
       frame.isNegative = true;
     }
     return frame;

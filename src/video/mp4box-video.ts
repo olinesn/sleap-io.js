@@ -184,14 +184,16 @@ export class Mp4BoxVideoBackend implements VideoBackend {
       return bitmap;
     }
 
-    this.latestRequestedFrame = frameIndex;
+    // A pinned read (embedding) neither supersedes the newest demand read nor
+    // is dropped when a newer one arrives (`GetFrameOptions.pinned`).
+    if (!opts?.pinned) this.latestRequestedFrame = frameIndex;
     // A demand read always wins over speculative decode-ahead: abort any
     // in-flight ahead-work so this frame isn't stuck behind it (the running
     // batch bails on the signal between decode batches).
     this.aheadAbort?.abort();
 
     this.decodeQueue = this.decodeQueue.then(async () => {
-      if (this.latestRequestedFrame !== frameIndex) return;
+      if (!opts?.pinned && this.latestRequestedFrame !== frameIndex) return;
       if (opts?.signal?.aborted) return;
 
       const keyframe = this.findKeyframeBefore(frameIndex);

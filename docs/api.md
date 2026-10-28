@@ -96,7 +96,15 @@ await saveSlp(labels, "/tmp/roundtrip.slp", {
 });
 ```
 
-- `options.embed`: embed frames (`true`/`"all"`, `"user"`, `"suggestions"`, `"user+suggestions"`, or `"source"` to restore source video paths before writing).
+- `options.embed`: which frame images to embed, as Python sleap-io's `embed`:
+  - `true` / `"all"`: every labeled frame and every suggestion (`"all+suggestions"` is an alias)
+  - `"user"`: user-labeled frames (user instances, negative frames, user centroids/boxes/masks/ROIs)
+  - `"suggestions"` / `"user+suggestions"`
+  - an explicit list of `[video, frameIdx]` pairs: exactly those frames
+  - `"source"`: no images; restore source video paths before writing
+  - `false` (default): no embedding (already-embedded images are still kept)
+- `options.embedAllVideos` (default `true`, as Python's `embed_all_videos`): when embedding, a video with no frames to embed becomes an empty embedded video referencing the package (keeping its shape and source video), so the package is portable. `false` leaves such videos as external references.
+- `options.onProgress(current, total, message)`: called as frames are read (`"Embedding frames"`) and written (`"Writing frames"`). Return `false` to cancel: the save throws `ExportCancelled`.
 - `options.restoreOriginalVideos` (default `true`): keep original video paths.
 
 ### `saveSlpToBytes(labels, options)`
@@ -107,7 +115,7 @@ const bytes: Uint8Array = await saveSlpToBytes(labels, { embed: false });
 ```
 
 - `labels`: `Labels` object to serialize.
-- `options.embed`: embed frames (`true`, `false`, or dataset name).
+- `options`: the same `embed`, `embedAllVideos`, `onProgress` and `restoreOriginalVideos` options as `saveSlp`.
 - Returns `Promise<Uint8Array>`.
 
 ### `loadVideo(source, options)`

@@ -345,6 +345,27 @@ await saveSlp(labels, "output.slp", { embed: "user+suggestions" });
 
 // Restore source video references (strip embedded data)
 await saveSlp(labels, "output.slp", { embed: "source" });
+
+// Embed exactly these frames (any frames, labeled or not)
+await saveSlp(labels, "output.slp", {
+  embed: [
+    [labels.videos[0], 100],
+    [labels.videos[0], 250],
+  ],
+});
+
+// Leave videos with no frames to embed as external references
+// (by default they become empty embedded videos, as in Python sleap-io)
+await saveSlp(labels, "output.slp", { embed: "user", embedAllVideos: false });
+
+// Report progress, and cancel by returning false (throws ExportCancelled)
+await saveSlp(labels, "output.slp", {
+  embed: "user",
+  onProgress: (current, total, message) => {
+    console.log(message, current, total);
+    return !userClickedCancel;
+  },
+});
 ```
 
 ## Multi-File Loading

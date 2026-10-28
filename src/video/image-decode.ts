@@ -12,6 +12,7 @@
 
 import type { VideoFrame } from "./backend.js";
 import type { RawFrame } from "../transform/frame.js";
+import { encodePngPixels } from "./png-encode.js";
 
 /** Rasterize an opaque `ImageBitmap` to RGBA `ImageData` (OffscreenCanvas / skia). */
 export async function rasterizeBitmap(bitmap: ImageBitmap): Promise<ImageData> {
@@ -92,89 +93,46 @@ export function isImageDataLike(
 }
 
 /**
- * Encode RGBA `ImageData` to PNG bytes (`OffscreenCanvas` in browser, lazy
- * `skia-canvas` on Node). Browser-safe: never statically imports `skia-canvas`.
- * Used when embedding a frame that a backend returns as raw pixels rather than
- * pre-encoded bytes — the stored `format` for such frames MUST be "png".
+ * Encode a frame's raw pixels to PNG bytes, as Python sleap-io stores an
+ * embedded frame. Used when embedding a frame that a backend returns as pixels
+ * rather than pre-encoded bytes; the stored `format` for such frames MUST be
+ * "png". Browser-safe, pure JS.
+ *
+ * An `ImageData` (RGBA by construction, real or a plain RGBA object) is stored
+ * as a 3-channel RGB PNG: video frames have no alpha, and Python reads a PNG
+ * back with exactly the channels it stores, so an RGBA PNG would come back as
+ * a 4-channel image. A {@link RawFrame} keeps its own channel count, so
+ * {@link GrayscaleVideoBackend}'s 1-channel frame becomes a grayscale PNG. (The
+ * browser's canvas encoder isn't used: it can only write RGBA, and its
+ * `putImageData` throws on anything but a real `ImageData`.)
  */
 export async function encodeImageDataToPng(
-  img:
-    | ImageData
-    | { data: Uint8ClampedArray | Uint8Array; width: number; height: number },
+  img: ImageData | RawFrame,
 ): Promise<Uint8Array> {
-  // Browser: OffscreenCanvas + putImageData + convertToBlob.
-  if (typeof OffscreenCanvas !== "undefined") {
-    const canvas = new OffscreenCanvas(img.width, img.height);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      throw new Error("Failed to get 2D context to encode a frame to PNG");
+  const { data, width, height } = img;
+  const explicit = "channels" in img ? img.channels : undefined;
+  const pixels = width * height;
+  if (explicit === undefined && data.length === pixels * 4) {
+    const rgb = new Uint8Array(pixels * 3);
+    for (let p = 0, i = 0, o = 0; p < pixels; p++, i += 4, o += 3) {
+      rgb[o] = data[i];
+      rgb[o + 1] = data[i + 1];
+      rgb[o + 2] = data[i + 2];
     }
-    ctx.putImageData(img as unknown as ImageData, 0, 0);
-    const blob = await canvas.convertToBlob({ type: "image/png" });
-    return new Uint8Array(await blob.arrayBuffer());
+    return encodePngPixels(rgb, width, height, 3);
   }
-  // Node: skia-canvas (lazy dynamic import; never statically bundled). skia's
-  // `putImageData` requires a real skia `ImageData` (a plain object throws), so
-  // wrap the raw bytes in one (mirrors `makeImageData` in seq-video.ts).
-  // `toBuffer` returns a Buffer (a Uint8Array subclass).
-  try {
-    const sc = await import("skia-canvas");
-    const scMod = sc as unknown as {
-      Canvas: new (
-        w: number,
-        h: number,
-      ) => {
-        getContext: (t: string) => {
-          putImageData: (i: unknown, x: number, y: number) => void;
-        };
-        toBuffer: (fmt: string) => Promise<Uint8Array> | Uint8Array;
-      };
-      ImageData: new (d: Uint8ClampedArray, w: number, h: number) => ImageData;
-    };
-    const rgba =
-      img.data instanceof Uint8ClampedArray
-        ? img.data
-        : new Uint8ClampedArray(
-            img.data.buffer,
-            img.data.byteOffset,
-            img.data.byteLength,
-          );
-    const skiaImg = new scMod.ImageData(rgba, img.width, img.height);
-    const canvas = new scMod.Canvas(img.width, img.height);
-    const ctx = canvas.getContext("2d");
-    ctx.putImageData(skiaImg, 0, 0);
-    return new Uint8Array(await canvas.toBuffer("png"));
-  } catch (err) {
-    throw new Error(
-      "Encoding a raw frame to PNG requires an image encoder (a browser with " +
-        "OffscreenCanvas, or the optional `skia-canvas` package on Node). " +
-        `Original error: ${(err as Error).message}`,
-    );
-  }
+  return encodePngPixels(data, width, height, explicit ?? data.length / pixels);
 }
 
 /**
- * Encode an opaque `ImageBitmap` to PNG bytes. Browser: draw straight to an
- * `OffscreenCanvas` and `convertToBlob`. Node: rasterize via {@link
- * rasterizeBitmap} (skia) then {@link encodeImageDataToPng}. Browser-safe.
+ * Encode an opaque `ImageBitmap` to PNG bytes as Python sleap-io stores it (an
+ * RGB PNG; see {@link encodeImageDataToPng}): rasterize it (OffscreenCanvas in
+ * a browser, skia on Node), then encode. Browser-safe.
  */
 export async function encodeBitmapToPng(
   bitmap: ImageBitmap,
 ): Promise<Uint8Array> {
-  // Browser: single OffscreenCanvas — draw the bitmap, then convertToBlob.
-  if (typeof OffscreenCanvas !== "undefined") {
-    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      throw new Error("Failed to get 2D context to encode a frame to PNG");
-    }
-    ctx.drawImage(bitmap as unknown as CanvasImageSource, 0, 0);
-    const blob = await canvas.convertToBlob({ type: "image/png" });
-    return new Uint8Array(await blob.arrayBuffer());
-  }
-  // Node: rasterize (skia drawImage) to ImageData, then PNG-encode it.
-  const img = await rasterizeBitmap(bitmap);
-  return encodeImageDataToPng(img);
+  return encodeImageDataToPng(await rasterizeBitmap(bitmap));
 }
 
 /** PNG / JPEG magic-byte sniff for undecoded encoded frame bytes. */

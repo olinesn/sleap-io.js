@@ -16,9 +16,11 @@ import {
 import { RemoteIOError, isUrl, resolveUrl } from "../../io/remote.js";
 import type {
   SerializableEmbedEntry,
+  SerializableEncodeEntry,
   LabelTableUpdate,
   LabelTable,
 } from "./write.js";
+import type { EncodeFramePayload } from "./stream-embed.js";
 
 /**
  * Options for opening a streaming HDF5 file.
@@ -851,6 +853,43 @@ export class StreamingH5Writer {
     } finally {
       this.appendProgressCb = undefined;
     }
+  }
+
+  /**
+   * Streaming new-embed (see `appendEncodedVideos`): start writing
+   * `entry`'s `video{i}` group in the open DEST file. `collapseToGray` makes
+   * the worker keep one channel of each frame, as a grayscale video's reads.
+   */
+  async beginEncodedVideo(
+    entry: SerializableEncodeEntry,
+    collapseToGray: boolean,
+  ): Promise<void> {
+    await this.send("beginEncodedVideo", { entry, collapseToGray });
+  }
+
+  /**
+   * PNG-encode (in the worker) and append one frame of the video begun with
+   * {@link beginEncodedVideo}. The frame's bitmap or buffer is transferred, so
+   * the caller must not use it afterwards.
+   */
+  async appendEncodedFrame(
+    frameIdx: number,
+    frame: EncodeFramePayload,
+  ): Promise<void> {
+    const transfer: Transferable[] =
+      frame.kind === "bitmap"
+        ? [frame.bitmap]
+        : [
+            (frame.kind === "png" ? frame.bytes : frame.data)
+              .buffer as ArrayBuffer,
+          ];
+    await this.send("appendEncodedFrame", { frameIdx, frame }, transfer);
+  }
+
+  /** Finish the begun video: its frame index datasets and attributes. */
+  async endEncodedVideo(): Promise<{ framesWritten: number }> {
+    const res = await this.send("endEncodedVideo");
+    return { framesWritten: Number(res.framesWritten ?? 0) };
   }
 
   /**

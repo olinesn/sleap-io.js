@@ -44,7 +44,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import YAML from "yaml";
-import { deflate } from "pako";
+import { encodePngPixels } from "../video/png-encode.js";
 
 import { Labels } from "../model/labels.js";
 import { LabelsSet } from "../model/labels-set.js";
@@ -1515,91 +1515,7 @@ export function encodePng(
   height: number,
   compressLevel: number | null = null,
 ): Uint8Array {
-  const level =
-    compressLevel == null ? 6 : Math.min(9, Math.max(0, compressLevel));
-
-  // Filtered raw scanlines: each row prefixed with filter-type byte 0 (None).
-  const stride = width * 4;
-  const raw = new Uint8Array((stride + 1) * height);
-  for (let y = 0; y < height; y++) {
-    raw[y * (stride + 1)] = 0;
-    raw.set(
-      rgba.subarray(y * stride, y * stride + stride),
-      y * (stride + 1) + 1,
-    );
-  }
-  const compressed = deflate(raw, {
-    level: level as 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9,
-  });
-
-  const ihdr = new Uint8Array(13);
-  const dv = new DataView(ihdr.buffer);
-  dv.setUint32(0, width);
-  dv.setUint32(4, height);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // color type: RGBA
-  ihdr[10] = 0; // compression
-  ihdr[11] = 0; // filter
-  ihdr[12] = 0; // interlace
-
-  const signature = new Uint8Array([
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-  ]);
-  const chunks = [
-    signature,
-    pngChunk("IHDR", ihdr),
-    pngChunk("IDAT", compressed),
-    pngChunk("IEND", new Uint8Array(0)),
-  ];
-
-  const total = chunks.reduce((sum, c) => sum + c.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.length;
-  }
-  return out;
-}
-
-/** Build a length-prefixed, CRC32-suffixed PNG chunk. */
-function pngChunk(type: string, data: Uint8Array): Uint8Array {
-  const typeBytes = new Uint8Array([
-    type.charCodeAt(0),
-    type.charCodeAt(1),
-    type.charCodeAt(2),
-    type.charCodeAt(3),
-  ]);
-  const out = new Uint8Array(12 + data.length);
-  const dv = new DataView(out.buffer);
-  dv.setUint32(0, data.length);
-  out.set(typeBytes, 4);
-  out.set(data, 8);
-  const crcInput = new Uint8Array(4 + data.length);
-  crcInput.set(typeBytes, 0);
-  crcInput.set(data, 4);
-  dv.setUint32(8 + data.length, crc32(crcInput));
-  return out;
-}
-
-// CRC32 table (lazily built once).
-let CRC_TABLE: Uint32Array | null = null;
-function crc32(bytes: Uint8Array): number {
-  if (CRC_TABLE === null) {
-    CRC_TABLE = new Uint32Array(256);
-    for (let n = 0; n < 256; n++) {
-      let c = n;
-      for (let k = 0; k < 8; k++) {
-        c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      }
-      CRC_TABLE[n] = c >>> 0;
-    }
-  }
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
+  return encodePngPixels(rgba, width, height, 4, compressLevel);
 }
 
 // =============================================================================

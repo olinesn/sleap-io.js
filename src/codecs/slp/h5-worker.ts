@@ -8,6 +8,8 @@
  * @module
  */
 
+import { EMBED_ENCODE_WORKER_CODE } from "./embed-encode-worker.js";
+
 /**
  * Worker code as a string for inline blob creation.
  * This allows the worker to be bundled with the library without requiring
@@ -184,6 +186,37 @@ self.onmessage = async function(e) {
         respond(id, appendResult);
         break;
 
+      // Streaming new-embed (embed-encode-worker.ts): one video at a time,
+      // begin -> appendEncodedFrame per frame -> end. Queued so frames are
+      // encoded and appended strictly in arrival order even though encoding
+      // awaits (this handler is async, so messages would otherwise interleave).
+      case 'beginEncodedVideo':
+        queueEncode(id, function() {
+          if (!currentDestFile) throw new Error('beginEncodedVideo: no dest file open (call openWrite or openAppend first)');
+          encodeState = beginEncodedVideoEnc(currentDestFile, payload.entry);
+          encodeState.collapseToGray = !!payload.collapseToGray;
+          return { success: true };
+        });
+        break;
+
+      case 'appendEncodedFrame':
+        queueEncode(id, async function() {
+          if (!encodeState) throw new Error('appendEncodedFrame: no video begun (call beginEncodedVideo first)');
+          var bytes = await encodeFrameEnc(payload.frame, encodeState.collapseToGray);
+          appendEncodedBytesEnc(encodeState, payload.frameIdx, bytes);
+          return { success: true };
+        });
+        break;
+
+      case 'endEncodedVideo':
+        queueEncode(id, function() {
+          if (!encodeState) throw new Error('endEncodedVideo: no video begun (call beginEncodedVideo first)');
+          var endResult = endEncodedVideoEnc(currentDestFile, encodeState);
+          encodeState = null;
+          return { success: true, framesWritten: endResult.framesWritten };
+        });
+        break;
+
       case 'openWrite':
         const openWriteResult = openWrite(
           payload.sab,
@@ -261,6 +294,20 @@ self.onmessage = async function(e) {
     respond(id, { success: false, error: errorMessage });
   }
 };
+
+// Streaming new-embed state: the video being written, and the chain that
+// serializes its queued messages.
+let encodeState = null;
+let encodeChain = Promise.resolve();
+
+function queueEncode(id, fn) {
+  encodeChain = encodeChain.then(fn).then(
+    function(result) { respond(id, result); },
+    function(error) {
+      respond(id, { success: false, error: (error && error.message) || String(error) });
+    }
+  );
+}
 
 function respond(id, data, transferables) {
   if (transferables) {
@@ -580,7 +627,23 @@ function createWriteRangeFile(parent, name, initialSize) {
       stream_ops[k] = function() { FS.forceLoadFile(node); return fn.apply(null, arguments); };
     })(sk, origStreamOps[sk]);
   }
+  // Write-behind: consecutive writes (HDF5 appends chunk after chunk at the
+  // end of the file) gather into one block of up to the bridge's transfer size
+  // and cross the bridge as ONE request, instead of one blocking round-trip per
+  // HDF5 write (a row-per-frame embedded video issues several small chunk
+  // writes per frame). Flushed before any read, truncate or close, so the file
+  // always reads back what was written.
+  var pending = null;
+  var pendingStart = 0;
+  var pendingLen = 0;
+  function flushPending() {
+    if (pendingLen === 0) return;
+    var len = pendingLen;
+    pendingLen = 0;
+    bridgeWrite(pendingStart, pending, 0, len, 'dest');
+  }
   stream_ops.read = function(stream, buffer, offset, length, position) {
+    flushPending();
     if (position >= writeFileSize) return 0;
     var end = position + length;
     if (end > writeFileSize) end = writeFileSize;
@@ -595,12 +658,27 @@ function createWriteRangeFile(parent, name, initialSize) {
     return got;
   };
   stream_ops.write = function(stream, buffer, offset, length, position) {
-    bridgeWrite(position, buffer, offset, length, 'dest');
+    if (pending === null) pending = new Uint8Array(rangeMaxChunk);
+    var contiguous = pendingLen > 0 && position === pendingStart + pendingLen;
+    if (!contiguous || pendingLen + length > pending.length) flushPending();
+    if (length >= pending.length) {
+      bridgeWrite(position, buffer, offset, length, 'dest');
+    } else {
+      if (pendingLen === 0) pendingStart = position;
+      pending.set(buffer.subarray(offset, offset + length), pendingLen);
+      pendingLen += length;
+    }
     if (position + length > writeFileSize) writeFileSize = position + length;
     return length;
   };
+  var origClose = stream_ops.close;
+  stream_ops.close = function(stream) {
+    flushPending();
+    if (origClose) return origClose.apply(null, arguments);
+  };
   // llseek: rely on the wrapped default (SEEK_END uses node.usedBytes -> writeFileSize).
   node.stream_ops = stream_ops;
+  node.flushPendingWrites = flushPending;
 
   // node_ops: override setattr so ftruncate is bridged (NOT written into MEMFS contents).
   var node_ops = {};
@@ -608,6 +686,7 @@ function createWriteRangeFile(parent, name, initialSize) {
   for (var nk in origNodeOps) node_ops[nk] = origNodeOps[nk];
   node_ops.setattr = function(n, attr) {
     if (attr.size !== undefined && attr.size !== null) {
+      flushPending();
       bridgeTruncate(attr.size, 'dest');
       writeFileSize = attr.size;
     }
@@ -828,13 +907,6 @@ async function openAppendOpfs(destOpfsPath, sourceFile, structureBytes, sourceFi
   };
 }
 
-// Per-window byte budget for appendEmbeddedVideos' streamed raw blob copy, and
-// the HDF5 chunk length (elements) for the 1-D embedded video byte dataset.
-// MUST match EMBED_WRITE_WINDOW_BYTES / EMBED_VIDEO_CHUNK_BYTES in write.ts
-// (~line 558) — keep them in lockstep.
-var EMBED_WRITE_WINDOW_BYTES = 32 * 1024 * 1024;
-var EMBED_VIDEO_CHUNK_BYTES = 1 << 20;
-
 // Reinterpret an h5wasm slice()/value read as a Uint8Array without copying when
 // possible (mirrors asUint8Array in ../../video/embedded-frame.ts — KEEP IN
 // LOCKSTEP). Crucially this reinterprets an Int8Array's (h5wasm dtype '<b')
@@ -974,31 +1046,29 @@ function setStringAttrWorker(target, name, value) {
 
 // Worker-side writeSourceVideoJson (mirrors write.ts's writeSourceVideoJson -
 // KEEP IN LOCKSTEP): writes the source video's metadata JSON into
-// '{groupPath}/source_video', normally as a 'json' string attribute, or (only
-// if it would exceed the 64 KB HDF5 attribute ceiling) a 'json' dataset in the
-// same group instead.
+// '{groupPath}/source_video' as Python does, normally as a 'json' variable-
+// length string attribute, or (only if it would exceed the 64 KB HDF5
+// attribute ceiling) a scalar fixed-length bytes 'json' dataset instead.
 function writeSourceVideoJsonWorker(file, groupPath, sourceDict) {
   var blob = JSON.stringify(sourceDict);
   file.create_group(groupPath + '/source_video');
   var byteLength = new TextEncoder().encode(blob).length;
   if (byteLength <= 64000) {
-    setStringAttrWorker(file.get(groupPath + '/source_video'), 'json', blob);
+    file.get(groupPath + '/source_video').create_attribute('json', blob);
     return;
   }
-  file.create_dataset({ name: groupPath + '/source_video/json', data: [blob] });
+  file.create_dataset({ name: groupPath + '/source_video/json', data: blob, shape: [], dtype: 'S' + byteLength });
 }
 
-// Worker port of writeEmbeddedVideoData (write.ts ~2852) for the RAW path ONLY
+// Worker port of writeEmbeddedVideoData (write.ts) for the RAW path ONLY
 // (SerializableEmbedEntry - Task 1.1's re-save/raw-copy embed plan). Requires
 // openAppend to have already opened BOTH currentSourceFile and currentDestFile.
-// For each entry: creates 'video{videoIndex}' in the DEST, writes the
-// source_video lineage (if any), then streams the SOURCE group's stored blobs
-// (via readSourceBlob) into a new resizable 1-D <B 'video{videoIndex}/video'
-// dataset in bounded byte windows (mirrors writeRawEmbeddedVideo's create-empty
-// -> resize -> write_slice window pattern), and finally writes
-// frame_numbers/frame_sizes + format/channel_order attrs. Does NOT close either
-// file (the caller's subsequent 'close' message does that via closeAppendFiles,
-// so more writes could still follow).
+// For each entry: copies the SOURCE group's stored blobs (via readSourceBlob),
+// one per row, into 'video{videoIndex}' in the DEST in Python sleap-io's layout
+// (the shared padded-row writer in embed-encode-worker.ts), then its
+// attributes, frame_numbers and source_video lineage. Does NOT close either
+// file (the caller's subsequent 'close' message does that via
+// closeAppendFiles, so more writes could still follow).
 //
 // Backstop (mirrors the #213 data-loss guard in writeEmbeddedVideoData): an
 // entry's frameNumbers IS the exact stored set, so every stored index must read
@@ -1019,49 +1089,10 @@ function appendEmbeddedVideos(entries) {
   var perVideo = [];
   for (var e = 0; e < entries.length; e++) {
     var entry = entries[e];
-    var group = 'video' + entry.videoIndex;
-    currentDestFile.create_group(group);
-
-    if (entry.sourceVideoJson) {
-      writeSourceVideoJsonWorker(currentDestFile, group, entry.sourceVideoJson);
-    }
-
-    currentDestFile.create_dataset({
-      name: group + '/video',
-      data: new Uint8Array(0),
-      shape: [0],
-      maxshape: [null],
-      chunks: [EMBED_VIDEO_CHUNK_BYTES],
-      dtype: '<B'
-    });
-    var vds = currentDestFile.get(group + '/video'); // re-fetch handle (mirror write.ts pattern)
-
-    var sizes = [];
-    var writtenFns = [];
-    var total = 0;
-    var win = [];
-    var winBytes = 0;
-    var flush = function() {
-      if (winBytes === 0) return;
-      var buf = new Uint8Array(winBytes);
-      var o = 0;
-      for (var k = 0; k < win.length; k++) { buf.set(win[k], o); o += win[k].length; }
-      vds.resize([total + winBytes]);
-      vds.write_slice([[total, total + winBytes]], buf);
-      total += winBytes;
-      win = [];
-      winBytes = 0;
-    };
-
+    var state = beginPaddedVideoEnc(currentDestFile, 'video' + entry.videoIndex, entry.frameNumbers.length);
     for (var i = 0; i < entry.frameNumbers.length; i++) {
       var blob = readSourceBlob(entry.sourceGroup, i);
-      if (blob && blob.length > 0) {
-        win.push(blob);
-        winBytes += blob.length;
-        sizes.push(blob.length);
-        writtenFns.push(entry.frameNumbers[i]);
-        if (winBytes >= EMBED_WRITE_WINDOW_BYTES) flush();
-      }
+      if (blob && blob.length > 0) appendPaddedRowEnc(state, entry.frameNumbers[i], blob);
       doneFrames++;
       if (totalFrames > 0) {
         var pct = Math.floor((doneFrames / totalFrames) * 100);
@@ -1071,37 +1102,24 @@ function appendEmbeddedVideos(entries) {
         }
       }
     }
-    flush();
 
-    if (writtenFns.length < entry.frameNumbers.length) {
+    if (state.frameNumbers.length < entry.frameNumbers.length) {
       throw new Error(
-        'embedding video' + entry.videoIndex + ': read ' + writtenFns.length + ' of ' +
+        'embedding video' + entry.videoIndex + ': read ' + state.frameNumbers.length + ' of ' +
         entry.frameNumbers.length + ' planned frame(s) - refusing to write a file with dropped images.'
       );
     }
-
-    setStringAttrWorker(vds, 'format', entry.format);
-    setStringAttrWorker(vds, 'channel_order', entry.channelOrder);
-
-    currentDestFile.create_dataset({
-      name: group + '/frame_numbers',
-      data: writtenFns,
-      shape: [writtenFns.length],
-      dtype: '<i4'
-    });
-    currentDestFile.create_dataset({
-      name: group + '/frame_sizes',
-      data: sizes,
-      shape: [sizes.length],
-      dtype: '<i4'
-    });
-
-    perVideo.push({ videoIndex: entry.videoIndex, framesWritten: writtenFns.length });
+    var res = finishPaddedVideoEnc(
+      state, entry.format, entry.channelOrder, entry.videoAttrs || null, entry.sourceVideoJson
+    );
+    perVideo.push({ videoIndex: entry.videoIndex, framesWritten: res.framesWritten });
   }
 
   currentDestFile.flush();
   return { success: true, perVideo: perVideo };
 }
+
+${EMBED_ENCODE_WORKER_CODE}
 
 // HDF5 datatype class ids used by the in-place writer port (H5Tget_class).
 var H5T_ENUM_CLASS = 8;
@@ -1452,6 +1470,7 @@ function warnCleanup(op, path, e) {
 // second openAppend without an intervening close doesn't leak the first pair of
 // MEMFS mounts.
 function closeAppendFiles() {
+  encodeState = null;
   if (currentSourceFile) {
     try { currentSourceFile.close(); } catch (e) {}
     currentSourceFile = null;
@@ -1559,6 +1578,9 @@ export type H5WorkerMessageType =
   | "openRange"
   | "openAppend"
   | "appendEmbeddedVideos"
+  | "beginEncodedVideo"
+  | "appendEncodedFrame"
+  | "endEncodedVideo"
   | "openWrite"
   | "openWriteOpfs"
   | "openAppendOpfs"

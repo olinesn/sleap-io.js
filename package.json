@@ -1,6 +1,6 @@
 {
   "name": "@talmolab/sleap-io.js",
-  "version": "0.5.13",
+  "version": "0.6.0",
   "private": false,
   "type": "module",
   "exports": {

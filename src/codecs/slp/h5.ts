@@ -2,6 +2,7 @@ import {
   RemoteIOError,
   fetchRetrying,
   isUrl,
+  redactUrl,
   resolveUrl,
   statusToMessage,
 } from "../../io/remote.js";
@@ -208,6 +209,37 @@ export async function openH5File(
   return openH5FileBrowser(module, source, options);
 }
 
+/** What to tell someone whose file HDF5 can't open. The Worker says the same. */
+export function cannotOpenAsHdf5Message(name: string): string {
+  return (
+    `Could not open '${name}' as an HDF5 file. It may be missing, incomplete ` +
+    "(cut off, or still downloading), or not a SLEAP file at all."
+  );
+}
+
+/**
+ * Throw if `openH5File` did not really open `source`. Opening doesn't throw for a
+ * file HDF5 can't open: it hands back an invalid id, and the first read then fails
+ * with "error - name not defined!". For a caller that needs the file now; a video
+ * backend may be built on a file it never ends up reading.
+ */
+export function checkOpenedAsHdf5(
+  file: H5File,
+  source: SlpSource,
+  options?: OpenH5Options,
+): void {
+  if (Number(file.file_id) >= 0) return;
+  const name =
+    typeof source === "string"
+      ? isUrl(source)
+        ? redactUrl(source)
+        : source
+      : (options?.filenameHint ??
+        (source as { name?: string }).name ??
+        "this file");
+  throw new Error(cannotOpenAsHdf5Message(name));
+}
+
 function isFileHandle(value: SlpSource): value is FileSystemFileHandle {
   return typeof value === "object" && value !== null && "getFile" in value;
 }
@@ -321,17 +353,26 @@ async function openFromUrl(
   return { file, close: () => file.close() };
 }
 
+let localFileCount = 0;
+
 async function openFromFile(
   module: H5Module,
   fs: H5FileSystem,
   file: File,
   options?: OpenH5Options,
 ): Promise<{ file: H5File; close: () => void }> {
-  const mountPath = `/slp-local-${Date.now()}`;
-  fs.mkdir?.(mountPath);
   const filename = options?.filenameHint ?? file.name ?? "local.slp";
 
-  if (fs.mount && fs.filesystems && fs.filesystems.WORKERFS) {
+  // WORKERFS reads a File through FileReaderSync, which only Workers have. On the
+  // main thread it mounts fine and then aborts h5wasm on the first read.
+  if (
+    fs.mount &&
+    fs.filesystems &&
+    fs.filesystems.WORKERFS &&
+    "FileReaderSync" in globalThis
+  ) {
+    const mountPath = `/slp-local-${Date.now()}`;
+    fs.mkdir?.(mountPath);
     fs.mount(fs.filesystems.WORKERFS, { files: [file] }, mountPath);
     const filePath = `${mountPath}/${filename}`;
     const h5file = new module.File(filePath, "r");
@@ -345,11 +386,20 @@ async function openFromFile(
     };
   }
 
+  // Its own path, since a video backend holds its file open while another opens,
+  // and removed on close, since this is a copy of the whole file.
   const buffer = new Uint8Array(await file.arrayBuffer());
-  const localPath = "/tmp-slp.slp";
+  ensureH5StagingDir(module);
+  const localPath = `/tmp/slp-local-${Date.now()}-${++localFileCount}.slp`;
   fs.writeFile(localPath, buffer);
   const h5file = new module.File(localPath, "r");
-  return { file: h5file, close: () => h5file.close() };
+  return {
+    file: h5file,
+    close: () => {
+      h5file.close();
+      fs.unlink?.(localPath);
+    },
+  };
 }
 
 /**

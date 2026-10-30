@@ -366,7 +366,7 @@ async function openRemoteFile(url, filename = 'data.h5', headers) {
       success: true,
       path: currentFile.path,
       filename: currentFile.filename,
-      keys: currentFile.keys()
+      keys: keysOfOpenedFile()
     };
   }
 
@@ -387,8 +387,20 @@ async function openRemoteFile(url, filename = 'data.h5', headers) {
     success: true,
     path: currentFile.path,
     filename: currentFile.filename,
-    keys: currentFile.keys()
+    keys: keysOfOpenedFile()
   };
+}
+
+// Opening doesn't throw for a file HDF5 can't open: it hands back an invalid id, and
+// keys() then fails with "error - name not defined!". Same words as
+// cannotOpenAsHdf5Message in h5.ts, which this worker code can't import.
+function keysOfOpenedFile() {
+  if (Number(currentFile.file_id) < 0) {
+    throw new Error("Could not open '" + currentFilename + "' as an HDF5 file. "
+      + "It may be missing, incomplete (cut off, or still downloading), or not a "
+      + "SLEAP file at all.");
+  }
+  return currentFile.keys();
 }
 
 async function openLocalFile(file, filename) {
@@ -419,7 +431,7 @@ async function openLocalFile(file, filename) {
     success: true,
     path: currentFile.path,
     filename: currentFile.filename,
-    keys: currentFile.keys()
+    keys: keysOfOpenedFile()
   };
 }
 
@@ -453,7 +465,7 @@ async function openBufferFile(buffer, filename = 'data.h5') {
     success: true,
     path: currentFile.path,
     filename: currentFile.filename,
-    keys: currentFile.keys()
+    keys: keysOfOpenedFile()
   };
 }
 
@@ -567,7 +579,7 @@ function openRangeFile(sab, size, filename, controlBytes) {
     success: true,
     path: currentFile.path,
     filename: currentFile.filename,
-    keys: currentFile.keys()
+    keys: keysOfOpenedFile()
   };
 }
 

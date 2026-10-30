@@ -8,6 +8,7 @@ import { readCompoundColumnsManual } from "./h5-compound.js";
 import {
   attrToNumber,
   attrToString,
+  checkFormatId,
   datasetValueToString,
   parseMetadataJson,
   missingMetadataJsonError,
@@ -167,6 +168,7 @@ export async function readSlp(
     const formatId = Number(
       metadataAttrs["format_id"]?.value ?? metadataAttrs["format_id"] ?? 1.0,
     );
+    checkFormatId(formatId, labelsPath);
     // Throws the same helpful error if the `metadata` group exists but its
     // required `json` attribute is missing/empty (truncated/corrupt file);
     // mirrors Python sleap-io PR #446.
@@ -471,6 +473,7 @@ export async function readSlpLazy(
     const formatId = Number(
       metadataAttrs["format_id"]?.value ?? metadataAttrs["format_id"] ?? 1.0,
     );
+    checkFormatId(formatId, labelsPath);
     // Throws the same helpful error if the `metadata` group exists but its
     // required `json` attribute is missing/empty (truncated/corrupt file);
     // mirrors Python sleap-io PR #446.

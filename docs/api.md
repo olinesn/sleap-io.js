@@ -86,6 +86,8 @@ const labels = await loadSlp("/data/session.slp", {
 - `options.h5.filenameHint`: helps name temporary files.
 - `options.lazy` (default `false`): use lazy loading for on-demand frame materialization.
 
+Throws `UnsupportedSlpFormatError` for a file in a format newer than this library can read (see [Files newer than this library](#files-newer-than-this-library)).
+
 ### `saveSlp(labels, filename, options)`
 Write `.slp` (Node/Electron).
 
@@ -760,6 +762,37 @@ The SLP format version (`format_id`) is set automatically based on content:
 | 2.2 | Chunked label image storage |
 | 2.3 | Virtual video crops present |
 | 2.4 | Persisted mask `fromPredicted` provenance link |
+
+##### Files newer than this library
+
+This library reads SLP formats below 3.0. Python sleap-io 0.10 writes format 3.0 by
+default, which stores every table as a group of columns. Every reader (`loadSlp`,
+`readSlp`, `readSlpLazy`, `readSlpStreaming`, and `loadSlpMetadata` and
+`validateSlpBuffer` from the lite entry) refuses such a file with an
+`UnsupportedSlpFormatError` instead of opening it as an empty project.
+
+To open one here, re-save it from Python in the 2.x layout:
+
+```python
+import sleap_io as sio
+
+sio.save_slp(sio.load_slp("mice.slp"), "mice_2x.slp", legacy_format=True)
+```
+
+Apps can catch the error to word it for their own users. Its `formatId` holds the
+file's version:
+
+```ts
+try {
+  labels = await loadSlp(file);
+} catch (e) {
+  if (e instanceof UnsupportedSlpFormatError) {
+    showMessage(`This file was made by a newer version (format ${e.formatId}).`);
+  } else {
+    throw e;
+  }
+}
+```
 
 ##### Virtual Crops (Format 2.3+)
 

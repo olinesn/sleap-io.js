@@ -3,6 +3,7 @@ import { LabelsSet } from "../model/labels-set.js";
 import { Video } from "../model/video.js";
 import { readSlp, readSlpLazy } from "../codecs/slp/read.js";
 import { readSlpStreaming } from "../codecs/slp/read-streaming.js";
+import { UnsupportedSlpFormatError } from "../codecs/slp/parsers.js";
 import { writeSlp, saveSlpToBytes } from "../codecs/slp/write.js";
 import { createVideoBackend, type VideoBackendType } from "../video/factory.js";
 import {
@@ -54,6 +55,8 @@ function isBrowserWithWorkerSupport(): boolean {
  *   paths (streaming, eager, and lazy); the final call is (total, total,
  *   "Finalizing"). Stage counts differ by path (streaming is finer-grained).
  * @returns Loaded Labels object
+ * @throws {UnsupportedSlpFormatError} If the file is in an SLP format newer than
+ *   this library can read (3.0 or above).
  */
 export async function loadSlp(
   source: SlpSource,
@@ -97,7 +100,13 @@ export async function loadSlp(
           lazy,
         });
       } catch (e) {
-        if (streamMode === "auto") {
+        // A file too new to read fails the same way on every reader, so don't retry
+        // it on the main thread. The retry could also hide this error: reading a
+        // picked File there aborts h5wasm (seen in Chromium) before any format check.
+        if (
+          streamMode === "auto" &&
+          !(e instanceof UnsupportedSlpFormatError)
+        ) {
           // Redact: the raw error can embed ?token= / userinfo (a remote URL).
           console.warn(
             "[sleap-io] Worker-based loading failed, falling back to main thread:",

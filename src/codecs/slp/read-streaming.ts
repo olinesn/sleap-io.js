@@ -17,6 +17,7 @@ import {
 import {
   attrToNumber,
   attrToString,
+  checkFormatId,
   datasetValueToString,
   parseMetadataJson,
   missingMetadataJsonError,
@@ -239,8 +240,9 @@ export async function readSlpStreaming(
         ? source.name
         : (options?.filenameHint ?? "slp-data.slp");
 
+  let labels: Labels;
   try {
-    return await readFromStreamingFile(
+    labels = await readFromStreamingFile(
       file,
       sourcePath,
       options?.filenameHint,
@@ -250,14 +252,20 @@ export async function readSlpStreaming(
       options?.lazy ?? false,
       lazyVideoMetadata,
     );
-  } finally {
-    // Keep the file open when video backends need it: eager (openVideos) OR
-    // deferred (lazyVideoMetadata), whose per-video backends read frame data on
-    // demand from this same StreamingH5File. Only close for pure metadata reads.
-    if (!openVideos && !lazyVideoMetadata) {
-      await file.close();
-    }
+  } catch (e) {
+    // Nothing will read this file now, so end its worker, whatever the options.
+    // Don't wait for that or let it fail: the caller needs this error, and a stuck
+    // worker never answers.
+    file.close().catch(() => {});
+    throw e;
   }
+  // Keep the file open when video backends need it: eager (openVideos) OR
+  // deferred (lazyVideoMetadata), whose per-video backends read frame data on
+  // demand from this same StreamingH5File. Only close for pure metadata reads.
+  if (!openVideos && !lazyVideoMetadata) {
+    await file.close();
+  }
+  return labels;
 }
 
 /**
@@ -322,6 +330,7 @@ export async function readFromStreamingFile(
       metadataAttrs["format_id"] ??
       1.0,
   );
+  checkFormatId(formatId, labelsPath);
   // Throws the same helpful error if the `metadata` group exists but its
   // required `json` attribute is missing/empty (truncated/corrupt file);
   // mirrors Python sleap-io PR #446 and matches the eager/lazy readers.

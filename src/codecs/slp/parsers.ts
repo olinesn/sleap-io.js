@@ -8,6 +8,7 @@ import { Track } from "../../model/instance.js";
 import { Camera, FrameGroup, InstanceGroup } from "../../model/camera.js";
 import type { Identity } from "../../model/identity.js";
 import { Instance3D, PredictedInstance3D } from "../../model/instance3d.js";
+import { isUrl, redactUrl } from "../../io/remote.js";
 
 const textDecoder = new TextDecoder();
 
@@ -99,6 +100,67 @@ export function parseMetadataJson(attr: unknown, labelsPath: string): unknown {
     throw missingMetadataJsonError(labelsPath);
   }
   return parseJsonAttr(attr);
+}
+
+/**
+ * A `/metadata` `format_id` at or above this uses a layout this library can't read.
+ *
+ * Format 3.0 (the default from Python sleap-io 0.10) stores every table as a group
+ * of columns. Read with the 2.x code those tables come back empty, so the file would
+ * open as 0 frames with no error, and saving it would write the empty project.
+ * Mirrors Python's `SLP_FORMAT_ID_LIMIT`. Raise it once the readers handle 3.0
+ * (#237), and honor the `/metadata` `required_features` attribute then as Python does.
+ */
+const SLP_FORMAT_ID_LIMIT = 3.0;
+
+/**
+ * Thrown when a `.slp` file is newer than this library can read. Nothing has been
+ * read from the file, so callers can catch this to word it for their own users.
+ */
+export class UnsupportedSlpFormatError extends Error {
+  /** The file's `format_id`, e.g. `3`. */
+  readonly formatId: number;
+
+  /**
+   * @param formatId The file's `format_id`.
+   * @param labelsPath Path, URL or name of the file, if known (used in the
+   *   message; credentials in a URL are masked).
+   */
+  constructor(formatId: number, labelsPath?: string) {
+    const name =
+      labelsPath && isUrl(labelsPath) ? redactUrl(labelsPath) : labelsPath;
+    const version = Number.isInteger(formatId)
+      ? formatId.toFixed(1)
+      : String(formatId);
+    super(
+      `${name || "This file"} uses SLP format ${version}, which is newer than ` +
+        `this version of sleap-io.js supports (max ${SLP_FORMAT_ID_LIMIT - 1}.x). ` +
+        "Upgrade sleap-io.js to read it, or re-save the file from Python " +
+        "sleap-io with `legacy_format=True`.",
+    );
+    this.name = "UnsupportedSlpFormatError";
+    this.formatId = formatId;
+    // Restore the prototype chain so `instanceof` holds even under older
+    // transpile targets (matches UnsupportedVideoFormatError).
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Refuse a `.slp` file newer than this library can read. Mirrors Python sleap-io's
+ * `_check_format_id`: a file without a `format_id` passes, as before.
+ *
+ * Call this before reading anything else from the file, since a newer layout may
+ * not hold what the other checks look for.
+ *
+ * @param formatId The file's `format_id`.
+ * @param labelsPath Path, URL or name of the file, if known.
+ * @throws {UnsupportedSlpFormatError} If the file is too new.
+ */
+export function checkFormatId(formatId: number, labelsPath?: string): void {
+  if (formatId >= SLP_FORMAT_ID_LIMIT) {
+    throw new UnsupportedSlpFormatError(formatId, labelsPath);
+  }
 }
 
 /**

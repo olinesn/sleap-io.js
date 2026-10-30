@@ -30,6 +30,7 @@ import {
   type JsfiveSource,
 } from "./codecs/slp/jsfive.js";
 import {
+  checkFormatId,
   parseJsonAttr,
   parseSkeletons,
   parseTracks,
@@ -55,6 +56,7 @@ export type {
   CameraMetadata,
 } from "./codecs/slp/parsers.js";
 export type { JsfiveSource } from "./codecs/slp/jsfive.js";
+export { UnsupportedSlpFormatError } from "./codecs/slp/parsers.js";
 export { Skeleton, Node, Edge, Symmetry } from "./model/skeleton.js";
 export { Track } from "./model/instance.js";
 
@@ -119,6 +121,8 @@ export interface SlpMetadata {
  * @param options.filename - Filename hint for embedded video paths
  * @returns SlpMetadata object with skeletons, counts, video info
  * @throws Error if the file is not a valid SLP file
+ * @throws {UnsupportedSlpFormatError} If the file is in an SLP format newer than
+ *   this library can read (3.0 or above)
  *
  * @example
  * ```typescript
@@ -205,6 +209,31 @@ function readSessionDataJsfive(
   };
 }
 
+/** Read `format_id` from the attributes of `/metadata`. */
+function readFormatId(metadataAttrs: Record<string, unknown>): number {
+  return Number(
+    (metadataAttrs.format_id as { value?: unknown })?.value ??
+      metadataAttrs.format_id ??
+      1.0,
+  );
+}
+
+/**
+ * Refuse a file newer than this library can read. Runs before the structure checks,
+ * since a newer layout may not have what they look for; a file with no `/metadata`
+ * is left to them.
+ */
+function checkFileFormat(
+  file: ReturnType<typeof openJsfiveFile>,
+  filename?: string,
+): void {
+  if (!file.keys.includes("metadata")) return;
+  const metadataGroup = file.get("metadata");
+  if (metadataGroup) {
+    checkFormatId(readFormatId(getAttrs(metadataGroup)), filename);
+  }
+}
+
 export async function loadSlpMetadata(
   source: JsfiveSource,
   options?: { filename?: string },
@@ -212,6 +241,8 @@ export async function loadSlpMetadata(
   const file = openJsfiveFile(source, options?.filename);
 
   try {
+    checkFileFormat(file, options?.filename);
+
     // Verify SLEAP structure
     const requiredKeys = ["metadata", "frames", "instances", "points"];
     for (const key of requiredKeys) {
@@ -227,11 +258,7 @@ export async function loadSlpMetadata(
     }
 
     const metadataAttrs = getAttrs(metadataGroup);
-    const formatId = Number(
-      (metadataAttrs.format_id as { value?: unknown })?.value ??
-        metadataAttrs.format_id ??
-        1.0,
-    );
+    const formatId = readFormatId(metadataAttrs);
     const metadataJson = parseJsonAttr(metadataAttrs.json) as Record<
       string,
       unknown
@@ -348,6 +375,8 @@ export async function loadSlpMetadata(
  * @param source - ArrayBuffer or Uint8Array containing the SLP file
  * @returns true if the file is a valid SLP file
  * @throws Error with details if the file is invalid
+ * @throws {UnsupportedSlpFormatError} If the file is in an SLP format newer than
+ *   this library can read (3.0 or above)
  *
  * @example
  * ```typescript
@@ -363,6 +392,8 @@ export function validateSlpBuffer(source: JsfiveSource): boolean {
   const file = openJsfiveFile(source);
 
   try {
+    checkFileFormat(file);
+
     // Check for required SLEAP structure
     const requiredKeys = ["metadata", "frames", "instances", "points"];
     const missingKeys = requiredKeys.filter((k) => !file.keys.includes(k));

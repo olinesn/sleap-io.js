@@ -13,6 +13,11 @@ import type { Video } from "./video.js";
  * `dataset` ("videoN/video" → N), preferring the live backend's dataset and
  * falling back to `backendMetadata.dataset`.
  *
+ * In SLP 3.0, `video` is always the list index, so the guess above must not run: it
+ * would send a frame to the wrong video when only some videos have frames and
+ * their group ids aren't in list order. A 3.0 `/frames` table always comes with an
+ * `is_negative` column (see `./columnar.ts`), and a 2.x one never does.
+ *
  * Single source of truth for the eager readers (`buildLabeledFrames`) and the
  * lazy store ({@link LazyDataStore}), which previously carried drifting copies.
  */
@@ -20,6 +25,9 @@ export function buildVideoIdMap(
   framesData: Record<string, unknown[]>,
   videos: Video[],
 ): Map<number, number> {
+  if (framesData.is_negative) {
+    return new Map(videos.map((_, index) => [index, index]));
+  }
   const videoIds = new Set<number>();
   for (const value of framesData.video ?? []) {
     videoIds.add(Number(value));

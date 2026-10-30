@@ -19,6 +19,7 @@ import {
   isImageDataLike,
 } from "../../video/image-decode.js";
 import { getH5Module, getH5FileSystem, ensureH5StagingDir } from "./h5.js";
+import { isH5Group } from "./columnar.js";
 import { type ROI, type PredictedROI, encodeWkb } from "../../model/roi.js";
 import type {
   SegmentationMask,
@@ -3272,8 +3273,11 @@ export interface OnDiskTable {
   rows: number;
   /** Column count (matrix width, or compound member count). */
   cols: number;
-  /** Storage layout: a 2-D numeric matrix, or a 1-D compound record dataset. */
-  layout: "flat" | "compound";
+  /**
+   * Storage layout: a 2-D numeric matrix, a 1-D compound record dataset, or a group
+   * of columns (SLP 3.0).
+   */
+  layout: "flat" | "compound" | "columnar";
   /** Whether the dataset is chunked (⇒ resizable on axis 0). */
   chunked?: boolean;
   /** Compound members (only for `layout: "compound"`). */
@@ -3312,12 +3316,16 @@ export interface DatasetMetaLike {
  * Convert a `getDatasetMeta` result (from the streaming reader) into an
  * {@link OnDiskTable} for the writability gate. Returns `undefined` when the
  * dataset is absent. Detects compound vs flat from the presence of
- * `compound_type.members`, and resizability from the presence of `chunks`.
+ * `compound_type.members`, and resizability from the presence of `chunks`. A table
+ * with metadata but no shape is a group of columns (SLP 3.0).
  */
 export function onDiskTableFromMeta(
   meta: DatasetMetaLike | null | undefined,
 ): OnDiskTable | undefined {
-  if (!meta || !Array.isArray(meta.shape)) return undefined;
+  if (!meta) return undefined;
+  if (!Array.isArray(meta.shape)) {
+    return { rows: 0, cols: 0, layout: "columnar" };
+  }
   const md = meta.metadata;
   const members = md?.compound_type?.members;
   const chunked = !!md?.chunks;
@@ -3398,6 +3406,8 @@ function sameStringArray(a: string[] | null, b: string[] | null): boolean {
 /**
  * Decide whether `update` can be written into `onDisk` IN PLACE, or whether the
  * caller must fall back to a full re-save. NOT writable when:
+ *  - any table is a group of columns (SLP 3.0): this library writes the 2.x layout,
+ *    and patching one table of a 3.0 file would leave it in neither; OR
  *  - any table's compound members include an HDF5 enum/bool (typeClass 8) —
  *    Python-written points store `visible`/`complete` this way and h5wasm cannot
  *    write them; OR
@@ -3449,6 +3459,12 @@ export function checkInPlaceWritable(
   ];
   for (const [name, table, od] of checks) {
     if (!od) continue; // absent on disk → writer creates it (resizable)
+    if (od.layout === "columnar") {
+      return {
+        ok: false,
+        reason: `table "${name}" is a group of columns (SLP format 3.0), which cannot be written in place — re-save the whole file instead`,
+      };
+    }
     if (od.layout === "compound" && od.members) {
       const enumMember = od.members.find((m) => m.typeClass === H5T_ENUM_CLASS);
       if (enumMember) {
@@ -3570,6 +3586,12 @@ function writeOneTableInPlace(
     if (rowCount === 0) return;
     createMatrixDataset(file, diskName, table.rows, table.fields, dtype, true);
     return;
+  }
+  if (isH5Group(ds)) {
+    // Backstop for the gate (checkInPlaceWritable), like the resize check below.
+    throw new Error(
+      `in-place update of "${diskName}": it is a group of columns (SLP format 3.0), which cannot be written in place — re-save the whole file instead`,
+    );
   }
 
   const md = ds.metadata;

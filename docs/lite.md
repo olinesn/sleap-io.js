@@ -43,7 +43,7 @@ console.log(metadata.provenance);   // { sleap_version, ... }
 
 **Returns:** `Promise<SlpMetadata>`
 
-**Throws:** `UnsupportedSlpFormatError` if the file is in an SLP format newer than this library can read (3.0 or above)
+**Throws:** `UnsupportedSlpFormatError` if the file is in an SLP format newer than this library can read (4.0 or above), or requires a feature it doesn't understand
 
 ### `validateSlpBuffer(source)`
 
@@ -62,7 +62,7 @@ try {
 
 - `source`: `ArrayBuffer` or `Uint8Array` to validate
 
-**Returns:** `true` if valid, throws `Error` with details if invalid, or `UnsupportedSlpFormatError` if the file is in an SLP format newer than this library can read (3.0 or above)
+**Returns:** `true` if valid, throws `Error` with details if invalid, or `UnsupportedSlpFormatError` if the file is in an SLP format newer than this library can read (4.0 or above), or requires a feature it doesn't understand
 
 ### `isHdf5Buffer(source)`
 

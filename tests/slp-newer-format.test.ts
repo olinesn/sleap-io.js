@@ -1,22 +1,20 @@
 /**
  * An `.slp` file newer than this library can read must be refused, not read as empty.
  *
- * Python sleap-io 0.10 writes SLP format 3.0 by default: every table is a group of
- * columns instead of a compound dataset. Read with the 2.x code those tables come
- * back empty, so such a file opened as 0 frames with no error, and saving it then
- * wrote the empty project. Every reader now checks `format_id` first, with the same
- * rule as Python's `_check_format_id`.
+ * A file in a format this library doesn't know may hold anything, and the readers that
+ * came before reading 3.0 opened such a file as 0 frames with no error, and saving it
+ * then wrote the empty project. Every reader checks `format_id` first, with the same
+ * rule as Python's `_check_format_id`. `slp-format-30.test.ts` has reading 3.0 itself.
  *
- * `py_written_30_columnar.slp` is a real file from Python's release branch (see
- * `tests/data/slp/gen_format_30_fixture.py`). The files with other format ids are
- * real 2.x fixtures with only that attribute changed, so they prove the check goes
- * by `format_id` and not by what the tables happen to look like.
+ * The files here are real fixtures with only `format_id` changed, so they prove the
+ * check goes by `format_id` and not by what the tables happen to look like.
  *
  * The `loadSlp` fallback and the worker cleanup need module mocks, so they are in
  * `slp-newer-format-streaming.test.ts`.
  */
 import { describe, it, expect } from "./bun-test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { ready, File as H5File } from "h5wasm/node";
@@ -37,6 +35,7 @@ const fixturePath = (name: string) => path.join(fixtureRoot, name);
 const fixtureBytes = (name: string): ArrayBuffer =>
   new Uint8Array(readFileSync(fixturePath(name))).buffer as ArrayBuffer;
 
+/** A real file from Python's release branch, in format 3.0. */
 const COLUMNAR = "py_written_30_columnar.slp";
 /** A real 2.x file, with this many frames, to change `format_id` on. */
 const REAL_2X = "py_written_25_identity.slp";
@@ -200,65 +199,49 @@ async function refusal(read: () => Promise<unknown>): Promise<Error> {
   throw new Error(`expected a refusal, but it read (frames: ${frames})`);
 }
 
-describe("a file in SLP format 3.0, written by Python, is refused", () => {
-  it("the fixture really is the new layout, with poses in it", async () => {
-    const module = await ready;
-    const { fake, close } = await streamingFake(fixtureBytes(COLUMNAR));
-    try {
-      expect(
-        ((await fake.getAttrs("metadata")).format_id as { value: number })
-          .value,
-      ).toBe(3);
-    } finally {
-      close();
-    }
-    const p = `/tmp/newer_layout_${Date.now()}.slp`;
-    module.FS.writeFile(p, new Uint8Array(fixtureBytes(COLUMNAR)));
-    const h5 = new H5File(p, "r");
-    try {
-      const x = h5.get("points/x") as unknown as { value: ArrayLike<number> };
-      expect(Array.from(x.value)).toEqual([1, 3]);
-      expect(h5.get("frames")?.constructor.name).toBe("Group");
-    } finally {
-      h5.close();
-      module.FS.unlink(p);
-    }
-  });
-
+describe("a file in SLP format 4.0 is refused", () => {
   for (const [name, read] of READERS) {
     it(`${name} throws a clear error instead of returning 0 frames`, async () => {
-      const e = await refusal(() => read(fixtureBytes(COLUMNAR), "mice.slp"));
+      const e = await refusal(async () =>
+        read(await withFormatId(COLUMNAR, 4), "mice.slp"),
+      );
       expect(e).toBeInstanceOf(UnsupportedSlpFormatError);
       expect(e.name).toBe("UnsupportedSlpFormatError");
-      expect((e as UnsupportedSlpFormatError).formatId).toBe(3);
-      expect(e.message).toContain("mice.slp uses SLP format 3.0");
+      expect((e as UnsupportedSlpFormatError).formatId).toBe(4);
+      expect(e.message).toContain("mice.slp uses SLP format 4.0");
       expect(e.message).toContain("newer than this version of sleap-io.js");
-      expect(e.message).toContain("max 2.x");
+      expect(e.message).toContain("max 3.x");
       expect(e.message).toContain("legacy_format=True");
     });
   }
 
   it("readSlp given a path names that path", async () => {
-    const e = await refusal(() =>
-      readSlp(fixturePath(COLUMNAR), { openVideos: false }),
-    );
-    expect(e).toBeInstanceOf(UnsupportedSlpFormatError);
-    expect(e.message).toContain(fixturePath(COLUMNAR));
+    const bytes = await withFormatId(COLUMNAR, 4);
+    const dir = mkdtempSync(path.join(tmpdir(), "newer-format-"));
+    const p = path.join(dir, "mice.slp");
+    writeFileSync(p, new Uint8Array(bytes));
+    try {
+      const e = await refusal(() => readSlp(p, { openVideos: false }));
+      expect(e).toBeInstanceOf(UnsupportedSlpFormatError);
+      expect(e.message).toContain(p);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("the streaming reader names the file without the URL's query", async () => {
-    const e = await refusal(() =>
-      readStreaming(fixtureBytes(COLUMNAR), "mice.slp"),
-    );
+    const bytes = await withFormatId(COLUMNAR, 4);
+    const e = await refusal(() => readStreaming(bytes, "mice.slp"));
     expect(e).toBeInstanceOf(UnsupportedSlpFormatError);
-    expect(e.message).toContain("mice.slp uses SLP format 3.0");
+    expect(e.message).toContain("mice.slp uses SLP format 4.0");
     expect(e.message).not.toContain("a=1");
   });
 
   it("the error stops before anything but the metadata is read", async () => {
+    const bytes = await withFormatId(COLUMNAR, 4);
     const stages: Array<string | undefined> = [];
     const e = await refusal(() =>
-      readSlp(fixtureBytes(COLUMNAR), {
+      readSlp(bytes, {
         openVideos: false,
         onProgress: (_i, _n, message) => stages.push(message),
       }),
@@ -267,16 +250,17 @@ describe("a file in SLP format 3.0, written by Python, is refused", () => {
     expect(stages).toEqual(["Reading metadata"]);
   });
 
-  it("validateSlpBuffer does not call the file valid", () => {
+  it("validateSlpBuffer does not call the file valid", async () => {
+    const bytes = await withFormatId(COLUMNAR, 4);
     let caught: unknown;
     try {
-      validateSlpBuffer(fixtureBytes(COLUMNAR));
+      validateSlpBuffer(bytes);
     } catch (e) {
       caught = e;
     }
     expect(caught).toBeInstanceOf(UnsupportedSlpFormatError);
     expect((caught as Error).message).toContain(
-      "This file uses SLP format 3.0",
+      "This file uses SLP format 4.0",
     );
   });
 
@@ -288,11 +272,11 @@ describe("a file in SLP format 3.0, written by Python, is refused", () => {
 
 describe("the check goes by format_id", () => {
   for (const [name, read] of READERS) {
-    it(`${name} refuses a 2.x layout marked 3.0 and later formats`, async () => {
+    it(`${name} refuses a 2.x layout marked 4.0 and later formats`, async () => {
       for (const [id, shown] of [
-        [3, "3.0"],
-        [3.1, "3.1"],
         [4, "4.0"],
+        [4.1, "4.1"],
+        [5, "5.0"],
       ] as const) {
         const bytes = await withFormatId(REAL_2X, id);
         const e = await refusal(() => read(bytes, "newer.slp"));
@@ -303,8 +287,8 @@ describe("the check goes by format_id", () => {
     });
   }
 
-  it("a format below 3.0 reads in every reader", async () => {
-    const bytes = await withFormatId(REAL_2X, 2.99);
+  it("a format below 4.0 reads in every reader", async () => {
+    const bytes = await withFormatId(REAL_2X, 3.99);
     const eager = await readSlp(bytes, { openVideos: false });
     expect(eager.labeledFrames.length).toBe(REAL_2X_FRAMES);
     const lazy = await readSlpLazy(bytes, { openVideos: false });
@@ -341,7 +325,7 @@ describe("the check goes by format_id", () => {
   it("the streaming reader takes format_id with or without the { value } wrapper", async () => {
     // The worker wraps attributes in { value }; other callers of this exported
     // function may pass them bare.
-    for (const format_id of [{ value: 3 }, 3]) {
+    for (const format_id of [{ value: 4 }, 4]) {
       const stub = {
         getAttrs: async () => ({ format_id }),
       } as unknown as StreamingH5File;

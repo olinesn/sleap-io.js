@@ -41,7 +41,10 @@ function isBrowserWithWorkerSupport(): boolean {
  * Load a SLEAP labels file (.slp).
  *
  * Automatically selects the best loading strategy:
- * - Browser with Worker support: uses streaming reader via Web Worker
+ * - Browser with Worker support: uses streaming reader via Web Worker. If that
+ *   fails, a path, URL or byte buffer is retried with the standard reader, and for
+ *   a File or FileSystemFileHandle the failure is thrown as it is. To read a picked
+ *   file on the main thread, pass `h5: { stream: "download" }`.
  * - Node.js or fallback: uses standard HDF5 reader
  *
  * @param source - Path to .slp file, ArrayBuffer, Uint8Array, File, or FileSystemFileHandle
@@ -67,7 +70,15 @@ export async function loadSlp(
     onProgress?: (current: number, total: number, message?: string) => void;
   },
 ): Promise<Labels> {
-  const streamMode = options?.h5?.stream ?? "auto";
+  const requestedMode = options?.h5?.stream ?? "auto";
+  // A picked file stays with the Worker, which reads only the ranges it needs. A
+  // retry on the main thread would take the whole file into memory to reach the same
+  // answer, and could replace that answer with an out-of-memory error.
+  const isPickedFile =
+    (typeof File !== "undefined" && source instanceof File) ||
+    (typeof source === "object" && "getFile" in source);
+  const streamMode =
+    requestedMode === "auto" && isPickedFile ? "range" : requestedMode;
   const openVideos = options?.openVideos ?? true;
   const lazy = options?.lazy ?? false;
 

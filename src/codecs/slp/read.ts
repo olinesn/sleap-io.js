@@ -1,4 +1,5 @@
 import {
+  checkOpenedAsHdf5,
   openH5File,
   type OpenH5Options,
   type SlpSource,
@@ -149,6 +150,7 @@ export async function readSlp(
     urlHeaders: options?.h5?.headers,
   };
   try {
+    checkOpenedAsHdf5(file, source, options?.h5);
     report(0); // Reading metadata
     const labelsPath =
       typeof source === "string"
@@ -455,6 +457,7 @@ export async function readSlpLazy(
     urlHeaders: options?.h5?.headers,
   };
   try {
+    checkOpenedAsHdf5(file, source, options?.h5);
     report(0); // Reading metadata
     const labelsPath =
       typeof source === "string"

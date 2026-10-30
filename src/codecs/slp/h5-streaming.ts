@@ -1126,6 +1126,13 @@ export async function openH5Worker(
   }
 
   const file = new StreamingH5File();
-  await file.openAny(source, options);
+  try {
+    await file.openAny(source, options);
+  } catch (e) {
+    // Nothing will use this worker now. Don't wait for it to end, or let that fail:
+    // the caller needs this error.
+    file.close().catch(() => {});
+    throw e;
+  }
   return file;
 }

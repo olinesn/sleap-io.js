@@ -82,7 +82,7 @@ const labels = await loadSlp("/data/session.slp", {
 
 - `source`: string path/URL, `File`, `FileSystemFileHandle`, `Uint8Array`, or `ArrayBuffer`.
 - `options.openVideos` (default `true`): set `false` to skip opening video backends.
-- `options.h5.stream`: `"auto" | "range" | "download"` (browser URL streaming).
+- `options.h5.stream`: `"auto" | "range" | "download"` (browser URL streaming). `"auto"` retries a failed Worker read on the main thread, except for a `File` or `FileSystemFileHandle`, where you get the Worker's error. `"download"` reads on the main thread, holding the whole file in memory.
 - `options.h5.filenameHint`: helps name temporary files.
 - `options.lazy` (default `false`): use lazy loading for on-demand frame materialization.
 

@@ -12,7 +12,9 @@ produces together, and what a reader must cope with anyway:
   some of them (in 3.0 ``/frames/video`` is the list index; in 2.x it is ``N``);
 - unknown columns and per-record ``metadata/`` groups in ``handbuilt_30.slp``.
 
-``py_written_30_columnar.slp`` is the real thing, from Python's own writer.
+Python's own reader on release/0.10 opens all of these with the expected contents, and
+their tables match ``py_written_30_twin.slp`` (the same project from Python's own writer,
+see ``gen_format_30_twins_fixture.py``) in dtype, chunking and compression.
 
 Also written: ``handbuilt_30_gzip.slp`` (columns compressed as with Python's
 ``compression="gzip"``, and videos that aren't embedded), ``handbuilt_30_lzf.slp``
@@ -190,7 +192,7 @@ SESSIONS = [
         {
             "calibration": CALIBRATION,
             "camcorder_to_video_idx_map": {"0": 0, "1": 1},
-            "metadata": {"name": "s0"},
+            "name": "s0",
             "fg_start": 0,
             "fg_end": 2,
         }

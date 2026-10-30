@@ -1,9 +1,12 @@
 /**
  * SLP format 3.0, where every table is a group of columns, read through every path.
  *
- * `handbuilt_30.slp` and `handbuilt_30_2x.slp` hold one project in the two layouts (see
- * `tests/data/slp/gen_format_30_handbuilt_fixture.py`), so the main check is that they
- * read the same. `py_written_30_columnar.slp` is a real file from Python's writer.
+ * The main check is that one project saved in both layouts reads the same. The
+ * `py_written_30_*` pairs come from Python's own writer, with `legacy_format=True` for
+ * the 2.x file (`tests/data/slp/gen_format_30_twins_fixture.py`), which also shows that
+ * re-saving that way works for anything that can't read 3.0. The `handbuilt_30*` files
+ * (`gen_format_30_handbuilt_fixture.py`) follow Python's layout by hand, to hold what its
+ * writer doesn't produce: embedded videos numbered out of list order, unknown columns.
  *
  * `readSlpStreaming` needs a browser Worker, so the streaming tests run the real worker
  * code and the real `StreamingH5File` over h5wasm/node, with only the message
@@ -35,16 +38,23 @@ import {
   numberColumn,
 } from "../src/codecs/slp/columnar.js";
 
+const fixturePath = (name: string): string =>
+  path.join(fileURLToPath(new URL("./data/slp", import.meta.url)), name);
 const fixture = (name: string): ArrayBuffer =>
-  new Uint8Array(
-    readFileSync(
-      path.join(fileURLToPath(new URL("./data/slp", import.meta.url)), name),
-    ),
-  ).buffer as ArrayBuffer;
+  new Uint8Array(readFileSync(fixturePath(name))).buffer as ArrayBuffer;
 
 const COLUMNAR = "handbuilt_30.slp";
 const LEGACY = "handbuilt_30_2x.slp";
 const PYTHON = "py_written_30_columnar.slp";
+const PYTHON_TWIN = "py_written_30_twin.slp";
+
+/** One project saved in both layouts: the 3.0 file, then the 2.x file. */
+const TWINS: Array<[string, string]> = [
+  [PYTHON_TWIN, "py_written_30_twin_legacy.slp"],
+  ["py_written_30_sparse.slp", "py_written_30_sparse_legacy.slp"],
+  ["py_written_30_embedded.pkg.slp", "py_written_30_embedded_legacy.pkg.slp"],
+  [COLUMNAR, LEGACY],
+];
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -314,69 +324,74 @@ function annotationSnapshot(labels: Labels) {
   };
 }
 
-describe("a 3.0 file and its 2.x twin read the same", () => {
-  for (const [name, read] of FULL_READERS) {
-    it(name, async () => {
+for (const [columnarFile, legacyFile] of TWINS) {
+  describe(`${columnarFile} and ${legacyFile} read the same`, () => {
+    for (const [name, read] of FULL_READERS) {
+      it(name, async () => {
+        quietWarnings();
+        const columnar = await read(fixture(columnarFile));
+        const legacy = await read(fixture(legacyFile));
+        expect(columnar.labeledFrames.length).toBeGreaterThan(0);
+        expect(poseSnapshot(columnar)).toEqual(poseSnapshot(legacy));
+        expect(annotationSnapshot(columnar)).toEqual(
+          annotationSnapshot(legacy),
+        );
+      });
+    }
+
+    for (const [name, read] of STREAMING_READERS) {
+      it(name, async () => {
+        quietWarnings();
+        const columnar = await read(fixture(columnarFile));
+        const legacy = await read(fixture(legacyFile));
+        expect(columnar.labeledFrames.length).toBeGreaterThan(0);
+        expect(poseSnapshot(columnar)).toEqual(poseSnapshot(legacy));
+      });
+    }
+
+    it("the streaming reader reads the same poses as the eager one", async () => {
       quietWarnings();
-      const columnar = await read(fixture(COLUMNAR));
-      const legacy = await read(fixture(LEGACY));
-      expect(poseSnapshot(columnar)).toEqual(poseSnapshot(legacy));
-      expect(annotationSnapshot(columnar)).toEqual(annotationSnapshot(legacy));
+      const eager = poseSnapshot(
+        await readSlp(fixture(columnarFile), { openVideos: false }),
+      );
+      const streamed = poseSnapshot(await readStreaming(fixture(columnarFile)));
+      // On any format, it links identities to instances only (not to centroids).
+      expect({ ...streamed, centroids: [] }).toEqual({
+        ...eager,
+        centroids: [],
+      });
+      expect(streamed.centroids.length).toBe(eager.centroids.length);
     });
-  }
 
-  for (const [name, read] of STREAMING_READERS) {
-    it(name, async () => {
+    it("loadSlpMetadata", async () => {
       quietWarnings();
-      const columnar = await read(fixture(COLUMNAR));
-      const legacy = await read(fixture(LEGACY));
-      expect(poseSnapshot(columnar)).toEqual(poseSnapshot(legacy));
+      const columnar = await loadSlpMetadata(fixture(columnarFile));
+      const legacy = await loadSlpMetadata(fixture(legacyFile));
+      expect(columnar.formatId).toBe(3);
+      expect(legacy.formatId).toBeLessThan(3);
+      expect(columnar.counts.labeledFrames).toBeGreaterThan(0);
+      expect(columnar.counts).toEqual(legacy.counts);
+      expect(columnar.version).toBe(legacy.version);
+      expect(columnar.skeletons[0].nodeNames).toEqual(
+        legacy.skeletons[0].nodeNames,
+      );
+      expect(columnar.tracks.map((t) => t.name)).toEqual(
+        legacy.tracks.map((t) => t.name),
+      );
+      expect(columnar.suggestions).toEqual(legacy.suggestions);
+      expect(columnar.provenance).toEqual(legacy.provenance);
+      expect(columnar.hasEmbeddedImages).toBe(legacy.hasEmbeddedImages);
+      expect(columnar.sessions.map((s) => s.cameras)).toEqual(
+        legacy.sessions.map((s) => s.cameras),
+      );
+      expect(columnar.sessions.map((s) => s.videosByCamera)).toEqual(
+        legacy.sessions.map((s) => s.videosByCamera),
+      );
     });
-  }
-
-  it("the streaming reader reads the same poses as the eager one", async () => {
-    quietWarnings();
-    const eager = poseSnapshot(
-      await readSlp(fixture(COLUMNAR), { openVideos: false }),
-    );
-    const streamed = poseSnapshot(await readStreaming(fixture(COLUMNAR)));
-    // On any format, it links identities to instances only (not to centroids).
-    expect({ ...streamed, centroids: [] }).toEqual({ ...eager, centroids: [] });
-    expect(streamed.centroids.length).toBe(eager.centroids.length);
   });
+}
 
-  it("loadSlpMetadata", async () => {
-    quietWarnings();
-    const columnar = await loadSlpMetadata(fixture(COLUMNAR));
-    const legacy = await loadSlpMetadata(fixture(LEGACY));
-    expect(columnar.formatId).toBe(3);
-    expect(legacy.formatId).toBeCloseTo(2.8, 5);
-    expect(columnar.counts).toEqual({
-      labeledFrames: 5,
-      instances: 4,
-      points: 6,
-      predictedPoints: 6,
-    });
-    expect(columnar.counts).toEqual(legacy.counts);
-    expect(columnar.version).toBe(legacy.version);
-    expect(columnar.skeletons[0].nodeNames).toEqual(
-      legacy.skeletons[0].nodeNames,
-    );
-    expect(columnar.tracks.map((t) => t.name)).toEqual(
-      legacy.tracks.map((t) => t.name),
-    );
-    expect(columnar.videos).toEqual(legacy.videos);
-    expect(columnar.suggestions).toEqual(legacy.suggestions);
-    expect(columnar.provenance).toEqual(legacy.provenance);
-    expect(columnar.hasEmbeddedImages).toBe(legacy.hasEmbeddedImages);
-    expect(columnar.sessions.map((s) => s.cameras)).toEqual(
-      legacy.sessions.map((s) => s.cameras),
-    );
-    expect(columnar.sessions.map((s) => s.videosByCamera)).toEqual(
-      legacy.sessions.map((s) => s.videosByCamera),
-    );
-  });
-
+describe("other layouts read the same as the 2.x file", () => {
   it("gzip-compressed columns read the same as plain ones", async () => {
     quietWarnings();
     const gzip = "handbuilt_30_gzip.slp";
@@ -389,7 +404,12 @@ describe("a 3.0 file and its 2.x twin read the same", () => {
     );
     expect(frames(await readStreaming(fixture(gzip)))).toEqual(expected);
     const lite = await loadSlpMetadata(fixture(gzip));
-    expect(lite.counts.points).toBe(6);
+    expect(lite.counts).toEqual({
+      labeledFrames: 5,
+      instances: 4,
+      points: 6,
+      predictedPoints: 6,
+    });
     expect(lite.sessions[0].frameGroups?.length).toBe(2);
   });
 
@@ -407,36 +427,103 @@ describe("a 3.0 file and its 2.x twin read the same", () => {
   });
 });
 
-describe("what a 3.0 file holds", () => {
-  it("poses, links and flags come through with their values", async () => {
-    quietWarnings();
-    const labels = await readSlp(fixture(COLUMNAR), { openVideos: false });
-    expect(labels.labeledFrames.map((f) => f.frameIdx)).toEqual([
-      5, 7, 9, 11, 13,
-    ]);
-    const [p0, u0] = labels.labeledFrames[0].instances as any[];
-    expect(p0.constructor.name).toBe("PredictedInstance");
-    // Float64 survives: 2.x would round this to the nearest float32.
-    expect(p0.score).toBe(0.1);
-    expect(p0.trackingScore).toBe(0.75);
-    expect(p0.track.name).toBe("mouse1");
-    expect(p0.points.map((p: any) => p.score)).toEqual([0.25, 0.5, 0.75]);
-    expect(u0.constructor.name).toBe("Instance");
-    expect(u0.fromPredicted).toBe(p0);
-    // `verified` is what the rest of the library calls `complete`. A hidden point
-    // keeps its coordinates; an absent one has none.
-    expect(u0.points[0]).toMatchObject({ visible: true, complete: true });
-    expect(u0.points[1]).toMatchObject({
-      xy: [3.5, 4.5],
-      visible: false,
-      complete: true,
+// The same project in both, so the same values must come out.
+for (const file of [PYTHON_TWIN, COLUMNAR]) {
+  describe(`what ${file} holds`, () => {
+    it("poses, links and flags come through with their values", async () => {
+      quietWarnings();
+      const labels = await readSlp(fixture(file), { openVideos: false });
+      expect(labels.labeledFrames.map((f) => f.frameIdx)).toEqual([
+        5, 7, 9, 11, 13,
+      ]);
+      const [p0, u0] = labels.labeledFrames[0].instances as any[];
+      expect(p0.constructor.name).toBe("PredictedInstance");
+      // Float64 survives: 2.x would round this to the nearest float32.
+      expect(p0.score).toBe(0.1);
+      expect(p0.trackingScore).toBe(0.75);
+      expect(p0.track.name).toBe("mouse1");
+      expect(p0.points.map((p: any) => p.score)).toEqual([0.25, 0.5, 0.75]);
+      expect(u0.constructor.name).toBe("Instance");
+      expect(u0.fromPredicted).toBe(p0);
+      // `verified` is what the rest of the library calls `complete`. A hidden point
+      // keeps its coordinates; an absent one has none.
+      expect(u0.points[0]).toMatchObject({ visible: true, complete: true });
+      expect(u0.points[1]).toMatchObject({
+        xy: [3.5, 4.5],
+        visible: false,
+        complete: true,
+      });
+      expect(u0.points[2].xy.every(Number.isNaN)).toBe(true);
+      expect(p0.identity.name).toBe("animal_A");
+      expect(p0.identityScore).toBe(0.5);
+      expect(u0.category).toBe("rodent");
     });
-    expect(u0.points[2].xy.every(Number.isNaN)).toBe(true);
-    expect(p0.identity.name).toBe("animal_A");
-    expect(p0.identityScore).toBe(0.5);
-    expect(u0.category).toBe("rodent");
-  });
 
+    it("session tables give 3D points, scores and member references", async () => {
+      quietWarnings();
+      const labels = await readSlp(fixture(file), { openVideos: false });
+      const groups = [...labels.sessions[0].frameGroups.values()] as any[];
+      expect(groups.map((g) => g.frameIdx)).toEqual([5, 7]);
+      expect(groups[0].metadata).toEqual({ fg: 1 });
+      const [first, second] = groups[0].instanceGroups;
+      expect(first.identity.name).toBe("animal_A");
+      expect(first.instance3d.points[0]).toEqual([1.5, 2.5, 3.5]);
+      expect(first._instanceRefsByCamera.size).toBe(2);
+      expect(second.instance3d).toBeUndefined();
+      expect(second.metadata).toEqual({ ig: "x" });
+      const predicted = groups[1].instanceGroups[0].instance3d;
+      expect(predicted.constructor.name).toBe("PredictedInstance3D");
+      expect(predicted.pointScores.slice(0, 2)).toEqual([0.5, 0.25]);
+      // Also through the lite reader, which has no frames to resolve them against.
+      const lite = await loadSlpMetadata(fixture(file));
+      expect(lite.sessions[0].frameGroups?.map((g) => g.frameIdx)).toEqual([
+        5, 7,
+      ]);
+    });
+
+    it("annotations come from their 3.0 columns and buffers", async () => {
+      quietWarnings();
+      const labels = await readSlp(fixture(file), { openVideos: false });
+      const frame = labels.labeledFrames[0];
+      const roi = frame.rois[0] as any;
+      expect([roi.name, roi.category, roi.source]).toEqual([
+        "roi-a",
+        "cat-a",
+        "src-a",
+      ]);
+      expect(roi.instance).toBe(frame.instances[1]);
+      expect(labels.rois.map((r) => r.name)).toContain("static");
+      expect(frame.bboxes[0].x2).toBe(5);
+      expect(frame.bboxes[0].instance).toBe(frame.instances[0]);
+      const predicted = frame.masks[0] as any;
+      const user = frame.masks[1] as any;
+      expect(Array.from(predicted.rleCounts)).toEqual([1, 2, 3]);
+      expect(Array.from(predicted.scoreMap)).toEqual([0, 1, 2, 3, 4, 5]);
+      expect(user.fromPredicted).toBe(predicted);
+      expect(user.scale).toEqual([2, 0.5]);
+      const image = frame.labelImages[0] as any;
+      expect(Array.from(image.data)).toEqual([0, 1, 1, 2]);
+      expect(image.objects.get(1).name).toBe("o1");
+      expect(image.objects.get(1).instance).toBe(frame.instances[0]);
+      const second = labels.labeledFrames[1].labelImages[0] as any;
+      expect(Array.from(second.data)).toEqual([2, 2, 0, 1]);
+      expect(Array.from(second.scoreMap)).toEqual([0, 1, 2, 3]);
+    });
+
+    it("per-detection links reach annotations, not just instances", async () => {
+      quietWarnings();
+      const labels = await readSlp(fixture(file), { openVideos: false });
+      expect(labels.labeledFrames[1].centroids[0].identity?.name).toBe(
+        "animal_A",
+      );
+      expect(labels.labeledFrames[0].masks[0].identity?.name).toBe("animal_B");
+      expect(labels.labeledFrames[0].bboxes[0].identity?.name).toBe("animal_A");
+      expect(labels.labeledFrames[0].masks[1].category).toBe("rodent");
+    });
+  });
+}
+
+describe("what a 3.0 file holds", () => {
   it("/frames/video is the list index, not the videoN number", async () => {
     quietWarnings();
     // videos are [video2, video0, video1], and only the first two have frames, so
@@ -505,66 +592,87 @@ describe("what a 3.0 file holds", () => {
     ]);
   });
 
-  it("session tables give 3D points, scores and member references", async () => {
-    quietWarnings();
-    const labels = await readSlp(fixture(COLUMNAR), { openVideos: false });
-    const groups = [...labels.sessions[0].frameGroups.values()] as any[];
-    expect(groups.map((g) => g.frameIdx)).toEqual([5, 7]);
-    expect(groups[0].metadata).toEqual({ fg: 1 });
-    const [first, second] = groups[0].instanceGroups;
-    expect(first.identity.name).toBe("animal_A");
-    expect(first.instance3d.points[0]).toEqual([1.5, 2.5, 3.5]);
-    expect(first._instanceRefsByCamera.size).toBe(2);
-    expect(second.instance3d).toBeUndefined();
-    expect(second.metadata).toEqual({ ig: "x" });
-    const predicted = groups[1].instanceGroups[0].instance3d;
-    expect(predicted.constructor.name).toBe("PredictedInstance3D");
-    expect(predicted.pointScores.slice(0, 2)).toEqual([0.5, 0.25]);
-    // Also through the lite reader, which has no frames to resolve them against.
-    const lite = await loadSlpMetadata(fixture(COLUMNAR));
-    expect(lite.sessions[0].frameGroups?.map((g) => g.frameIdx)).toEqual([
-      5, 7,
+  it("Python stores a video by list index in 3.0 and by videoN number in 2.x", async () => {
+    const module = await ready;
+    const videoColumn = async (name: string) => {
+      const p = await tmpPath();
+      module.FS.writeFile(p, new Uint8Array(fixture(name)));
+      const f: any = new H5File(p, "r");
+      const frames = f.get("frames");
+      const values =
+        frames.shape === undefined
+          ? Array.from(frames.get("video").value as ArrayLike<bigint>, Number)
+          : frames.value.map((row: unknown[]) => Number(row[1]));
+      f.close();
+      module.FS.unlink(p);
+      return values;
+    };
+    expect(await videoColumn("py_written_30_sparse.slp")).toEqual([0, 0]);
+    expect(await videoColumn("py_written_30_sparse_legacy.slp")).toEqual([
+      2, 2,
     ]);
+    for (const name of [
+      "py_written_30_sparse.slp",
+      "py_written_30_sparse_legacy.slp",
+    ]) {
+      const labels = await readSlp(fixture(name), { openVideos: false });
+      expect(labels.labeledFrames.map((f) => f.video)).toEqual([
+        labels.videos[0],
+        labels.videos[0],
+      ]);
+      expect(labels.labeledFrames.map((f) => f.isNegative)).toEqual([
+        false,
+        true,
+      ]);
+    }
   });
 
-  it("annotations come from their 3.0 columns and buffers", async () => {
-    quietWarnings();
-    const labels = await readSlp(fixture(COLUMNAR), { openVideos: false });
-    const frame = labels.labeledFrames[0];
-    const roi = frame.rois[0] as any;
-    expect([roi.name, roi.category, roi.source]).toEqual([
-      "roi-a",
-      "cat-a",
-      "src-a",
-    ]);
-    expect(roi.instance).toBe(frame.instances[1]);
-    expect(labels.rois.map((r) => r.name)).toContain("static");
-    expect(frame.bboxes[0].x2).toBe(5);
-    expect(frame.bboxes[0].instance).toBe(frame.instances[0]);
-    const predicted = frame.masks[0] as any;
-    const user = frame.masks[1] as any;
-    expect(Array.from(predicted.rleCounts)).toEqual([1, 2, 3]);
-    expect(Array.from(predicted.scoreMap)).toEqual([0, 1, 2, 3, 4, 5]);
-    expect(user.fromPredicted).toBe(predicted);
-    expect(user.scale).toEqual([2, 0.5]);
-    const image = frame.labelImages[0] as any;
-    expect(Array.from(image.data)).toEqual([0, 1, 1, 2]);
-    expect(image.objects.get(1).name).toBe("o1");
-    expect(image.objects.get(1).instance).toBe(frame.instances[0]);
-    const second = labels.labeledFrames[1].labelImages[0] as any;
-    expect(Array.from(second.data)).toEqual([2, 2, 0, 1]);
-    expect(Array.from(second.scoreMap)).toEqual([0, 1, 2, 3]);
-  });
-
-  it("per-detection links reach annotations, not just instances", async () => {
-    quietWarnings();
-    const labels = await readSlp(fixture(COLUMNAR), { openVideos: false });
-    expect(labels.labeledFrames[1].centroids[0].identity?.name).toBe(
-      "animal_A",
+  it("embedded images read the same from both layouts", async () => {
+    const frameBytes = async (name: string) => {
+      const labels = await readSlp(fixturePath(name), { openVideos: true });
+      const bytes = await labels.videos[0].getFrameBuffer(0);
+      labels.videos[0].close?.();
+      return Array.from(new Uint8Array(bytes as ArrayBufferLike));
+    };
+    const columnar = await frameBytes("py_written_30_embedded.pkg.slp");
+    expect(columnar.length).toBeGreaterThan(100);
+    expect(columnar).toEqual(
+      await frameBytes("py_written_30_embedded_legacy.pkg.slp"),
     );
-    expect(labels.labeledFrames[0].masks[0].identity?.name).toBe("animal_B");
-    expect(labels.labeledFrames[0].bboxes[0].identity?.name).toBe("animal_A");
-    expect(labels.labeledFrames[0].masks[1].category).toBe("rodent");
+  });
+
+  it("Python's float64 scores survive in 3.0, and round to float32 in 2.x", async () => {
+    quietWarnings();
+    const score = async (name: string) => {
+      const labels = await readSlp(fixture(name), { openVideos: false });
+      return (labels.labeledFrames[0].instances[0] as any).score as number;
+    };
+    expect(await score(PYTHON_TWIN)).toBe(0.1);
+    expect(await score("py_written_30_twin_legacy.slp")).toBe(Math.fround(0.1));
+  });
+
+  it("the warning names what Python's own file holds that a save won't keep", async () => {
+    const warn = quietWarnings();
+    await readSlp(fixture(PYTHON_TWIN), {
+      openVideos: false,
+      h5: { filenameHint: "mice.slp" },
+    });
+    const lines = warn.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes("/points has 1 unlabeled"))).toBe(true);
+    for (const table of ["/instances", "/frames", "/bboxes"]) {
+      expect(lines.some((l) => l.includes(`${table} holds metadata,`))).toBe(
+        true,
+      );
+    }
+    expect(lines.length).toBe(4);
+  });
+
+  it("the 2.x file has none of what the 3.0 one warns about", async () => {
+    const warn = quietWarnings();
+    await readSlp(fixture("py_written_30_twin_legacy.slp"), {
+      openVideos: false,
+    });
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("the file Python really writes reads in every reader, with no warnings", async () => {
@@ -1055,7 +1163,7 @@ describe("loading a 3.0 file and saving it", () => {
    * those numbers, and a 2.x reader then guesses wrong, whichever format was loaded (it
    * happens to `handbuilt_30_2x.slp` too). So these tests use videos that aren't embedded.
    */
-  const SAVED = "handbuilt_30_gzip.slp";
+  const SAVED = [PYTHON_TWIN, "handbuilt_30_gzip.slp"];
 
   /** Save and reload, returning the reloaded labels and the file's top-level facts. */
   async function saveAndInspect(labels: Labels) {
@@ -1078,60 +1186,62 @@ describe("loading a 3.0 file and saving it", () => {
     return { reloaded, facts };
   }
 
-  for (const [name, read] of [...FULL_READERS, ...STREAMING_READERS]) {
-    it(`${name} then a save keeps the poses, in the 2.x layout`, async () => {
+  for (const file of SAVED) {
+    for (const [name, read] of [...FULL_READERS, ...STREAMING_READERS]) {
+      it(`${file}: ${name} then a save keeps the poses, in the 2.x layout`, async () => {
+        quietWarnings();
+        const loaded = await read(fixture(file));
+        const before = poseSnapshot(loaded);
+        const { reloaded, facts } = await saveAndInspect(loaded);
+        expect(facts.formatId).toBeLessThan(3);
+        expect(facts.framesIsDataset).toBe(true);
+        expect(facts.keys).toContain("negative_frames");
+        const after = poseSnapshot(reloaded);
+        expect(after.frames).toEqual(before.frames);
+        expect(after.tracks).toEqual(before.tracks);
+        expect(after.skeleton).toEqual(before.skeleton);
+        expect(after.suggestions).toEqual(before.suggestions);
+        expect(after.sessions).toEqual(before.sessions);
+        expect(after.provenance).toEqual(before.provenance);
+      });
+    }
+
+    it(`${file}: a lazy load saved without materializing keeps the poses`, async () => {
       quietWarnings();
-      const loaded = await read(fixture(SAVED));
-      const before = poseSnapshot(loaded);
+      const loaded = await readSlpLazy(fixture(file), { openVideos: false });
       const { reloaded, facts } = await saveAndInspect(loaded);
       expect(facts.formatId).toBeLessThan(3);
-      expect(facts.framesIsDataset).toBe(true);
-      expect(facts.keys).toContain("negative_frames");
-      const after = poseSnapshot(reloaded);
-      expect(after.frames).toEqual(before.frames);
-      expect(after.tracks).toEqual(before.tracks);
-      expect(after.skeleton).toEqual(before.skeleton);
-      expect(after.suggestions).toEqual(before.suggestions);
-      expect(after.sessions).toEqual(before.sessions);
-      expect(after.provenance).toEqual(before.provenance);
+      loaded.materialize();
+      // A lazy save has never kept per-detection identities or categories, on any format.
+      const poses = (labels: Labels) =>
+        poseSnapshot(labels).frames.map((f) => [
+          f.video,
+          f.frameIdx,
+          f.isNegative,
+          f.instances.map((i) => [i.type, i.score, i.track, i.points]),
+        ]);
+      expect(poses(reloaded)).toEqual(poses(loaded));
+    });
+
+    it(`${file}: the merged streaming writer takes a 3.0 lazy store`, async () => {
+      quietWarnings();
+      const loaded = await readSlpLazy(fixture(file), { openVideos: false });
+      const bytes = await saveSlpMergedFromStores([loaded._lazyDataStore!]);
+      const reloaded = await readSlp(
+        new Uint8Array(bytes as Uint8Array).buffer as ArrayBuffer,
+        { openVideos: false },
+      );
+      loaded.materialize();
+      const frames = (labels: Labels) =>
+        poseSnapshot(labels).frames.map((f) => [
+          f.video,
+          f.frameIdx,
+          f.isNegative,
+          f.instances.map((i) => i.points),
+        ]);
+      expect(frames(reloaded)).toEqual(frames(loaded));
     });
   }
-
-  it("a lazy load saved without materializing keeps the poses", async () => {
-    quietWarnings();
-    const loaded = await readSlpLazy(fixture(SAVED), { openVideos: false });
-    const { reloaded, facts } = await saveAndInspect(loaded);
-    expect(facts.formatId).toBeLessThan(3);
-    loaded.materialize();
-    // A lazy save has never kept per-detection identities or categories, on any format.
-    const poses = (labels: Labels) =>
-      poseSnapshot(labels).frames.map((f) => [
-        f.video,
-        f.frameIdx,
-        f.isNegative,
-        f.instances.map((i) => [i.type, i.score, i.track, i.points]),
-      ]);
-    expect(poses(reloaded)).toEqual(poses(loaded));
-  });
-
-  it("the merged streaming writer takes a 3.0 lazy store", async () => {
-    quietWarnings();
-    const loaded = await readSlpLazy(fixture(SAVED), { openVideos: false });
-    const bytes = await saveSlpMergedFromStores([loaded._lazyDataStore!]);
-    const reloaded = await readSlp(
-      new Uint8Array(bytes as Uint8Array).buffer as ArrayBuffer,
-      { openVideos: false },
-    );
-    loaded.materialize();
-    const frames = (labels: Labels) =>
-      poseSnapshot(labels).frames.map((f) => [
-        f.video,
-        f.frameIdx,
-        f.isNegative,
-        f.instances.map((i) => i.points),
-      ]);
-    expect(frames(reloaded)).toEqual(frames(loaded));
-  });
 
   it("what a save loses: unknown columns, record metadata, the labeled flag", async () => {
     quietWarnings();

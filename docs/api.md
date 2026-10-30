@@ -920,6 +920,32 @@ id.color;     // "#ff0000"
 id.metadata;  // Record<string, unknown>
 ```
 
+### `Event`, `UserEvent`, `PredictedEvent`, `EventType`
+
+Frame-spanning annotations on `labels.events`, with their catalog on `labels.eventTypes` (SLP format 2.6, shared with Python sleap-io).
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `type` | `EventType` | Catalog entry; a bare string in the constructor makes one |
+| `video` | `Video \| null` | The video the event occurs in |
+| `startFrame` | `number` | First frame (inclusive) |
+| `endFrame` | `number` | Last frame (inclusive); defaults to `startFrame` |
+| `subject` | `Track \| Identity \| null` | Who the event is about |
+| `target` | `Track \| Identity \| null` | Who the event is directed at |
+| `name` | `string` | Name of this event |
+| `source` | `string` | Annotation source identifier |
+| `metadata` | `Record<string, string>` | Arbitrary string metadata |
+| `scores` | `Float32Array \| null` | *(PredictedEvent)* per-frame confidence, one per frame |
+| `score` | `number \| null` | *(PredictedEvent)* overall confidence |
+
+Getters: `isPredicted`, `isDirected`, `isInstantaneous`, `nFrames`. Methods: `contains(frameIdx)`, `overlaps(other)`. `cloneEvent(event, refs?)` copies an event, optionally replacing its `type`, `video`, `subject` or `target`.
+
+`EventType` has `name`, `description`, `metadata` and `matches(other, method = "name")`; types are matched across files by name.
+
+`labels.getEvents({ video, subject, type, frameIdx, predicted })` filters events; `frameIdx` matches every event whose span covers that frame, and `type` is matched by name. `labels.eventsAt(video, frameIdx, subject?)` is shorthand for "what is happening at this frame?".
+
+`buildEventSignatures(labels)` and `readEventSignaturesStreaming(file)` give comparable signatures of the events in memory and on disk, for `checkInPlaceWritable`'s `sidecars.onDisk.events`.
+
 ### `Instance3D` and `PredictedInstance3D`
 
 3D keypoint data from multi-camera triangulation.

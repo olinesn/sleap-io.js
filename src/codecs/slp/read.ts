@@ -55,6 +55,13 @@ import {
   RecordingSession,
 } from "../../model/camera.js";
 import { Identity } from "../../model/identity.js";
+import type { Event, EventType } from "../../model/event.js";
+import {
+  type EventColumns,
+  type EventTypeColumns,
+  buildEventTypes,
+  buildEvents,
+} from "./events.js";
 import { Embedding } from "../../model/embedding.js";
 import { LazyDataStore, LazyFrameList } from "../../model/lazy.js";
 import { buildVideoIdMap } from "../../model/video-id-map.js";
@@ -387,6 +394,7 @@ export async function readSlp(
       identities,
       provenance: (metadataJson?.provenance as Record<string, unknown>) ?? {},
       rois: staticRois,
+      ...readEventsAndTypes(file, videos, tracks, identities),
     });
     // Sessions are read before the frame store exists; wire the lazy frame
     // resolver now so ref-backed grouping resolves against labels.labeledFrames.
@@ -683,6 +691,7 @@ export async function readSlpLazy(
       sessions,
       identities,
       provenance: (metadataJson?.provenance as Record<string, unknown>) ?? {},
+      ...readEventsAndTypes(file, videos, tracks, identities),
     });
 
     // Replace the eager labeledFrames with lazy proxy
@@ -1251,6 +1260,66 @@ function readIdentityCatalog(file: any): Identity[] {
   const json = file.get("identities_json");
   if (json) return readIdentities(json);
   return readIdentityGroup(file);
+}
+
+/**
+ * Read the `/event_types` catalog and the `/events` group (SLP 2.6), as Python
+ * sleap-io writes them. Empty lists when the groups are absent (older files).
+ */
+function readEventsAndTypes(
+  file: any,
+  videos: Video[],
+  tracks: Track[],
+  identities: Identity[],
+): { eventTypes: EventType[]; events: Event[] } {
+  const num = (name: string): ArrayLike<number | bigint> | undefined =>
+    file.get(name)?.value as ArrayLike<number | bigint> | undefined;
+  const str = (name: string): string[] | undefined => {
+    const ds = file.get(name);
+    return ds
+      ? Array.from(ds.value as ArrayLike<unknown>, decodeStr)
+      : undefined;
+  };
+
+  let eventTypes: EventType[] = [];
+  const names = str("event_types/name");
+  if (names) {
+    const types: EventTypeColumns = {
+      name: names,
+      description: str("event_types/description"),
+      metaOwner: num("event_types/meta_owner"),
+      metaKey: str("event_types/meta_key"),
+      metaVal: str("event_types/meta_val"),
+    };
+    eventTypes = buildEventTypes(types);
+  }
+
+  const video = num("events/video");
+  if (!video) return { eventTypes, events: [] };
+  const col = (name: string) => num(`events/${name}`) ?? [];
+  const cols: EventColumns = {
+    video,
+    startFrame: col("start_frame"),
+    endFrame: col("end_frame"),
+    type: col("type"),
+    subjectKind: col("subject_kind"),
+    targetKind: col("target_kind"),
+    subjectIdx: col("subject_idx"),
+    targetIdx: col("target_idx"),
+    isPredicted: col("is_predicted") as EventColumns["isPredicted"],
+    name: str("events/name"),
+    source: str("events/source"),
+    score: num("events/score") as ArrayLike<number> | undefined,
+    scores: num("events/scores") as ArrayLike<number> | undefined,
+    scoreOffsets: num("events/score_offsets"),
+    metaOwner: num("events/meta_owner"),
+    metaKey: str("events/meta_key"),
+    metaVal: str("events/meta_val"),
+  };
+  return {
+    eventTypes,
+    events: buildEvents(cols, videos, eventTypes, tracks, identities),
+  };
 }
 
 /** A detection that can carry a per-detection identity/embedding (SLP 2.5). */

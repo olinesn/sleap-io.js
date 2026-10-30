@@ -64,6 +64,14 @@ import {
   RecordingSession,
 } from "../../model/camera.js";
 import { Identity } from "../../model/identity.js";
+import type { Event, EventType } from "../../model/event.js";
+import {
+  type EventColumns,
+  type EventTypeColumns,
+  buildEventTypes,
+  buildEvents,
+  eventSignatures,
+} from "./events.js";
 import { Embedding } from "../../model/embedding.js";
 import { StreamingHdf5VideoBackend } from "../../video/streaming-hdf5-video.js";
 import { CropVideoBackend } from "../../video/crop-backend.js";
@@ -512,6 +520,12 @@ export async function readFromStreamingFile(
     identities,
     rawSessions,
   );
+  const { eventTypes, events } = await readEventsStreaming(
+    file,
+    videos,
+    tracks,
+    identities,
+  );
 
   onProgress?.(total, total, "Finalizing");
   // In lazy mode omit `labeledFrames` entirely (mirrors readSlpLazy): the Labels
@@ -526,6 +540,8 @@ export async function readFromStreamingFile(
     sessions,
     identities,
     provenance: (metadataJson?.provenance as Record<string, unknown>) ?? {},
+    eventTypes,
+    events,
   });
   if (lazyStore) {
     // Attach the lazy proxies BEFORE injectSessionFrameResolver so the resolver's
@@ -1159,6 +1175,110 @@ async function readIdentitiesStreaming(
   } catch {
     return [];
   }
+}
+
+/** Read the `/event_types` and `/events` columns over the streaming API, as stored. */
+async function readEventColumnsStreaming(file: StreamingH5File): Promise<{
+  types: EventTypeColumns | null;
+  events: EventColumns | null;
+}> {
+  const keys = file.keys();
+  const group = async (name: string): Promise<Set<string>> =>
+    keys.includes(name) ? new Set(await file.getKeys(name)) : new Set();
+  const typeKeys = await group("event_types");
+  const eventKeys = await group("events");
+  const num = async (
+    present: Set<string>,
+    groupName: string,
+    name: string,
+  ): Promise<Array<number | bigint> | undefined> =>
+    present.has(name)
+      ? (normalizeDatasetArray(
+          (await file.getDatasetValue(`${groupName}/${name}`)).value,
+        ) as Array<number | bigint>)
+      : undefined;
+  const str = async (
+    present: Set<string>,
+    groupName: string,
+    name: string,
+  ): Promise<string[] | undefined> =>
+    present.has(name)
+      ? normalizeDatasetArray(
+          (await file.getDatasetValue(`${groupName}/${name}`)).value,
+        ).map((v) => decodeEntryText(v) ?? "")
+      : undefined;
+
+  let types: EventTypeColumns | null = null;
+  const names = await str(typeKeys, "event_types", "name");
+  if (names) {
+    types = {
+      name: names,
+      description: await str(typeKeys, "event_types", "description"),
+      metaOwner: await num(typeKeys, "event_types", "meta_owner"),
+      metaKey: await str(typeKeys, "event_types", "meta_key"),
+      metaVal: await str(typeKeys, "event_types", "meta_val"),
+    };
+  }
+
+  let events: EventColumns | null = null;
+  const video = await num(eventKeys, "events", "video");
+  if (video) {
+    const col = async (name: string) =>
+      (await num(eventKeys, "events", name)) ?? [];
+    events = {
+      video,
+      startFrame: await col("start_frame"),
+      endFrame: await col("end_frame"),
+      type: await col("type"),
+      subjectKind: await col("subject_kind"),
+      targetKind: await col("target_kind"),
+      subjectIdx: await col("subject_idx"),
+      targetIdx: await col("target_idx"),
+      isPredicted: (await col("is_predicted")) as EventColumns["isPredicted"],
+      name: await str(eventKeys, "events", "name"),
+      source: await str(eventKeys, "events", "source"),
+      score: (await num(eventKeys, "events", "score")) as number[] | undefined,
+      scores: (await num(eventKeys, "events", "scores")) as
+        | number[]
+        | undefined,
+      scoreOffsets: await num(eventKeys, "events", "score_offsets"),
+      metaOwner: await num(eventKeys, "events", "meta_owner"),
+      metaKey: await str(eventKeys, "events", "meta_key"),
+      metaVal: await str(eventKeys, "events", "meta_val"),
+    };
+  }
+  return { types, events };
+}
+
+/**
+ * Read the event catalog and the events (SLP 2.6) over the streaming API. Empty
+ * lists when the groups are absent (older files).
+ */
+async function readEventsStreaming(
+  file: StreamingH5File,
+  videos: Video[],
+  tracks: Track[],
+  identities: Identity[],
+): Promise<{ eventTypes: EventType[]; events: Event[] }> {
+  const { types, events } = await readEventColumnsStreaming(file);
+  const eventTypes = types ? buildEventTypes(types) : [];
+  return {
+    eventTypes,
+    events: events
+      ? buildEvents(events, videos, eventTypes, tracks, identities)
+      : [],
+  };
+}
+
+/**
+ * The signatures of the events on disk, to compare with
+ * `buildExpectedSidecars(labels).events` before an in-place save.
+ */
+export async function readEventSignaturesStreaming(
+  file: StreamingH5File,
+): Promise<string[]> {
+  const { types, events } = await readEventColumnsStreaming(file);
+  return eventSignatures(types, events);
 }
 
 /**

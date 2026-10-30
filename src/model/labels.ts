@@ -18,7 +18,13 @@ import {
   cloneRecordingSession,
   injectSessionFrameResolver,
 } from "./camera.js";
-import type { Identity } from "./identity.js";
+import { Identity } from "./identity.js";
+import {
+  type Event,
+  type EventParticipant,
+  EventType,
+  cloneEvent,
+} from "./event.js";
 import { toDict } from "../codecs/dictionary.js";
 import { labelsFromNumpy } from "../codecs/numpy.js";
 import { type LazyDataStore, LazyFrameList } from "./lazy.js";
@@ -166,6 +172,11 @@ export class Labels {
   provenance: Record<string, unknown>;
   identities: Identity[];
 
+  // Frame-spanning events and their catalog (the "ethogram"). Not on any frame: an
+  // event may cover frames with no pose labels.
+  eventTypes: EventType[];
+  events: Event[];
+
   // Static ROIs: not tied to any specific frame (e.g., arena boundaries).
   _staticRois: ROI[];
 
@@ -204,6 +215,8 @@ export class Labels {
     provenance?: Record<string, unknown>;
     rois?: ROI[];
     identities?: Identity[];
+    eventTypes?: EventType[];
+    events?: Event[];
   }) {
     this.labeledFrames = options?.labeledFrames ?? [];
     this.videos = options?.videos ?? [];
@@ -214,6 +227,8 @@ export class Labels {
     this.provenance = options?.provenance ?? {};
     this._staticRois = options?.rois ?? [];
     this.identities = options?.identities ?? [];
+    this.eventTypes = options?.eventTypes ?? [];
+    this.events = options?.events ?? [];
 
     if (!this.videos.length && this.labeledFrames.length) {
       const uniqueVideos = new Map<string | Video, Video>();
@@ -252,6 +267,52 @@ export class Labels {
       if (roi.track && !existingTracks.has(roi.track)) {
         existingTracks.add(roi.track);
         this.tracks.push(roi.track);
+      }
+    }
+    this._collectEvents();
+  }
+
+  /**
+   * Register catalog entries and participants referenced by `events`: every
+   * referenced `EventType` goes in `eventTypes` (deduped by name, rebinding each
+   * event's `type` onto the first entry of that name), and every video, `Track` and
+   * `Identity` an event uses goes in `videos` / `tracks` / `identities`. Called on
+   * construction, from {@link update} and again at save time, so an event appended
+   * afterwards is not dropped. Idempotent. Port of Python `_collect_events`.
+   */
+  _collectEvents(): void {
+    const byName = new Map<string, EventType>();
+    for (const et of this.eventTypes) {
+      if (!byName.has(et.name)) byName.set(et.name, et);
+    }
+    for (const ev of this.events) {
+      const canonical = byName.get(ev.type.name);
+      if (canonical === undefined) byName.set(ev.type.name, ev.type);
+      else if (canonical !== ev.type) ev.type = canonical;
+    }
+    if (byName.size !== this.eventTypes.length) {
+      this.eventTypes.length = 0;
+      this.eventTypes.push(...byName.values());
+    }
+    if (!this.events.length) return;
+    const videos = new Set(this.videos);
+    const tracks = new Set(this.tracks);
+    const identities = new Set(this.identities);
+    for (const ev of this.events) {
+      if (ev.video && !videos.has(ev.video)) {
+        videos.add(ev.video);
+        this.videos.push(ev.video);
+      }
+      for (const p of [ev.subject, ev.target]) {
+        if (p instanceof Track) {
+          if (!tracks.has(p)) {
+            tracks.add(p);
+            this.tracks.push(p);
+          }
+        } else if (p instanceof Identity && !identities.has(p)) {
+          identities.add(p);
+          this.identities.push(p);
+        }
       }
     }
   }
@@ -1072,6 +1133,47 @@ export class Labels {
     return results;
   }
 
+  /**
+   * Query frame-spanning events. Unlike the per-frame accessors, `frameIdx` matches
+   * every event whose inclusive span covers that frame, not events "on" one frame.
+   * `type` is matched by name, so either an `EventType` or a bare name works.
+   * `subject` is compared by object identity. `predicted` selects `PredictedEvent`s
+   * (`true`) or `UserEvent`s (`false`).
+   */
+  getEvents(filters?: {
+    video?: Video | string | URL;
+    subject?: EventParticipant;
+    type?: EventType | string;
+    frameIdx?: number;
+    predicted?: boolean;
+  }): Event[] {
+    if (!filters) return [...this.events];
+    const video =
+      filters.video !== undefined
+        ? (this._resolveVideo(filters.video) ?? undefined)
+        : undefined;
+    const typeName =
+      filters.type instanceof EventType ? filters.type.name : filters.type;
+    return this.events.filter(
+      (ev) =>
+        (filters.video === undefined || ev.video === video) &&
+        (filters.frameIdx === undefined || ev.contains(filters.frameIdx)) &&
+        (filters.subject === undefined || ev.subject === filters.subject) &&
+        (typeName === undefined || ev.type.name === typeName) &&
+        (filters.predicted === undefined ||
+          ev.isPredicted === filters.predicted),
+    );
+  }
+
+  /** Every event covering `frameIdx` in `video` ("what is happening at this frame?"). */
+  eventsAt(
+    video: Video | string | URL,
+    frameIdx: number,
+    subject?: EventParticipant,
+  ): Event[] {
+    return this.getEvents({ video, frameIdx, subject });
+  }
+
   getLabelImages(filters?: {
     video?: Video | string | URL;
     frameIdx?: number;
@@ -1168,6 +1270,11 @@ export class Labels {
       if (mapped) suggestion.video = mapped;
     }
 
+    for (const ev of this.events) {
+      const mapped = ev.video ? videoMap.get(ev.video) : undefined;
+      if (mapped) ev.video = mapped;
+    }
+
     // Update static ROIs
     for (const roi of this._staticRois) {
       if (roi.video && videoMap.has(roi.video))
@@ -1182,8 +1289,8 @@ export class Labels {
 
   /**
    * Remove one or more videos and every reference to them — the "drop" analog
-   * of {@link replaceVideos}. Labeled frames and suggestions belonging to a
-   * removed video are dropped (a frame's ROIs go with it), as are static ROIs
+   * of {@link replaceVideos}. Labeled frames, suggestions and events belonging to
+   * a removed video are dropped (a frame's ROIs go with it), as are static ROIs
    * that reference it. Videos not present are ignored (a no-op, matching
    * {@link addVideo}'s lenient convention).
    *
@@ -1200,6 +1307,9 @@ export class Labels {
       (lf) => !toRemove.has(lf.video),
     );
     this.suggestions = this.suggestions.filter((s) => !toRemove.has(s.video));
+    this.events = this.events.filter(
+      (ev) => !ev.video || !toRemove.has(ev.video),
+    );
     this._staticRois = this._staticRois.filter(
       (roi) => !roi.video || !toRemove.has(roi.video),
     );
@@ -1273,6 +1383,41 @@ export class Labels {
       trackMap.set(t, nt);
       return nt;
     });
+
+    // Clone identities, the event catalog, and events with their references
+    // remapped onto the copies.
+    const identityMap = new Map<Identity, Identity>();
+    const newIdentities = this.identities.map((id) => {
+      const ni = new Identity({
+        name: id.name,
+        color: id.color,
+        metadata: structuredClone(id.metadata),
+      });
+      identityMap.set(id, ni);
+      return ni;
+    });
+    const eventTypeMap = new Map<EventType, EventType>();
+    const newEventTypes = this.eventTypes.map((et) => {
+      const ne = new EventType({
+        name: et.name,
+        description: et.description,
+        metadata: { ...et.metadata },
+      });
+      eventTypeMap.set(et, ne);
+      return ne;
+    });
+    const remapParticipant = (p: EventParticipant | null) =>
+      p === null
+        ? null
+        : (trackMap.get(p as Track) ?? identityMap.get(p as Identity) ?? p);
+    const newEvents = this.events.map((ev) =>
+      cloneEvent(ev, {
+        type: eventTypeMap.get(ev.type) ?? ev.type,
+        video: ev.video ? (videoMap.get(ev.video) ?? ev.video) : null,
+        subject: remapParticipant(ev.subject),
+        target: remapParticipant(ev.target),
+      }),
+    );
 
     // Helper: clone an instance with remapped skeleton/track
     const cloneInstance = (
@@ -1414,7 +1559,9 @@ export class Labels {
           cloneRecordingSession(s, { videoMap }),
         ),
         provenance: { ...this.provenance },
-        identities: structuredClone(this.identities),
+        identities: newIdentities,
+        eventTypes: newEventTypes,
+        events: newEvents,
       });
 
       labelsCopy._lazyDataStore = newStore;
@@ -1467,7 +1614,9 @@ export class Labels {
         ),
         provenance: { ...this.provenance },
         rois: cloneAncillary(this._staticRois),
-        identities: structuredClone(this.identities),
+        identities: newIdentities,
+        eventTypes: newEventTypes,
+        events: newEvents,
       });
       injectSessionFrameResolver(labelsCopy);
     }
@@ -1689,6 +1838,7 @@ export class Labels {
         this.videos.push(sf.video);
       }
     }
+    this._collectEvents();
   }
 
   /**
@@ -1909,6 +2059,9 @@ export class Labels {
     // ----- §6.3 lazy guard + init -------------------------------------------
     // JS convention: materialize a lazy Labels rather than raising.
     if (this._lazyFrameList) this.materialize();
+    // Register what the source's events reference, so those videos and tracks flow
+    // through the same matching as the rest (a no-op without events).
+    other._collectEvents();
 
     const result = new MergeResult(true);
 
@@ -2247,6 +2400,64 @@ export class Labels {
             }),
           );
         }
+      }
+
+      // ----- STEP 5b: events ----------------------------------------------
+      // Each incoming event is copied with its references rerouted onto this
+      // object's catalogs: the type and identities by name, the video and tracks
+      // through their matching. An event whose (video, span, type, subject, target,
+      // predicted?) already exists is skipped, so re-merging a source is idempotent;
+      // scores are not part of that key, so an exact re-merge keeps the first copy.
+      if (other.eventTypes.length || other.events.length) {
+        const typeMap = new Map<EventType, EventType>();
+        for (const otherType of other.eventTypes) {
+          let matched = this.eventTypes.find((t) => t.matches(otherType));
+          if (!matched) {
+            matched = otherType;
+            this.eventTypes.push(otherType);
+          }
+          typeMap.set(otherType, matched);
+        }
+        const remapParticipant = (
+          p: EventParticipant | null,
+        ): EventParticipant | null => {
+          if (p === null) return null;
+          if (p instanceof Track) return trackMap.get(p) ?? p;
+          let matched = this.identities.find((id) => id.name === p.name);
+          if (!matched) {
+            matched = p;
+            this.identities.push(p);
+          }
+          return matched;
+        };
+        const eventKey = (ev: Event): string =>
+          [
+            ev.video ? this.videos.indexOf(ev.video) : -1,
+            ev.startFrame,
+            ev.endFrame,
+            ev.type.name,
+            ev.subject === null ? "" : ev.subject.name,
+            ev.subject instanceof Track ? "t" : "i",
+            ev.target === null ? "" : ev.target.name,
+            ev.target instanceof Track ? "t" : "i",
+            ev.isPredicted,
+          ].join("\u0001");
+        const existing = new Set(this.events.map(eventKey));
+        for (const otherEvent of other.events) {
+          const merged = cloneEvent(otherEvent, {
+            type: typeMap.get(otherEvent.type) ?? otherEvent.type,
+            video: otherEvent.video
+              ? (videoMap.get(otherEvent.video) ?? otherEvent.video)
+              : null,
+            subject: remapParticipant(otherEvent.subject),
+            target: remapParticipant(otherEvent.target),
+          });
+          const key = eventKey(merged);
+          if (existing.has(key)) continue;
+          existing.add(key);
+          this.events.push(merged);
+        }
+        this._collectEvents();
       }
 
       // ----- §6.9 success tail --------------------------------------------

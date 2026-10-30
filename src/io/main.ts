@@ -100,9 +100,8 @@ export async function loadSlp(
           lazy,
         });
       } catch (e) {
-        // A file too new to read fails the same way on every reader, so don't retry
-        // it on the main thread. The retry could also hide this error: reading a
-        // picked File there aborts h5wasm (seen in Chromium) before any format check.
+        // A file too new to read fails the same way on every reader, so a retry on
+        // the main thread would only read the whole file first.
         if (
           streamMode === "auto" &&
           !(e instanceof UnsupportedSlpFormatError)

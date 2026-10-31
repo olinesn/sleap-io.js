@@ -36,6 +36,7 @@ import {
   reconstructInstance3D,
   resolveIdentity,
 } from "./parsers.js";
+import { urlBasename } from "../../io/remote.js";
 import { buildSourceVideoFromDict } from "./source-video.js";
 import { Labels } from "../../model/labels.js";
 import { LabeledFrame } from "../../model/labeled-frame.js";
@@ -311,8 +312,7 @@ export async function readFromStreamingFile(
     onProgress?.(n, total, message ?? STAGES[n]);
 
   report(0);
-  const labelsPath =
-    filenameHint ?? url.split("/").pop()?.split("?")[0] ?? "slp-data.slp";
+  const labelsPath = filenameHint ?? urlBasename(url);
   // A missing `metadata` group surfaces from the worker as a thrown
   // "Path not found: metadata"; treat that the same as a missing `json`
   // attribute (both indicate a truncated/corrupt file) and route it through

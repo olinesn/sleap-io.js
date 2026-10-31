@@ -16,8 +16,9 @@ import {
 import {
   RemoteIOError,
   isUrl,
-  redactUrl,
+  redactUrlsInText,
   resolveUrl,
+  urlBasename,
 } from "../../io/remote.js";
 import type {
   SerializableEmbedEntry,
@@ -327,16 +328,19 @@ export class StreamingH5File {
         } else if (data.error && typeof data.error === "object") {
           errorMessage = JSON.stringify(data.error);
         }
-        pending.reject(new Error(errorMessage));
+        // The worker can't import redactUrl, and h5wasm and the browser quote the
+        // URL in what they say, so its failures are masked here.
+        pending.reject(new Error(redactUrlsInText(errorMessage)));
       }
     }
   }
 
   private handleError(e: ErrorEvent): void {
-    console.error("[StreamingH5File] Worker error:", e.message);
+    const message = redactUrlsInText(e.message);
+    console.error("[StreamingH5File] Worker error:", message);
     // Reject all pending messages
     for (const [id, pending] of this.pendingMessages) {
-      pending.reject(new Error(`Worker error: ${e.message}`));
+      pending.reject(new Error(`Worker error: ${message}`));
       this.pendingMessages.delete(id);
     }
   }
@@ -396,13 +400,11 @@ export class StreamingH5File {
     }
 
     const filename =
-      options?.filenameHint ||
-      resolvedUrl.split("/").pop()?.split("?")[0] ||
-      "data.h5";
+      options?.filenameHint || urlBasename(resolvedUrl) || "data.h5";
     const result = await this.send("openUrl", {
       url: resolvedUrl,
       // Only for showing, so a hint that's a URL mustn't bring its token along.
-      filename: isUrl(filename) ? redactUrl(filename) : filename,
+      filename: redactUrlsInText(filename),
       headers: options?.headers,
     });
     this._keys = (result.keys as string[]) || [];
@@ -419,7 +421,9 @@ export class StreamingH5File {
     // Initialize if not already done
     await this.init(options);
 
-    const filename = options?.filenameHint || file.name || "data.h5";
+    const filename = redactUrlsInText(
+      options?.filenameHint || file.name || "data.h5",
+    );
     const result = await this.send("openLocal", { file, filename });
     this._keys = (result.keys as string[]) || [];
     this._isOpen = true;
@@ -438,7 +442,7 @@ export class StreamingH5File {
     // Initialize if not already done
     await this.init(options);
 
-    const filename = options?.filenameHint || "data.h5";
+    const filename = redactUrlsInText(options?.filenameHint || "data.h5");
     // Transfer the buffer to the worker for efficiency
     const data = buffer instanceof Uint8Array ? buffer.buffer : buffer;
     const result = await this.send("openBuffer", { buffer: data, filename });
@@ -474,7 +478,7 @@ export class StreamingH5File {
     this.rangeControl = new Int32Array(sab, 0, 8);
     this.rangeData = new Uint8Array(sab, CONTROL_BYTES);
 
-    const filename = options?.filenameHint || "data.h5";
+    const filename = redactUrlsInText(options?.filenameHint || "data.h5");
     const result = await this.send("openRange", {
       sab,
       size: source.size,
@@ -747,15 +751,16 @@ export class StreamingH5Writer {
         } else if (data.error && typeof data.error === "object") {
           errorMessage = JSON.stringify(data.error);
         }
-        pending.reject(new Error(errorMessage));
+        pending.reject(new Error(redactUrlsInText(errorMessage)));
       }
     }
   }
 
   private handleError(e: ErrorEvent): void {
-    console.error("[StreamingH5Writer] Worker error:", e.message);
+    const message = redactUrlsInText(e.message);
+    console.error("[StreamingH5Writer] Worker error:", message);
     for (const [id, pending] of this.pendingMessages) {
-      pending.reject(new Error(`Worker error: ${e.message}`));
+      pending.reject(new Error(`Worker error: ${message}`));
       this.pendingMessages.delete(id);
     }
   }

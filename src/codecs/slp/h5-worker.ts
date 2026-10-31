@@ -53,10 +53,9 @@ function parseRetryAfterMsWorker(value) {
 // fetch wrapped in retry/backoff: retries transient network errors and
 // retryable statuses (429/5xx), honoring Retry-After. Returns the Response for
 // any non-retryable status so the caller handles it. Mirrors fetchRetrying in
-// ../../io/remote.ts. Errors are NOT redacted here because the worker only ever
-// sees URLs the main thread already resolved; the main thread re-wraps worker
-// failures, and no token-bearing URL reaches this transport in the streaming
-// path (Drive/headers route through the buffer download, not createLazyFile).
+// ../../io/remote.ts. Errors are NOT redacted here because this worker can't import
+// redactUrl: StreamingH5File masks any URL in a failure it reports, including what
+// h5wasm and the browser say themselves ("Couldn't load https://...").
 async function fetchRetryingWorker(url, init, retries) {
   const max = retries == null ? 3 : retries;
   let attempt = 0;

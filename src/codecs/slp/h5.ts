@@ -2,7 +2,7 @@ import {
   RemoteIOError,
   fetchRetrying,
   isUrl,
-  redactUrl,
+  redactUrlsInText,
   resolveUrl,
   statusToMessage,
 } from "../../io/remote.js";
@@ -211,8 +211,9 @@ export async function openH5File(
 
 /** What to tell someone whose file HDF5 can't open. The Worker says the same. */
 export function cannotOpenAsHdf5Message(name: string): string {
+  const shown = redactUrlsInText(name);
   return (
-    `Could not open '${name}' as an HDF5 file. It may be missing, incomplete ` +
+    `Could not open '${shown}' as an HDF5 file. It may be missing, incomplete ` +
     "(cut off, or still downloading), or not a SLEAP file at all."
   );
 }
@@ -231,9 +232,7 @@ export function checkOpenedAsHdf5(
   if (Number(file.file_id) >= 0) return;
   const name =
     typeof source === "string"
-      ? isUrl(source)
-        ? redactUrl(source)
-        : source
+      ? source
       : (options?.filenameHint ??
         (source as { name?: string }).name ??
         "this file");

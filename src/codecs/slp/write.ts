@@ -1419,13 +1419,11 @@ export class SlpStreamWriter {
   close(): Uint8Array {
     if (this.closed) throw new Error("SlpStreamWriter is already closed");
     this.closed = true;
+    this.finalizeFile();
     const fs = getH5FileSystem(this.module);
-    try {
-      this.finalizeFile();
-      return fs.readFile!(this.memPath);
-    } finally {
-      fs.unlink!(this.memPath);
-    }
+    const bytes = fs.readFile!(this.memPath);
+    fs.unlink!(this.memPath);
+    return bytes;
   }
 
   /**
@@ -1443,6 +1441,7 @@ export class SlpStreamWriter {
   ): Promise<void> {
     if (this.closed) throw new Error("SlpStreamWriter is already closed");
     this.closed = true;
+    this.finalizeFile();
 
     const fs = getH5FileSystem(this.module);
     const cfs = fs as unknown as ChunkedFs;
@@ -1451,7 +1450,6 @@ export class SlpStreamWriter {
       Math.trunc(opts?.chunkBytes ?? 8 * 1024 * 1024),
     );
     try {
-      this.finalizeFile();
       if (cfs.open && cfs.read && cfs.close && cfs.stat) {
         const size = Number(cfs.stat(this.memPath).size);
         const stream = cfs.open(this.memPath, "r");

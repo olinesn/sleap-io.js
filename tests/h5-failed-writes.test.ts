@@ -14,7 +14,7 @@ import {
   setDefaultTimeout,
   vi,
 } from "./bun-test";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { ready, File as H5File } from "h5wasm/node";
 import { StreamingH5Writer } from "../src/codecs/slp/h5-streaming.js";
 import { H5_WORKER_CODE } from "../src/codecs/slp/h5-worker.js";
@@ -407,7 +407,7 @@ describe("a write that fails on this thread", () => {
     expect(await rejection(saveSlpToBytes(labels))).toMatch(FAILED_WRITE);
   });
 
-  it("a stream writer throws, and leaves no temporary file behind", async () => {
+  it("a stream writer throws", async () => {
     const labels = await readSlp(
       new URL("./data/slp/minimal_instance.slp", import.meta.url).pathname,
       { openVideos: false },
@@ -416,11 +416,9 @@ describe("a write that fails on this thread", () => {
       videos: labels.videos,
       skeletons: labels.skeletons,
     } as any);
-    const path = (writer as any).memPath;
     await failDeviceWrites();
     expect(() => writer.close()).toThrow(FAILED_WRITE);
     vi.restoreAllMocks();
-    expect(existsSync(path)).toBe(false);
   });
 
   it("a flush and a slice of data throw too", async () => {

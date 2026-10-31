@@ -394,13 +394,23 @@ async function openRemoteFile(url, filename = 'data.h5', headers) {
 // Opening doesn't throw for a file HDF5 can't open: it hands back an invalid id, and
 // keys() then fails with "error - name not defined!". Same words as
 // cannotOpenAsHdf5Message in h5.ts, which this worker code can't import.
-function keysOfOpenedFile() {
-  if (Number(currentFile.file_id) < 0) {
-    throw new Error("Could not open '" + currentFilename + "' as an HDF5 file. "
+function keysOfOpenedFile(file = currentFile, name = currentFilename) {
+  if (Number(file.file_id) < 0) {
+    throw new Error("Could not open '" + name + "' as an HDF5 file. "
       + "It may be missing, incomplete (cut off, or still downloading), or not a "
       + "SLEAP file at all.");
   }
-  return currentFile.keys();
+  return file.keys();
+}
+
+// Mount a File with WORKERFS (zero-copy access) and return the path to open. It goes
+// in under a name of our own, so that path can't disagree with the mount. WORKERFS
+// would otherwise use file.name, which needn't work as a path ('', '/a.slp', '../a.slp').
+// A name the caller gives the file is only for showing: it can be a full path or a URL.
+function mountWorkerfsFile(file, dir) {
+  FS.mkdir(dir);
+  FS.mount(FS.filesystems.WORKERFS, { blobs: [{ name: 'local.h5', data: file }] }, dir);
+  return dir + '/local.h5';
 }
 
 async function openLocalFile(file, filename) {
@@ -411,21 +421,14 @@ async function openLocalFile(file, filename) {
   // Close any existing file
   closeFile();
 
-  // Use provided filename or file.name
-  const fname = filename || file.name || 'local.h5';
-
   // Create mount point for WORKERFS
   mountPath = '/local-' + Date.now();
   mountType = 'local';
-  currentFilename = fname;
-  FS.mkdir(mountPath);
-
-  // Mount the file using WORKERFS (zero-copy access)
-  FS.mount(FS.filesystems.WORKERFS, { files: [file] }, mountPath);
+  // What messages call this file: the provided filename or file.name
+  currentFilename = filename || file.name || 'local.h5';
 
   // Open with h5wasm
-  const filePath = mountPath + '/' + fname;
-  currentFile = new h5wasm.File(filePath, 'r');
+  currentFile = new h5wasm.File(mountWorkerfsFile(file, mountPath), 'r');
 
   return {
     success: true,
@@ -884,14 +887,9 @@ async function openAppendOpfs(destOpfsPath, sourceFile, structureBytes, sourceFi
   closeFile();
 
   // SOURCE: the user's opened file, read-only via WORKERFS (on-demand sync reads).
-  var srcFname = (sourceFile && sourceFile.name) || sourceFilename || 'source.slp';
-  srcFname = (((srcFname).split('/').pop() || '').split('\\\\').pop()) || 'source.slp';
   sourceMountPath = '/opfs-append-src-' + Date.now();
-  sourceMountFilename = srcFname;
   sourceMountIsWorkerfs = true;
-  FS.mkdir(sourceMountPath);
-  FS.mount(FS.filesystems.WORKERFS, { files: [sourceFile] }, sourceMountPath);
-  currentSourceFile = new h5wasm.File(sourceMountPath + '/' + srcFname, 'r');
+  currentSourceFile = new h5wasm.File(mountWorkerfsFile(sourceFile, sourceMountPath), 'r');
 
   // DEST: seed the OPFS file with the structure bytes, then open it append-mode
   // over the OPFS write device.
@@ -914,7 +912,7 @@ async function openAppendOpfs(destOpfsPath, sourceFile, structureBytes, sourceFi
 
   return {
     success: true,
-    sourceKeys: currentSourceFile.keys(),
+    sourceKeys: keysOfOpenedFile(currentSourceFile, sourceFilename || sourceFile.name || 'source.slp'),
     destKeys: currentDestFile.keys()
   };
 }

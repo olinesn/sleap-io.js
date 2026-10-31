@@ -186,8 +186,13 @@ const looksLikeBrowser = (yes: boolean) =>
 /** Where h5wasm's error output goes. It takes console.error once, as it starts. */
 let h5wasmOutput: (...args: unknown[]) => void = console.error;
 
+type BrowserH5wasm = {
+  ready: Promise<unknown>;
+  Module: { onAbort?: (what: unknown) => void };
+};
+
 /** h5wasm's browser build, which checks at startup that it's in a Worker. */
-const h5wasm: { ready: Promise<unknown> } = await (async () => {
+const h5wasm: BrowserH5wasm = await (async () => {
   vi.stubGlobal("WorkerGlobalScope", class {});
   looksLikeBrowser(true);
   const source = readFileSync(
@@ -198,9 +203,7 @@ const h5wasm: { ready: Promise<unknown> } = await (async () => {
   );
   const { error } = console;
   console.error = (...args) => h5wasmOutput(...args);
-  const module = new Function(`${source}\nreturn h5wasm;`)() as {
-    ready: Promise<unknown>;
-  };
+  const module = new Function(`${source}\nreturn h5wasm;`)() as BrowserH5wasm;
   console.error = error;
   await module.ready;
   looksLikeBrowser(false);
@@ -704,6 +707,54 @@ describe("a URL that fails", () => {
     const longest = AWKWARD_URLS[AWKWARD_URLS.length - 1];
     expect(asChromiumQuotes(longest)).not.toContain("?");
     expect(asChromiumQuotes(longest)).toContain("SECRET");
+  });
+
+  it("h5wasm doesn't print it either", async () => {
+    const said: string[] = [];
+    h5wasmOutput = (...args) => said.push(args.join(" "));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const message = await failureOf(`${MISSING}?token=SECRET`);
+    expect(message).toContain("Status: 404");
+    expect(message).not.toContain("-sASSERTIONS");
+
+    server.refusesHead = true;
+    await failureOf(`${GOOD}?token=SECRET`);
+    server.refusesHead = false;
+
+    const file = await openH5Worker(`${BIG}?token=SECRET`);
+    server.failsFrom = 1024 * 1024;
+    await messageOf(file.getDatasetValue("pred_points"));
+    await file.close();
+
+    expect(said.join("\n")).not.toContain("SECRET");
+    expect(said.join("\n")).not.toContain("Couldn't load");
+  });
+
+  it("an abort that quotes no URL goes on as before", async () => {
+    quietConsole();
+    await (await openH5Worker(GOOD)).close();
+    const { onAbort } = h5wasm.Module;
+    expect(onAbort).toBeFunction();
+    expect(() => onAbort?.("something else")).not.toThrow();
+    expect(() => onAbort?.(undefined)).not.toThrow();
+    expect(() => onAbort?.("Couldn't load https://x.test/y")).toThrow(
+      "Aborted(Couldn't load https://x.test/y)",
+    );
+  });
+
+  it("a build of h5wasm with no Module still starts", async () => {
+    const scope: {
+      postMessage: (data: unknown) => void;
+      onmessage?: (e: { data: unknown }) => Promise<void>;
+    } = { postMessage: vi.fn() };
+    new Function("self", "importScripts", "h5wasm", H5_WORKER_CODE)(
+      scope,
+      () => {},
+      { ready: Promise.resolve(), FS: {} },
+    );
+    await scope.onmessage?.({ data: { type: "init", id: 1, payload: {} } });
+    expect(scope.postMessage).toHaveBeenCalledWith({ id: 1, success: true });
   });
 
   it("the Worker can still read the next URL", async () => {

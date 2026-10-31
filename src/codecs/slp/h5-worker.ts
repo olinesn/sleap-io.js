@@ -335,6 +335,14 @@ async function initH5Wasm(h5wasmUrl) {
   h5wasmModule = h5wasm;
   // FS is exposed directly on h5wasm module after ready
   FS = h5wasm.FS;
+  // h5wasm prints what it aborts with, and that can quote a URL with its token
+  // ("Couldn't load https://..."). It calls this first, and throwing skips the print.
+  // The failure still reaches StreamingH5File, which masks it.
+  if (h5wasm.Module) {
+    h5wasm.Module.onAbort = function(what) {
+      if (String(what).includes('://')) throw new Error('Aborted(' + what + ')');
+    };
+  }
 }
 
 async function openRemoteFile(url, filename = 'data.h5', headers) {

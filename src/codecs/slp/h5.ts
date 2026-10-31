@@ -159,6 +159,27 @@ export async function nodeReadPackageVersion(): Promise<string | null> {
 // at module scope so the browser code path caches across calls.
 let modulePromise: Promise<H5Module> | null = null;
 
+/**
+ * h5wasm prints what it aborts with, and that can quote a URL with its token
+ * ("Couldn't load https://..."), when a read fails after the file opened. It calls
+ * `onAbort` first, and throwing from it skips the print. An app's own `onAbort` on the
+ * same module still hears about every abort, masked. The worker does the same:
+ * `initH5Wasm` in `h5-worker.ts`.
+ * @internal
+ */
+export function keepUrlsOutOfAborts(module: H5Module): void {
+  const emscripten = (
+    module as unknown as { Module?: { onAbort?: (what: unknown) => void } }
+  ).Module;
+  if (!emscripten) return;
+  const previous = emscripten.onAbort;
+  emscripten.onAbort = (what) => {
+    const said = redactUrlsInText(String(what));
+    previous?.(said);
+    if (said.includes("://")) throw new Error(`Aborted(${said})`);
+  };
+}
+
 export async function getH5Module(): Promise<H5Module> {
   if (_nodeGetModule) {
     return _nodeGetModule();
@@ -167,6 +188,7 @@ export async function getH5Module(): Promise<H5Module> {
     modulePromise = (async () => {
       const module = await import("h5wasm");
       await module.ready;
+      keepUrlsOutOfAborts(module as H5Module);
       return module as H5Module;
     })();
   }

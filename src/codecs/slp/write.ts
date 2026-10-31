@@ -163,6 +163,42 @@ function isRawCopyable(video: Video): boolean {
   return !!(video.hasEmbeddedImages && video.backend?.getFrameBuffer);
 }
 
+/**
+ * Add any track or identity only its detections know about to `labels.tracks` and
+ * `labels.identities`. The tables store each as its position in that list, so one
+ * missing from it would save as nothing. Python collects them at save too.
+ */
+function registerDetectionCatalogs(labels: Labels): void {
+  const tracks = new Set(labels.tracks);
+  const identities = new Set(labels.identities);
+  const registerIdentity = (identity: Identity | null | undefined): void => {
+    if (identity && !identities.has(identity)) {
+      identities.add(identity);
+      labels.identities.push(identity);
+    }
+  };
+  for (const frame of labels.labeledFrames) {
+    for (const inst of frame.instances) {
+      if (inst.track && !tracks.has(inst.track)) {
+        tracks.add(inst.track);
+        labels.tracks.push(inst.track);
+      }
+      registerIdentity(inst.identity);
+    }
+  }
+  anyDetection(labels, (detection) => {
+    registerIdentity(detection.identity);
+    return false;
+  });
+  for (const session of labels.sessions) {
+    for (const frameGroup of session.frameGroups.values()) {
+      for (const group of frameGroup.instanceGroups) {
+        registerIdentity(group.identity);
+      }
+    }
+  }
+}
+
 function writeSlpToFile(
   file: any,
   labels: Labels,
@@ -723,6 +759,16 @@ export interface SlpWriteHeader {
   provenance?: Record<string, unknown>;
 }
 
+/** Whether a detection carries an identity, category or embedding. */
+function hasDetectionLabels(d: IdentityBearing): boolean {
+  return !!(
+    d.identity ||
+    d.identityEmbedding ||
+    d.category ||
+    d.categoryEmbedding
+  );
+}
+
 /** Per-store id offsets applied while appending (see {@link SlpStreamWriter.appendStore}). */
 export interface AppendStoreOptions {
   /** Added to each frame's (remapped) video index. */
@@ -733,6 +779,12 @@ export interface AppendStoreOptions {
   skeletonOffset?: number;
   /** Frames per append window (defaults to {@link DEFAULT_WRITE_WINDOW_FRAMES}). */
   windowFrames?: number;
+  /**
+   * The store's identities on the writer's catalog. An identity not in it is found in
+   * the catalog by name; one not there either cannot be written (the catalog is written
+   * when the writer opens), so its links are left out.
+   */
+  identityMap?: Map<Identity, Identity>;
 }
 
 /**
@@ -816,12 +868,22 @@ export class SlpStreamWriter {
     ctx: [number, number][];
   } = { anns: [], ctx: [] };
 
+  // Identity, category and embeddings of each written instance row that has any, by
+  // row. Kept from the stores and written at finalize, like the annotations above.
+  private detectionLabels: IdentityBearing[] = [];
+  private identities: Identity[];
+
   /** @internal — use {@link openSlpWriter}. */
   constructor(
     module: any,
     file: any,
     memPath: string,
-    header: { videos: Video[]; skeletons: Skeleton[]; tracks: Track[] },
+    header: {
+      videos: Video[];
+      skeletons: Skeleton[];
+      tracks: Track[];
+      identities?: Identity[];
+    },
   ) {
     this.module = module;
     this.file = file;
@@ -829,6 +891,7 @@ export class SlpStreamWriter {
     this.videos = header.videos;
     this.skeletons = header.skeletons;
     this.tracks = header.tracks;
+    this.identities = header.identities ?? [];
   }
 
   /**
@@ -1065,10 +1128,105 @@ export class SlpStreamWriter {
         outIdxOf,
         skippedKeys,
       );
+      this.collectDetectionLabels(store, instBase, outIdxOf, opts);
     } catch (e) {
       // A mid-write failure leaves a partial file — release it rather than leak.
       this.dispose();
       throw e;
+    }
+  }
+
+  /** Keep what `store`'s instances carry beyond their poses, by written row. */
+  private collectDetectionLabels(
+    store: LazyDataStore,
+    instBase: number,
+    outIdxOf: (idx: number) => number | null,
+    opts?: AppendStoreOptions,
+  ): void {
+    const row = (idx: number): IdentityBearing | null => {
+      const out = outIdxOf(idx);
+      if (out === null) return null;
+      this.detectionLabels[instBase + out] ??= {};
+      return this.detectionLabels[instBase + out];
+    };
+    for (const [idx, [identityIdx, score]] of store._instanceIdentityLinks ??
+      []) {
+      const source = store.identities?.[identityIdx];
+      if (!source) continue;
+      const identity =
+        opts?.identityMap?.get(source) ??
+        this.identities.find((id) => id.name === source.name);
+      const detection = identity ? row(idx) : null;
+      if (detection) {
+        detection.identity = identity;
+        detection.identityScore = score;
+      }
+    }
+    for (const [idx, embedding] of store._instanceEmbeddings ?? []) {
+      const detection = row(idx);
+      if (detection) detection.identityEmbedding = embedding;
+    }
+    for (const [idx, [categoryIdx, score]] of store._instanceCategoryLinks ??
+      []) {
+      const category = store.categoryCatalog?.[categoryIdx];
+      const detection = category ? row(idx) : null;
+      if (detection) {
+        detection.category = category;
+        detection.categoryScore = score;
+      }
+    }
+    for (const [idx, embedding] of store._instanceCategoryEmbeddings ?? []) {
+      const detection = row(idx);
+      if (detection) detection.categoryEmbedding = embedding;
+    }
+  }
+
+  /**
+   * Write them, with the identities and categories on the annotations, and raise
+   * `format_id` as a full save would for what they hold. The writer's catalog was written
+   * when it opened, so an identity is found there by name; one not there is left out.
+   */
+  private writeDetectionLabels(): void {
+    const onCatalog = (d: IdentityBearing): IdentityBearing =>
+      d.identity && !this.identities.includes(d.identity)
+        ? {
+            ...d,
+            identity: this.identities.find(
+              (id) => id.name === d.identity?.name,
+            ),
+          }
+        : d;
+    const owners = (list: IdentityBearing[]): IdentityBearing[] =>
+      list.some(hasDetectionLabels) ? list.map(onCatalog) : [];
+    const none: IdentityBearing = {};
+    const detections: DetectionCollections = {
+      instance: this.detectionLabels.length
+        ? Array.from({ length: this.instRows }, (_, i) =>
+            onCatalog(this.detectionLabels[i] ?? none),
+          )
+        : [],
+      centroid: owners(this.pendingCentroids.anns as IdentityBearing[]),
+      mask: owners(this.pendingMasks.anns as IdentityBearing[]),
+      bbox: owners(this.pendingBboxes.anns as IdentityBearing[]),
+      roi: owners(this.pendingRois.anns as IdentityBearing[]),
+    };
+    const all = ownerCollections(detections).flatMap(([, list]) => list);
+    if (!all.length) return;
+    writeIdentityLinks(this.file, this.identities, detections);
+    writeCategoryLinks(this.file, detections);
+    writeEmbeddings(this.file, detections);
+    const metadata = this.file.get("metadata");
+    const was = Number(metadata.attrs.format_id?.value ?? 0);
+    let formatId = was;
+    if (all.some((d) => d.identity || d.identityEmbedding)) {
+      formatId = Math.max(formatId, 2.5);
+    }
+    if (all.some((d) => d.category || d.categoryEmbedding)) {
+      formatId = Math.max(formatId, 2.7);
+    }
+    if (formatId !== was) {
+      metadata.delete_attribute("format_id");
+      metadata.create_attribute("format_id", formatId);
     }
   }
 
@@ -1109,7 +1267,15 @@ export class SlpStreamWriter {
           localId.set(inst as Instance, localInstId);
           const skeletonId = Math.max(0, this.skeletons.indexOf(inst.skeleton));
           const trackId = inst.track ? this.tracks.indexOf(inst.track) : -1;
+          if (inst.track && trackId < 0) {
+            throw new Error(
+              `Track "${inst.track.name}" was not in the tracks given to openSlpWriter, so it cannot be written: the track list is already in the file.`,
+            );
+          }
           const trackingScore = inst.trackingScore ?? 0;
+          if (hasDetectionLabels(inst)) {
+            this.detectionLabels[instBase + localInstId] = inst;
+          }
           let type = 0;
           let score = 0;
           let ptStart = 0;
@@ -1396,6 +1562,7 @@ export class SlpStreamWriter {
   /** Write pending `negative_frames` and close the HDF5 file (shared finalize). */
   private finalizeFile(): void {
     this.writePendingAnnotations();
+    this.writeDetectionLabels();
     if (this.negativeFrames.size > 0) {
       const rows: number[][] = [];
       for (const key of this.negativeFrames) {
@@ -1593,6 +1760,7 @@ export async function openSlpWriter(
     videos: header.videos,
     skeletons: header.skeletons,
     tracks: header.tracks ?? [],
+    identities: header.identities ?? [],
   });
 }
 
@@ -1876,6 +2044,7 @@ async function writeSlpBytes(
   const file = new module.File(memPath, "w");
   try {
     try {
+      registerDetectionCatalogs(writeLabels);
       writeSlpToFile(file, writeLabels, plan);
       if (includeEmbeddedData && plan && plan.size > 0) {
         await writeEmbeddedVideoData(file, labels, plan, options?.onProgress);
@@ -3378,6 +3547,7 @@ export interface OnDiskSidecars {
  * byte-exact.
  */
 export function buildExpectedSidecars(labels: Labels): OnDiskSidecars {
+  registerDetectionCatalogs(labels);
   return {
     tracksJson: buildTracksJson(labels.tracks),
     suggestionsJson: buildSuggestionsJson(labels.suggestions, labels.videos),

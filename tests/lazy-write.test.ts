@@ -18,8 +18,14 @@ import { UserROI } from "../src/model/roi.js";
 import { UserSegmentationMask } from "../src/model/mask.js";
 import { UserLabelImage } from "../src/model/label-image.js";
 import type { LabelImageObjectInfo } from "../src/model/label-image.js";
+import { Identity } from "../src/model/identity.js";
+import { Embedding } from "../src/model/embedding.js";
 import { readSlp, readSlpLazy } from "../src/codecs/slp/read.js";
+import { openH5File } from "../src/codecs/slp/h5.js";
 import { saveSlpToBytes } from "../src/codecs/slp/write.js";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Save eager → read lazy → save lazy → read eager. The middle step is the
  *  lazy fast path; we verify that `lazy.materialize()` is never needed. */
@@ -414,5 +420,264 @@ describe("lazy SLP write fast path", () => {
       // Expected — no real video to embed pixels from.
     }
     expect(lazy.isLazy).toBe(false);
+  });
+});
+
+describe("lazy SLP write keeps identity and category links", () => {
+  const fixture = (name: string): ArrayBuffer =>
+    new Uint8Array(
+      readFileSync(
+        path.join(fileURLToPath(new URL("./data/slp", import.meta.url)), name),
+      ),
+    ).buffer as ArrayBuffer;
+  const closed = { openVideos: false };
+  const reload = (bytes: Uint8Array) =>
+    readSlp(new Uint8Array(bytes).buffer as ArrayBuffer, closed);
+
+  type Detection = {
+    identity?: { name: string } | null;
+    identityScore?: number | null;
+    identityEmbedding?: { vector: number[] } | null;
+    category?: string | null;
+    categoryScore?: number | null;
+    categoryEmbedding?: { vector: number[] } | null;
+  };
+  const linksOf = (d: Detection) => ({
+    identity: d.identity?.name ?? null,
+    identityScore: d.identityScore ?? null,
+    identityEmbedding: d.identityEmbedding?.vector ?? null,
+    category: d.category ?? null,
+    categoryScore: d.categoryScore ?? null,
+    categoryEmbedding: d.categoryEmbedding?.vector ?? null,
+  });
+  /** Every detection's links by kind. Instances in table order; a lazy save may
+   * reorder annotations, so those are compared as a set. */
+  const allLinks = (labels: Labels) => {
+    const set = (list: Detection[]) =>
+      list.map((d) => JSON.stringify(linksOf(d))).sort();
+    return {
+      instances: labels.labeledFrames.flatMap((f) =>
+        (f.instances as Detection[]).map(linksOf),
+      ),
+      centroids: set(labels.centroids as Detection[]),
+      masks: set(labels.masks as Detection[]),
+      bboxes: set(labels.bboxes as Detection[]),
+      rois: set(labels.rois as Detection[]),
+    };
+  };
+
+  /** Read something out of a saved file, then close it. */
+  async function inFile<T>(
+    bytes: Uint8Array,
+    read: (file: any) => T,
+  ): Promise<T> {
+    const { file, close } = await openH5File(
+      new Uint8Array(bytes).buffer as ArrayBuffer,
+    );
+    try {
+      return read(file);
+    } finally {
+      close();
+    }
+  }
+  const formatId = (bytes: Uint8Array) =>
+    inFile(bytes, (file) => {
+      const attrs = file.get("metadata").attrs;
+      return Number(attrs.format_id?.value ?? attrs.format_id);
+    });
+
+  it.each([
+    "py_written_25_identity.slp",
+    "py_written_27_category.slp",
+    "py_written_30_twin.slp",
+    "py_written_30_twin_legacy.slp",
+    "handbuilt_30.slp",
+    "handbuilt_30_2x.slp",
+    "handbuilt_30_gzip.slp",
+  ])("%s", async (name) => {
+    const want = allLinks(await readSlp(fixture(name), closed));
+    const lazy = await readSlpLazy(fixture(name), closed);
+    const bytes = await saveSlpToBytes(lazy);
+    expect(lazy.isLazy).toBe(true);
+    expect(allLinks(await reload(bytes))).toEqual(want);
+    // There was something to lose.
+    const flat = JSON.stringify(want);
+    expect(flat).toMatch(/"(identity|category)":"[^"]/);
+  });
+
+  it("the Python identity file: scores and embeddings, and format 2.5", async () => {
+    const lazy = await readSlpLazy(
+      fixture("py_written_25_identity.slp"),
+      closed,
+    );
+    const bytes = await saveSlpToBytes(lazy);
+    const all = (await reload(bytes)).labeledFrames.flatMap((f) => f.instances);
+    expect(all.map((i) => i.identity?.name)).toEqual(["A", "B", "A"]);
+    expect(all[0].identityScore).toBeCloseTo(0.9, 5);
+    expect(all[1].identityEmbedding?.vector).toHaveLength(3);
+    expect(await formatId(bytes)).toBe(2.5);
+  });
+
+  it("the Python category file: scores and embeddings, and format 2.7", async () => {
+    const lazy = await readSlpLazy(
+      fixture("py_written_27_category.slp"),
+      closed,
+    );
+    const bytes = await saveSlpToBytes(lazy);
+    const all = (await reload(bytes)).labeledFrames.flatMap((f) => f.instances);
+    expect(all.map((i) => i.category)).toEqual(["left", "right", "left"]);
+    expect(all[1].categoryScore).toBeCloseTo(0.8, 5);
+    expect(all[2].categoryEmbedding?.vector).toHaveLength(2);
+    expect(await formatId(bytes)).toBe(2.7);
+  });
+
+  it.each([
+    "py_written_25_identity.slp",
+    "py_written_27_category.slp",
+  ])("%s: the same tables as an eager save", async (name) => {
+    const tables = (bytes: Uint8Array) =>
+      inFile(bytes, (file) =>
+        [
+          "identity/links",
+          "embeddings/vectors",
+          "embeddings/owner_type",
+          "embeddings/owner_id",
+          "categories/name",
+          "categories/links",
+          "embeddings/category_vectors",
+          "embeddings/category_owner_type",
+          "embeddings/category_owner_id",
+        ].map((table) => {
+          const value = file.get(table)?.value;
+          return value == null ? null : Array.from(value as ArrayLike<unknown>);
+        }),
+      );
+    const eager = await saveSlpToBytes(await readSlp(fixture(name), closed));
+    const lazy = await saveSlpToBytes(await readSlpLazy(fixture(name), closed));
+    expect(await tables(lazy)).toEqual(await tables(eager));
+  });
+
+  /** Instances with a link of one kind each, and the rest with none. */
+  function someLinked(): Labels {
+    const video = new Video({ filename: "v.mp4" });
+    const skeleton = new Skeleton({ nodes: ["A"] });
+    const animal = new Identity({ name: "animal" });
+    const plain = () =>
+      new Instance({ points: { A: [1, 2] }, skeleton }) as Instance & Detection;
+    const instances = Array.from({ length: 7 }, plain);
+    instances[1].identity = animal;
+    instances[1].identityScore = 0.5;
+    instances[2].identity = animal; // no score
+    instances[3].identityEmbedding = new Embedding([1, 2]); // no identity
+    instances[4].category = "left";
+    instances[4].categoryScore = 0.25;
+    instances[5].categoryEmbedding = new Embedding([3, 4, 5]); // no category
+    return new Labels({
+      labeledFrames: instances.map(
+        (instance, frameIdx) =>
+          new LabeledFrame({ video, frameIdx, instances: [instance] }),
+      ),
+      videos: [video],
+      skeletons: [skeleton],
+      identities: [animal],
+    });
+  }
+
+  it("each link stays on its own instance, with the others left without", async () => {
+    const want = allLinks(someLinked()).instances;
+    const back = await lazyRoundTrip(someLinked());
+    expect(allLinks(back).instances).toEqual(want);
+    expect(want[0].identity).toBeNull();
+    expect(want[2].identityScore).toBeNull();
+    expect(want[3].identityEmbedding).toEqual([1, 2]);
+    expect(want[6].category).toBeNull();
+  });
+
+  it("identity links follow the catalog as it stands", async () => {
+    const lazy = await readSlpLazy(
+      fixture("py_written_25_identity.slp"),
+      closed,
+    );
+    lazy.identities[0].name = "renamed";
+    lazy.identities.push(new Identity({ name: "new" }));
+    const back = await reload(await saveSlpToBytes(lazy));
+    expect(back.identities.map((i) => i.name)).toEqual(["renamed", "B", "new"]);
+    expect(
+      back.labeledFrames.flatMap((f) =>
+        f.instances.map((i) => i.identity?.name),
+      ),
+    ).toEqual(["renamed", "B", "renamed"]);
+  });
+
+  it("a copy of lazy labels keeps them too, saved lazy or materialized", async () => {
+    const name = "py_written_25_identity.slp";
+    const want = allLinks(await readSlp(fixture(name), closed));
+    const original = await readSlpLazy(fixture(name), closed);
+
+    const copy = original.copy();
+    expect(copy.isLazy).toBe(true);
+    expect(allLinks(await reload(await saveSlpToBytes(copy)))).toEqual(want);
+
+    const materialized = original.copy();
+    materialized.materialize();
+    expect(materialized.identities).toContain(
+      materialized.labeledFrames[0].instances[0].identity as Identity,
+    );
+    expect(allLinks(await reload(await saveSlpToBytes(materialized)))).toEqual(
+      want,
+    );
+  });
+
+  it("a link to a row or catalog entry that isn't there attaches to nothing", async () => {
+    const lazy = await readSlpLazy(
+      fixture("py_written_25_identity.slp"),
+      closed,
+    );
+    const store = lazy._lazyDataStore!;
+    store._instanceIdentityLinks = new Map([
+      [0, [99, null]], // no such identity
+      [99, [0, null]], // no such instance
+      [2, [1, 0.5]], // fine
+    ]);
+    store._instanceEmbeddings = new Map();
+    const bytes = await saveSlpToBytes(lazy);
+    expect(
+      (await reload(bytes)).labeledFrames.flatMap((f) =>
+        f.instances.map((i) => i.identity?.name ?? null),
+      ),
+    ).toEqual([null, null, "B"]);
+    expect(
+      await inFile(bytes, (file) => file.get("identity/links").shape),
+    ).toEqual([1, 4]);
+  });
+
+  it("writes nothing new and stays at its format when there are no links", async () => {
+    const video = new Video({ filename: "v.mp4" });
+    const skeleton = new Skeleton({ nodes: ["A"] });
+    const labels = new Labels({
+      labeledFrames: [
+        new LabeledFrame({
+          video,
+          frameIdx: 0,
+          instances: [new Instance({ points: { A: [1, 2] }, skeleton })],
+        }),
+      ],
+      videos: [video],
+      skeletons: [skeleton],
+      identities: [new Identity({ name: "unused" })],
+    });
+    const eager = await saveSlpToBytes(labels);
+    const lazy = await saveSlpToBytes(
+      await readSlpLazy(new Uint8Array(eager).buffer as ArrayBuffer, closed),
+    );
+    expect(await formatId(lazy)).toBe(await formatId(eager));
+    expect(await formatId(lazy)).toBeLessThan(2.5);
+    expect(
+      await inFile(lazy, (file) => [
+        file.get("identity/links"),
+        file.get("embeddings"),
+        file.get("categories"),
+      ]),
+    ).toEqual([null, null, null]);
   });
 });

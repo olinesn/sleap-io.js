@@ -37,7 +37,13 @@ import { deflate } from "pako";
 import type { Identity } from "../../model/identity.js";
 import { PredictedInstance3D } from "../../model/instance3d.js";
 import type { LazyDataStore } from "../../model/lazy.js";
-import { buildVideoIdMap } from "../../model/video-id-map.js";
+import {
+  buildVideoIdMap,
+  frameVideoIds,
+  videoIdsReadBack,
+  type VideoNumbers,
+} from "../../model/video-id-map.js";
+import { videoNumbersOfEntries, withFrameVideoIds } from "./frame-video-ids.js";
 
 // File writer hook — registered by h5-node.ts (imported as side-effect from Node entry point).
 let _writeToFile:
@@ -171,11 +177,10 @@ function writeSlpToFile(
 ): void {
   writeMetadata(file, labels);
 
-  if (plan && plan.size > 0) {
-    writeEmbeddedVideosJson(file, labels, plan);
-  } else {
-    writeVideos(file, labels.videos);
-  }
+  const videoNumbers =
+    plan && plan.size > 0
+      ? writeEmbeddedVideosJson(file, labels, plan)
+      : writeVideos(file, labels.videos);
   writeVideoCrops(file, labels.videos);
 
   writeTracks(file, labels.tracks);
@@ -188,8 +193,9 @@ function writeSlpToFile(
     labels.labeledFrames,
     labels.identities,
   );
-  writeLabeledFrames(file, labels);
-  writeNegativeFrames(file, labels);
+  const tables = buildLabelTableRows(labels, videoNumbers);
+  writeLabeledFrames(file, tables);
+  writeNegativeFrames(file, tables.negativeFrames);
   const allInstances = labels.labeledFrames.flatMap((f) => f.instances);
 
   // Build flat annotation lists with routing contexts from parent LabeledFrames
@@ -421,11 +427,50 @@ function writeLazyCompoundDataset(
   );
 }
 
-function writeLazyFramesAndInstances(file: any, store: LazyDataStore): void {
+/**
+ * How a lazy save must store each raw `/frames` id of `store`, or `null` to copy
+ * them as they are because they read back right under the `videos_json` just
+ * written. They may not: a 3.0 store holds list indices, and `embed: "source"`
+ * writes other videos than the ones the ids were read with.
+ */
+function lazyVideoIdRewrite(
+  store: LazyDataStore,
+  videoNumbers: VideoNumbers,
+): ((rawId: number) => number) | null {
+  const toIndex = buildVideoIdMap(store.framesData, store.videos);
+  const indexOf = (rawId: number) => toIndex.get(rawId) ?? rawId;
+  const rawIds = new Set<number>();
+  for (const value of store.framesData.video ?? []) rawIds.add(Number(value));
+  const rows = Array.from(rawIds, (id): [number, number] => [id, indexOf(id)]);
+  if (videoIdsReadBack(rows, videoNumbers)) return null;
+
+  const ids = frameVideoIds(
+    new Set(rows.map(([, index]) => index)),
+    videoNumbers,
+  );
+  return (rawId) => {
+    const index = indexOf(rawId);
+    return ids[index] ?? index;
+  };
+}
+
+function writeLazyFramesAndInstances(
+  file: any,
+  store: LazyDataStore,
+  rewriteVideoId: ((rawId: number) => number) | null,
+): void {
+  const framesData = rewriteVideoId
+    ? {
+        ...store.framesData,
+        video: Array.from(store.framesData.video ?? [], (id) =>
+          rewriteVideoId(Number(id)),
+        ),
+      }
+    : store.framesData;
   writeLazyMatrixDataset(
     file,
     "frames",
-    store.framesData,
+    framesData,
     ["frame_id", "video", "frame_idx", "instance_id_start", "instance_id_end"],
     "<i8",
   );
@@ -449,12 +494,20 @@ function writeLazyFramesAndInstances(file: any, store: LazyDataStore): void {
   );
 }
 
-function writeLazyNegativeFrames(file: any, store: LazyDataStore): void {
+function writeLazyNegativeFrames(
+  file: any,
+  store: LazyDataStore,
+  rewriteVideoId: ((rawId: number) => number) | null,
+): void {
   if (store.negativeFrames.size === 0) return;
   const rows: number[][] = [];
   for (const key of store.negativeFrames) {
     const [vidStr, fidxStr] = key.split(":");
-    rows.push([Number(vidStr), Number(fidxStr)]);
+    const rawId = Number(vidStr);
+    rows.push([
+      rewriteVideoId ? rewriteVideoId(rawId) : rawId,
+      Number(fidxStr),
+    ]);
   }
   // Deterministic ordering for byte-stable output.
   rows.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
@@ -472,8 +525,9 @@ function writeLazyNegativeFrames(file: any, store: LazyDataStore): void {
  * Reuses metadata writers (which only depend on eager `Labels` fields like
  * `videos`/`tracks`/`suggestions`/`identities`/`sessions`/`provenance`) and
  * pulls frames/instances/points/pred_points/negative_frames + per-type
- * annotation maps directly from `LazyDataStore`. No `LabeledFrame` or
- * `Instance` objects are constructed in this path.
+ * annotation maps + instance identity/category links directly from
+ * `LazyDataStore`. No `LabeledFrame` or `Instance` objects are constructed in
+ * this path.
  *
  * Limitations (matching Python):
  *   - `writeSessions` is called with an empty `labeledFrames` list, so any
@@ -492,7 +546,7 @@ function writeSlpToFileLazy(file: any, labels: Labels): void {
   }
 
   writeMetadata(file, labels);
-  writeVideos(file, labels.videos);
+  const videoNumbers = writeVideos(file, labels.videos);
   writeVideoCrops(file, labels.videos);
   writeTracks(file, labels.tracks);
   writeSuggestions(file, labels.suggestions, labels.videos);
@@ -501,8 +555,9 @@ function writeSlpToFileLazy(file: any, labels: Labels): void {
   // Frame-group refs resolved by lf index will be lost — matches Python.
   writeSessions(file, labels.sessions, labels.videos, [], labels.identities);
 
-  writeLazyFramesAndInstances(file, store);
-  writeLazyNegativeFrames(file, store);
+  const rewriteVideoId = lazyVideoIdRewrite(store, videoNumbers);
+  writeLazyFramesAndInstances(file, store, rewriteVideoId);
+  writeLazyNegativeFrames(file, store, rewriteVideoId);
 
   // Build per-type (annotation, context) pairs from the lazy store maps.
   // Per-frame Map keys are "vidIdx:frameIdx" strings (see read.ts).
@@ -589,6 +644,20 @@ function writeSlpToFileLazy(file: any, labels: Labels): void {
     [],
     liCtx,
   );
+
+  // Per-detection identity + category, as in writeSlpToFile. The annotation lists
+  // are in the order their datasets were written just above and `/instances` rows
+  // are copied as they are, so a detection's index in its list is its owner_id.
+  const detections: DetectionCollections = {
+    instance: lazyInstanceDetections(store),
+    centroid: allCentroids,
+    mask: allMasks,
+    bbox: allBboxes,
+    roi: allRois,
+  };
+  writeIdentityLinks(file, labels.identities, detections);
+  writeCategoryLinks(file, detections);
+  writeEmbeddings(file, detections);
 }
 
 /**
@@ -786,6 +855,7 @@ export class SlpStreamWriter {
   private module: any;
   private memPath: string;
   private videos: Video[];
+  private videoNumbers: VideoNumbers;
   private skeletons: Skeleton[];
   private tracks: Track[];
   private frameRows = 0;
@@ -799,6 +869,8 @@ export class SlpStreamWriter {
   // key skips that frame entirely. Append overlays (appendFrames) BEFORE bulk
   // stores so the overlay's frame is the one kept. See #208 follow-up.
   private writtenFrames = new Set<string>();
+  // List index of every video with a written frame (see storeFrameVideoIds).
+  private usedVideos = new Set<number>();
 
   // Per-frame annotations (masks/rois/bboxes/centroids/label-images) accumulated
   // across appends and written once at finalize — they're far fewer than pose
@@ -822,12 +894,18 @@ export class SlpStreamWriter {
     module: any,
     file: any,
     memPath: string,
-    header: { videos: Video[]; skeletons: Skeleton[]; tracks: Track[] },
+    header: {
+      videos: Video[];
+      videoNumbers: VideoNumbers;
+      skeletons: Skeleton[];
+      tracks: Track[];
+    },
   ) {
     this.module = module;
     this.file = file;
     this.memPath = memPath;
     this.videos = header.videos;
+    this.videoNumbers = header.videoNumbers;
     this.skeletons = header.skeletons;
     this.tracks = header.tracks;
   }
@@ -1013,6 +1091,7 @@ export class SlpStreamWriter {
             outInsts++;
           }
           this.writtenFrames.add(key);
+          this.usedVideos.add(combinedVideo);
         }
 
         // Write only the actually-filled slice of each (max-sized) buffer.
@@ -1103,6 +1182,7 @@ export class SlpStreamWriter {
         const key = `${videoIndex}:${frame.frameIdx}`;
         if (this.writtenFrames.has(key)) continue; // dedup: first write wins
         this.writtenFrames.add(key);
+        this.usedVideos.add(videoIndex);
         const localFrameId = framesRows.length;
         const instanceStart = instRows.length;
         for (const inst of frame.instances) {
@@ -1394,14 +1474,35 @@ export class SlpStreamWriter {
     }
   }
 
+  /**
+   * Frames are appended under their list index, since which videos have any isn't
+   * known until the end. Replace those ids in `/frames` if they wouldn't read back
+   * (see {@link frameVideoIds}), leaving the file untouched when they would.
+   */
+  private storeFrameVideoIds(videoIds: number[]): void {
+    if (videoIds.every((id, index) => id === index)) return;
+    const ds = this.file.get("frames");
+    const column = [
+      [0, this.frameRows],
+      [1, 2],
+    ];
+    const stored = ds.slice(column) as ArrayLike<number>;
+    ds.write_slice(
+      column,
+      Float64Array.from(stored, (index) => videoIds[index] ?? index),
+    );
+  }
+
   /** Write pending `negative_frames` and close the HDF5 file (shared finalize). */
   private finalizeFile(): void {
+    const videoIds = frameVideoIds(this.usedVideos, this.videoNumbers);
+    this.storeFrameVideoIds(videoIds);
     this.writePendingAnnotations();
     if (this.negativeFrames.size > 0) {
       const rows: number[][] = [];
       for (const key of this.negativeFrames) {
         const [v, f] = key.split(":");
-        rows.push([Number(v), Number(f)]);
+        rows.push([videoIds[Number(v)] ?? Number(v), Number(f)]);
       }
       rows.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
       createMatrixDataset(
@@ -1415,11 +1516,21 @@ export class SlpStreamWriter {
     this.file.close();
   }
 
+  /** {@link finalizeFile}, releasing the file if that fails. */
+  private finalize(): void {
+    try {
+      this.finalizeFile();
+    } catch (e) {
+      this.dispose();
+      throw e;
+    }
+    this.closed = true;
+  }
+
   /** Finalize the file (writes `negative_frames` if any) and return its bytes. */
   close(): Uint8Array {
     if (this.closed) throw new Error("SlpStreamWriter is already closed");
-    this.closed = true;
-    this.finalizeFile();
+    this.finalize();
     const fs = getH5FileSystem(this.module);
     const bytes = fs.readFile!(this.memPath);
     fs.unlink!(this.memPath);
@@ -1440,8 +1551,7 @@ export class SlpStreamWriter {
     opts?: { chunkBytes?: number },
   ): Promise<void> {
     if (this.closed) throw new Error("SlpStreamWriter is already closed");
-    this.closed = true;
-    this.finalizeFile();
+    this.finalize();
 
     const fs = getH5FileSystem(this.module);
     const cfs = fs as unknown as ChunkedFs;
@@ -1515,6 +1625,7 @@ export async function openSlpWriter(
   ensureH5StagingDir(module);
   const memPath = `/tmp/sleap_stream_${Date.now()}_${Math.random().toString(16).slice(2)}.slp`;
   const file = new module.File(memPath, "w");
+  let videoNumbers: VideoNumbers = [];
 
   try {
     // Reuse the eager metadata writers via a frameless header `Labels` (they read
@@ -1533,7 +1644,7 @@ export async function openSlpWriter(
     });
 
     writeMetadata(file, headerLabels);
-    writeVideos(file, headerLabels.videos);
+    videoNumbers = writeVideos(file, headerLabels.videos);
     writeVideoCrops(file, headerLabels.videos);
     writeTracks(file, headerLabels.tracks);
     writeSuggestions(file, headerLabels.suggestions, headerLabels.videos);
@@ -1592,6 +1703,7 @@ export async function openSlpWriter(
 
   return new SlpStreamWriter(module, file, memPath, {
     videos: header.videos,
+    videoNumbers,
     skeletons: header.skeletons,
     tracks: header.tracks ?? [],
   });
@@ -1806,16 +1918,22 @@ async function writeSlpBytes(
         const module = await getH5Module();
         ensureH5StagingDir(module);
         const memPath = `/tmp/sleap_output_${Date.now()}_${Math.random().toString(16).slice(2)}.slp`;
+        const fs = getH5FileSystem(module);
         const file = new module.File(memPath, "w");
         try {
-          writeSlpToFileLazy(file, lazyWriteLabels);
+          try {
+            writeSlpToFileLazy(file, lazyWriteLabels);
+          } finally {
+            file.close();
+          }
+          return fs.readFile!(memPath);
         } finally {
-          file.close();
+          try {
+            fs.unlink!(memPath);
+          } catch {
+            // best-effort cleanup
+          }
         }
-        const fs = getH5FileSystem(module);
-        const bytes = fs.readFile!(memPath);
-        fs.unlink!(memPath);
-        return bytes;
       }
     }
   }
@@ -2108,9 +2226,11 @@ function serializeSkeletons(skeletons: Skeleton[]): {
   return { skeletons: serialized, nodes };
 }
 
-function writeVideos(file: any, videos: Video[]): void {
+/** Write `videos_json`; returns the numbers `/frames` must agree with. */
+function writeVideos(file: any, videos: Video[]): VideoNumbers {
   const payload = videos.map((video) => JSON.stringify(serializeVideo(video)));
   file.create_dataset({ name: "videos_json", data: payload });
+  return videoNumbersOfEntries(payload);
 }
 
 function serializeVideo(video: Video): Record<string, unknown> {
@@ -2548,13 +2668,14 @@ function collectCategoryCatalog(c: DetectionCollections): string[] {
   const seen = new Set<string>();
   const catalog: string[] = [];
   for (const [, list] of ownerCollections(c)) {
-    for (const det of list) {
+    // forEach, not for...of: the lazy instance list has holes.
+    list.forEach((det) => {
       const cat = det.category;
       if (cat && !seen.has(cat)) {
         seen.add(cat);
         catalog.push(cat);
       }
-    }
+    });
   }
   return catalog;
 }
@@ -2595,6 +2716,35 @@ function writeCategoryLinks(file: any, c: DetectionCollections): void {
   );
 }
 
+/**
+ * A lazy store's instance identity + category, as detections at their `/instances`
+ * row with holes between them, so that no `Instance` has to be built. A link to no
+ * row or no catalog entry attaches to nothing when read, so it is left out.
+ */
+function lazyInstanceDetections(store: LazyDataStore): IdentityBearing[] {
+  const rowCount = (store.instancesData.instance_type ?? []).length;
+  const detections: IdentityBearing[] = [];
+  const set = (row: number, fields: IdentityBearing): void => {
+    if (row < rowCount) detections[row] = { ...detections[row], ...fields };
+  };
+  for (const [row, [idx, score]] of store._instanceIdentityLinks ?? []) {
+    const identity = store.identities?.[idx];
+    if (identity) set(row, { identity, identityScore: score });
+  }
+  for (const [row, identityEmbedding] of store._instanceEmbeddings ?? []) {
+    set(row, { identityEmbedding });
+  }
+  for (const [row, [idx, score]] of store._instanceCategoryLinks ?? []) {
+    const category = store.categoryCatalog?.[idx];
+    if (category != null) set(row, { category, categoryScore: score });
+  }
+  for (const [row, categoryEmbedding] of store._instanceCategoryEmbeddings ??
+    []) {
+    set(row, { categoryEmbedding });
+  }
+  return detections;
+}
+
 /** Whether any detection satisfies `pred` across all five modalities (used to gate
  * the identity 2.5 / category 2.7 format bumps). */
 function anyDetection(
@@ -2602,7 +2752,9 @@ function anyDetection(
   pred: (d: IdentityBearing) => boolean,
 ): boolean {
   const any = (list: IdentityBearing[]) => list.some(pred);
+  const store = labels._lazyDataStore;
   return (
+    (store != null && any(lazyInstanceDetections(store))) ||
     labels.labeledFrames.some((f) => any(f.instances as IdentityBearing[])) ||
     any(labels.masks as IdentityBearing[]) ||
     any(labels.centroids as IdentityBearing[]) ||
@@ -3053,12 +3205,15 @@ export interface LabelTableRows {
 }
 
 /** Build the `negative_frames` rows (`[video_id, frame_idx]`), in frame order. */
-function buildNegativeFrameRows(labels: Labels): number[][] {
+function buildNegativeFrameRows(
+  labels: Labels,
+  videoIds: number[],
+): number[][] {
   const rows: number[][] = [];
   for (const frame of labels.labeledFrames) {
     if (!frame.isNegative) continue;
     const videoIndex = Math.max(0, labels.videos.indexOf(frame.video));
-    rows.push([videoIndex, frame.frameIdx]);
+    rows.push([videoIds[videoIndex] ?? videoIndex, frame.frameIdx]);
   }
   return rows;
 }
@@ -3071,8 +3226,26 @@ function buildNegativeFrameRows(labels: Labels): number[][] {
  * {@link buildLabelTableUpdate} (the in-place save path) so both emit
  * byte-identical columns using the same field-name constants. Contains no HDF5
  * I/O — pure `Labels` → `number[][]`.
+ *
+ * `frames` and `negative_frames` hold each video's list index, unless `videoNumbers`
+ * says what the `videos_json` written beside them holds: then they hold what reads
+ * back as that index ({@link frameVideoIds}). The in-place path leaves that to its
+ * writers, which can see the `videos_json` in the file.
  */
-export function buildLabelTableRows(labels: Labels): LabelTableRows {
+export function buildLabelTableRows(
+  labels: Labels,
+  videoNumbers?: VideoNumbers,
+): LabelTableRows {
+  const videoIds = videoNumbers
+    ? frameVideoIds(
+        new Set(
+          labels.labeledFrames.map((frame) =>
+            Math.max(0, labels.videos.indexOf(frame.video)),
+          ),
+        ),
+        videoNumbers,
+      )
+    : labels.videos.map((_, index) => index);
   const frames: number[][] = [];
   const instances: number[][] = [];
   const points: number[][] = [];
@@ -3133,7 +3306,7 @@ export function buildLabelTableRows(labels: Labels): LabelTableRows {
     const instanceEnd = instances.length;
     frames.push([
       frameId,
-      videoIndex,
+      videoIds[videoIndex] ?? videoIndex,
       labeledFrame.frameIdx,
       instanceStart,
       instanceEnd,
@@ -3154,13 +3327,14 @@ export function buildLabelTableRows(labels: Labels): LabelTableRows {
     instances,
     points,
     predPoints,
-    negativeFrames: buildNegativeFrameRows(labels),
+    negativeFrames: buildNegativeFrameRows(labels, videoIds),
   };
 }
 
-function writeLabeledFrames(file: any, labels: Labels): void {
-  const { frames, instances, points, predPoints } = buildLabelTableRows(labels);
-
+function writeLabeledFrames(
+  file: any,
+  { frames, instances, points, predPoints }: LabelTableRows,
+): void {
   // `frames` stays a flat int matrix (Python reads it positionally), written
   // CHUNKED + unlimited (resizable=true) so it can be resized in place on an edit
   // re-save. The pose tables are HDF5 COMPOUND with integer id columns — so files
@@ -3179,8 +3353,7 @@ function writeLabeledFrames(file: any, labels: Labels): void {
   );
 }
 
-function writeNegativeFrames(file: any, labels: Labels): void {
-  const rows = buildNegativeFrameRows(labels);
+function writeNegativeFrames(file: any, rows: number[][]): void {
   if (!rows.length) return;
   createCompoundDataset(
     file,
@@ -3663,14 +3836,21 @@ function writeOneTableInPlace(
  * backstop for an incomplete gate, each per-table resize is asserted to have
  * actually taken effect (h5wasm silently no-ops resize on a non-resizable
  * dataset) — a resize that can't happen THROWS here rather than writing ghost
- * rows, so the caller falls back to a full re-save.
+ * rows, so the caller falls back to a full re-save. The `videos_json` staying in
+ * the file decides what `frames` and `negative_frames` store for each video
+ * ({@link withFrameVideoIds}); that throws, before anything is written, if nothing
+ * would read back.
  *
  * Does NOT flush or close the file — the caller owns the file lifecycle.
  */
 export function writeLabelTablesInPlace(
   file: any,
-  update: LabelTableUpdate,
+  labelTables: LabelTableUpdate,
 ): void {
+  const update = withFrameVideoIds(
+    labelTables,
+    videoNumbersOfEntries(file.get("videos_json")?.value ?? []),
+  );
   // The `dtype` here is only consulted when a table is ABSENT on disk and gets
   // created fresh as a flat matrix (writeOneTableInPlace → createMatrixDataset);
   // for an existing dataset the on-disk layout/dtype wins and this arg is ignored.
@@ -4217,13 +4397,13 @@ function embeddedVideoAttrs(video: Video): EmbeddedVideoAttrs {
  * The top-level `filename` is "." (Python writes the package's own path, which
  * a byte-producing save doesn't know; both readers resolve either to the
  * package). The per-group image datasets are written separately by
- * {@link writeEmbeddedVideoData}.
+ * {@link writeEmbeddedVideoData}. Returns the numbers `/frames` must agree with.
  */
 function writeEmbeddedVideosJson(
   file: any,
   labels: Labels,
   plan: EmbedPlan,
-): void {
+): VideoNumbers {
   const payload = labels.videos.map((video, videoIndex) => {
     const entry = plan.get(videoIndex);
     if (entry) {
@@ -4261,6 +4441,7 @@ function writeEmbeddedVideosJson(
     return JSON.stringify(serializeVideo(video));
   });
   file.create_dataset({ name: "videos_json", data: payload });
+  return videoNumbersOfEntries(payload);
 }
 
 /**

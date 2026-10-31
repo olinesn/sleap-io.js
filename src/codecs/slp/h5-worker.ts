@@ -242,6 +242,10 @@ self.onmessage = async function(e) {
         respond(id, openAppendOpfsResult);
         break;
 
+      case 'getDestVideosJson':
+        respond(id, { success: true, entries: getDestVideosJson() });
+        break;
+
       case 'updateLabelsInPlace':
         const updateResult = updateLabelsInPlace(payload);
         respond(id, updateResult);
@@ -1218,6 +1222,15 @@ function writeOneTableInPlaceWorker(file, diskName, fields, flat, rowCount, colC
   }
 }
 
+// The open DEST file's videos_json, which updateLabelsInPlace leaves as it is. The
+// main thread needs it to decide what /frames stores for each video (see
+// withFrameVideoIds, used by StreamingH5Writer.updateLabelsInPlace).
+function getDestVideosJson() {
+  if (!currentDestFile) throw new Error('getDestVideosJson: no dest file open (call openWrite first)');
+  var ds = currentDestFile.get('videos_json');
+  return ds ? ds.value : [];
+}
+
 // Worker port of writeLabelTablesInPlace (write.ts — KEEP IN LOCKSTEP): patch the
 // label tables of the open DEST file (openWrite) from the transferred update, then
 // (if metadataJson is set) replace the /metadata json attr. Payload tables carry
@@ -1657,6 +1670,7 @@ export type H5WorkerMessageType =
   | "openWrite"
   | "openWriteOpfs"
   | "openAppendOpfs"
+  | "getDestVideosJson"
   | "updateLabelsInPlace"
   | "getKeys"
   | "getAttr"

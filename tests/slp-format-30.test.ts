@@ -1158,12 +1158,18 @@ describe("provenance", () => {
 
 describe("loading a 3.0 file and saving it", () => {
   /**
-   * The embedded videos of `handbuilt_30.slp` are numbered out of list order, with
-   * frames in only some of them. A save writes `/frames/video` as the list index beside
-   * those numbers, and a 2.x reader then guesses wrong, whichever format was loaded (it
-   * happens to `handbuilt_30_2x.slp` too). So these tests use videos that aren't embedded.
+   * Files with some of everything, in both layouts. The embedded videos of
+   * `handbuilt_30*.slp` are numbered out of list order, with frames in only some of
+   * them, so `/frames/video` has to read back beside those numbers whichever format was
+   * loaded (see `frameVideoIds`).
    */
-  const SAVED = [PYTHON_TWIN, "handbuilt_30_gzip.slp"];
+  const SAVED = [
+    PYTHON_TWIN,
+    "py_written_30_twin_legacy.slp",
+    COLUMNAR,
+    LEGACY,
+    "handbuilt_30_gzip.slp",
+  ];
 
   /** Save and reload, returning the reloaded labels and the file's top-level facts. */
   async function saveAndInspect(labels: Labels) {
@@ -1210,17 +1216,12 @@ describe("loading a 3.0 file and saving it", () => {
       quietWarnings();
       const loaded = await readSlpLazy(fixture(file), { openVideos: false });
       const { reloaded, facts } = await saveAndInspect(loaded);
+      expect(loaded.isLazy).toBe(true);
       expect(facts.formatId).toBeLessThan(3);
       loaded.materialize();
-      // A lazy save has never kept per-detection identities or categories, on any format.
-      const poses = (labels: Labels) =>
-        poseSnapshot(labels).frames.map((f) => [
-          f.video,
-          f.frameIdx,
-          f.isNegative,
-          f.instances.map((i) => [i.type, i.score, i.track, i.points]),
-        ]);
-      expect(poses(reloaded)).toEqual(poses(loaded));
+      expect(poseSnapshot(reloaded).frames).toEqual(
+        poseSnapshot(loaded).frames,
+      );
     });
 
     it(`${file}: the merged streaming writer takes a 3.0 lazy store`, async () => {

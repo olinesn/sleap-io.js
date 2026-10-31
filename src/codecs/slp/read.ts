@@ -1978,7 +1978,20 @@ function readBboxes(
 ): [BoundingBox, number, number][] {
   const bboxesDs = file.get("bboxes");
   if (!bboxesDs) return [];
-  const bboxesData = normalizeStructDataset(bboxesDs);
+  // Python (since format 2.0) and current JS: a group with one dataset per field.
+  // Older JS: a flat matrix + `field_names`, with sibling string datasets. Python
+  // before 2.0: a compound table of centered boxes, with its strings in attributes.
+  // (Asks the node: h5wasm's `get` gives a Group for any path below a dataset, so
+  // `file.get("bboxes/x1")` is truthy for a flat table too.)
+  const columnar = typeof bboxesDs.keys === "function";
+  const bboxesData: Record<string, any> = columnar
+    ? Object.fromEntries(
+        (bboxesDs.keys() as string[]).map((name) => [
+          name,
+          bboxesDs.get(name).value,
+        ]),
+      )
+    : normalizeStructDataset(bboxesDs);
 
   // Legacy format: center-based columns (x_center, y_center, width, height)
   const xCenters = bboxesData.x_center ?? [];
@@ -1989,15 +2002,17 @@ function readBboxes(
   const count = isLegacy ? xCenters.length : x1s.length;
   if (!count) return [];
 
-  // v1.9+: string datasets at root level; fallback to JSON attrs on dataset
-  const categories = readStringMetadata(
-    file,
-    "bbox_categories",
-    bboxesDs,
-    "categories",
-  );
-  const names = readStringMetadata(file, "bbox_names", bboxesDs, "names");
-  const sources = readStringMetadata(file, "bbox_sources", bboxesDs, "sources");
+  // v2.0+ groups: columns; v1.9+: string datasets at root level; fallback to JSON
+  // attrs on dataset
+  const categories = columnar
+    ? Array.from(bboxesData.category ?? [], decodeStr)
+    : readStringMetadata(file, "bbox_categories", bboxesDs, "categories");
+  const names = columnar
+    ? Array.from(bboxesData.name ?? [], decodeStr)
+    : readStringMetadata(file, "bbox_names", bboxesDs, "names");
+  const sources = columnar
+    ? Array.from(bboxesData.source ?? [], decodeStr)
+    : readStringMetadata(file, "bbox_sources", bboxesDs, "sources");
 
   const yCenters = bboxesData.y_center ?? [];
   const widths = bboxesData.width ?? [];
@@ -2012,6 +2027,7 @@ function readBboxes(
   const bboxScores = bboxesData.score ?? [];
   const instanceIndices = bboxesData.instance ?? [];
   const trackingScores = bboxesData.tracking_score ?? [];
+  const isPredictedCol = bboxesData.is_predicted ?? [];
 
   const bboxes: [BoundingBox, number, number][] = [];
   for (let i = 0; i < count; i++) {
@@ -2061,11 +2077,15 @@ function readBboxes(
       source: sources[i] ?? "",
     };
 
+    const isPred =
+      isPredictedCol.length > i
+        ? Number(isPredictedCol[i]) === 1
+        : !Number.isNaN(scoreVal);
     let bbox: BoundingBox;
-    if (Number.isNaN(scoreVal)) {
-      bbox = new UserBoundingBox(options);
-    } else {
+    if (isPred) {
       bbox = new PredictedBoundingBox({ ...options, score: scoreVal });
+    } else {
+      bbox = new UserBoundingBox(options);
     }
 
     if (instanceIdx >= 0) {
@@ -2103,16 +2123,32 @@ function readStringMetadata(
 
 /**
  * Read score maps from index + data datasets.
- * Returns a Map from annotation index to { scoreMap, height, width }.
+ * Returns a Map from annotation index to its map, size, scale and offset (the last
+ * two default to 1 and 0: this library's older files don't have them).
  */
 function readScoreMaps(
   file: any,
   indexPath: string,
   dataPath: string,
-): Map<number, { scoreMap: Float32Array; height: number; width: number }> {
+): Map<
+  number,
+  {
+    scoreMap: Float32Array;
+    height: number;
+    width: number;
+    scale: [number, number];
+    offset: [number, number];
+  }
+> {
   const result = new Map<
     number,
-    { scoreMap: Float32Array; height: number; width: number }
+    {
+      scoreMap: Float32Array;
+      height: number;
+      width: number;
+      scale: [number, number];
+      offset: [number, number];
+    }
   >();
   const indexDs = file.get(indexPath);
   const dataDs = file.get(dataPath);
@@ -2124,6 +2160,10 @@ function readScoreMaps(
   const ends = indexData.data_end ?? [];
   const smHeights = indexData.height ?? [];
   const smWidths = indexData.width ?? [];
+  const scaleXCol = indexData.scale_x ?? [];
+  const scaleYCol = indexData.scale_y ?? [];
+  const offsetXCol = indexData.offset_x ?? [];
+  const offsetYCol = indexData.offset_y ?? [];
 
   const dataFlat: Uint8Array =
     dataDs.value instanceof Uint8Array
@@ -2152,7 +2192,19 @@ function readScoreMaps(
       ),
     );
 
-    result.set(annotIdx, { scoreMap, height: h, width: w });
+    result.set(annotIdx, {
+      scoreMap,
+      height: h,
+      width: w,
+      scale: [
+        scaleXCol.length > i ? Number(scaleXCol[i]) : 1,
+        scaleYCol.length > i ? Number(scaleYCol[i]) : 1,
+      ],
+      offset: [
+        offsetXCol.length > i ? Number(offsetXCol[i]) : 0,
+        offsetYCol.length > i ? Number(offsetYCol[i]) : 0,
+      ],
+    });
   }
   return result;
 }
@@ -2279,6 +2331,9 @@ function readMasks(
         ...baseOptions,
         score: scoreVal,
         scoreMap: sm?.scoreMap ?? null,
+        scoreMapScale: sm?.scale,
+        scoreMapOffset: sm?.offset,
+        _scoreMapSize: sm && [sm.height, sm.width],
       });
     } else {
       mask = new UserSegmentationMask(baseOptions);
@@ -2517,6 +2572,9 @@ function readLabelImages(
         source: sources[i] ?? "",
         score: liScore,
         scoreMap: sm?.scoreMap ?? null,
+        scoreMapScale: sm?.scale,
+        scoreMapOffset: sm?.offset,
+        _scoreMapSize: sm && [sm.height, sm.width],
         scale: liScale,
         offset: liOffset,
       });

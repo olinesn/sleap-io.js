@@ -591,160 +591,91 @@ describe("SLP ROI/Mask I/O", () => {
     expect(loadedUserInst.fromPredicted).not.toBeNull();
   });
 
-  it("loads fromPredicted as null from a legacy file without the from_predicted column", async () => {
+  /**
+   * Load a project whose `/masks` table was written by hand: one predicted mask,
+   * then one user mask. `fromPredicted` fills the user mask's from_predicted, and
+   * `undefined` leaves the column out, as files before format 2.4 do.
+   */
+  async function loadHandWrittenMasks(
+    fromPredicted?: number,
+  ): Promise<UserSegmentationMask> {
     const video = new Video({ filename: "test.mp4" });
     const skeleton = new Skeleton({ nodes: ["A"] });
     const inst = new Instance({ points: { A: [10, 20] }, skeleton });
     const frame = new LabeledFrame({ video, frameIdx: 0, instances: [inst] });
-
-    const maskData = makeMaskRaster(
-      40,
-      40,
-      (r, c) => r >= 5 && r < 15 && c >= 5 && c < 15,
-    );
-    const { encodeRle } = await import("../src/model/mask.js");
-    const predMask = new PredictedSegmentationMask({
-      rleCounts: encodeRle(maskData, 40, 40),
-      height: 40,
-      width: 40,
-      score: 0.8,
-    });
-    const userMask = predMask.toUser(true);
-    const lfMask = new LabeledFrame({
-      video,
-      frameIdx: 1,
-      masks: [predMask, userMask],
-    });
     const labels = new Labels({
-      labeledFrames: [frame, lfMask],
+      labeledFrames: [frame],
       videos: [video],
       skeletons: [skeleton],
     });
 
-    // Write normally (includes the from_predicted column), then surgically
-    // strip "from_predicted" from the masks dataset's field_names attr to
-    // simulate a pre-2.4 file. The reader is presence-gated by NAME, so the
-    // column becomes invisible and every user mask loads with null.
     const bytes = await saveSlpToBytes(labels);
     const module = await ready;
-    const memPath = `/tmp/slp_legacy_${Date.now()}_${Math.random().toString(16).slice(2)}.slp`;
+    const memPath = `/tmp/slp_hand_masks_${Date.now()}_${Math.random().toString(16).slice(2)}.slp`;
     module.FS.writeFile(memPath, new Uint8Array(bytes));
     {
       const f = new H5File(memPath, "a");
-      const masksDs = f.get("masks") as {
-        attrs: Record<string, { value?: unknown }>;
-        create_attribute: (
-          name: string,
-          value: unknown,
-          shape: unknown,
-          dtype: string,
-        ) => void;
-        delete_attribute: (name: string) => void;
-      };
-      const fieldNames: string[] = JSON.parse(
-        String((masksDs.attrs["field_names"] as { value?: unknown }).value),
-      );
-      const stripped = fieldNames.filter((n) => n !== "from_predicted");
-      const strippedJson = JSON.stringify(stripped);
-      // h5wasm's create_attribute cannot overwrite an existing attribute
-      // ("Object already exists"); delete the original field_names first so the
-      // pre-2.4 (column-stripped) attribute takes effect.
-      masksDs.delete_attribute("field_names");
-      masksDs.create_attribute(
-        "field_names",
-        strippedJson,
-        null,
-        `S${new TextEncoder().encode(strippedJson).length}`,
-      );
+      // Two rows: [member, dtype, predicted mask's value, user mask's value].
+      const members: Array<[string, string, number, number]> = [
+        ["height", "<I", 2, 2],
+        ["width", "<I", 2, 2],
+        ["annotation_type", "<B", 2, 2],
+        ["video", "<i", 0, 0],
+        ["frame_idx", "<q", 0, 0],
+        ["track", "<i", -1, -1],
+        ["instance", "<i", -1, -1],
+        ["is_predicted", "<B", 1, 0],
+        ["score", "<f", 0.8, Number.NaN],
+        ["tracking_score", "<f", Number.NaN, Number.NaN],
+        ["rle_start", "<Q", 0, 4],
+        ["rle_end", "<Q", 4, 8],
+      ];
+      if (fromPredicted !== undefined) {
+        members.push(["from_predicted", "<i", -1, fromPredicted]);
+      }
+      f.create_dataset({
+        name: "masks",
+        data: new Map(members.map(([name, , a, b]) => [name, [a, b]])),
+        shape: [2],
+        dtype: members.map(([name, dtype]) => [name, dtype]),
+      } as never);
+      const rle = new Uint8Array(new Uint32Array([0, 4]).buffer);
+      f.create_dataset({
+        name: "mask_rle",
+        data: rle,
+        shape: [rle.length],
+        dtype: "<B",
+      });
       f.close();
     }
-    const legacyBytes = module.FS.readFile(memPath) as Uint8Array;
+    const handWritten = module.FS.readFile(memPath) as Uint8Array;
     module.FS.unlink(memPath);
 
-    const loaded = await readSlp(new Uint8Array(legacyBytes).buffer, {
+    const loaded = await readSlp(new Uint8Array(handWritten).buffer, {
       openVideos: false,
     });
     loaded.materialize();
-    const loadedUser = loaded.masks.find(
+    expect(loaded.masks).toHaveLength(2);
+    return loaded.masks.find(
       (m): m is UserSegmentationMask => m instanceof UserSegmentationMask,
     )!;
-    expect(loadedUser.fromPredicted).toBeNull();
+  }
+
+  it("re-links fromPredicted from a table with the from_predicted column", async () => {
+    const user = await loadHandWrittenMasks(0);
+    expect(user.fromPredicted).toBeInstanceOf(PredictedSegmentationMask);
+  });
+
+  it("loads fromPredicted as null from a legacy file without the from_predicted column", async () => {
+    // The reader is presence-gated by NAME, so every user mask loads with null.
+    const user = await loadHandWrittenMasks();
+    expect(user.fromPredicted).toBeNull();
   });
 
   it("loads fromPredicted as null when the persisted index is out of range", async () => {
-    const video = new Video({ filename: "test.mp4" });
-    const skeleton = new Skeleton({ nodes: ["A"] });
-    const inst = new Instance({ points: { A: [10, 20] }, skeleton });
-    const frame = new LabeledFrame({ video, frameIdx: 0, instances: [inst] });
-
-    const maskData = makeMaskRaster(
-      40,
-      40,
-      (r, c) => r >= 5 && r < 15 && c >= 5 && c < 15,
-    );
-    const { encodeRle } = await import("../src/model/mask.js");
-    const predMask = new PredictedSegmentationMask({
-      rleCounts: encodeRle(maskData, 40, 40),
-      height: 40,
-      width: 40,
-      score: 0.8,
-    });
-    const userMask = predMask.toUser(true);
-    const lfMask = new LabeledFrame({
-      video,
-      frameIdx: 1,
-      masks: [predMask, userMask],
-    });
-    const labels = new Labels({
-      labeledFrames: [frame, lfMask],
-      videos: [video],
-      skeletons: [skeleton],
-    });
-
-    // Write, then overwrite every from_predicted cell with an out-of-range index
-    // (999) via write_slice to simulate a corrupt file. The bounds-checked
-    // re-link (fpIdx < masks.length) leaves fromPredicted null.
-    const bytes = await saveSlpToBytes(labels);
-    const module = await ready;
-    const memPath = `/tmp/slp_oor_${Date.now()}_${Math.random().toString(16).slice(2)}.slp`;
-    module.FS.writeFile(memPath, new Uint8Array(bytes));
-    {
-      const f = new H5File(memPath, "a");
-      const masksDs = f.get("masks") as {
-        shape: number[];
-        attrs: Record<string, { value?: unknown }>;
-        write_slice: (
-          ranges: Array<[number, number]>,
-          data: Float64Array,
-        ) => void;
-      };
-      const fieldNames: string[] = JSON.parse(
-        String((masksDs.attrs["field_names"] as { value?: unknown }).value),
-      );
-      const fpCol = fieldNames.indexOf("from_predicted");
-      expect(fpCol).toBeGreaterThanOrEqual(0);
-      const rowCount = masksDs.shape[0];
-      // Overwrite the from_predicted column (a [rowCount, 1] hyperslab) with 999.
-      masksDs.write_slice(
-        [
-          [0, rowCount],
-          [fpCol, fpCol + 1],
-        ],
-        Float64Array.from({ length: rowCount }, () => 999),
-      );
-      f.close();
-    }
-    const corruptBytes = module.FS.readFile(memPath) as Uint8Array;
-    module.FS.unlink(memPath);
-
-    const loaded = await readSlp(new Uint8Array(corruptBytes).buffer, {
-      openVideos: false,
-    });
-    loaded.materialize();
-    const loadedUser = loaded.masks.find(
-      (m): m is UserSegmentationMask => m instanceof UserSegmentationMask,
-    )!;
-    expect(loadedUser.fromPredicted).toBeNull();
+    // A corrupt file: the bounds-checked re-link (fpIdx < masks.length) leaves null.
+    const user = await loadHandWrittenMasks(999);
+    expect(user.fromPredicted).toBeNull();
   });
 
   it("backward compat: reads file with no ROIs/masks as empty arrays", async () => {

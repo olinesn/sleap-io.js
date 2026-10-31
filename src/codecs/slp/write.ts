@@ -66,18 +66,13 @@ function setStringAttr(target: any, name: string, value: string): void {
   target.create_attribute(name, value, null, `S${byteLength}`);
 }
 
-/** Write a string array as a JSON-encoded string attribute dataset at root level. */
+/**
+ * Write a string column as a dataset of variable-length UTF-8 strings, as Python
+ * sleap-io does (`h5py.special_dtype(vlen=str)`). Python reads such a dataset as a
+ * list of strings; files before this wrote JSON bytes, which it read as numbers.
+ */
 function writeStringDataset(file: any, name: string, values: string[]): void {
-  const json = JSON.stringify(values);
-  const bytes = textEncoder.encode(json);
-  file.create_dataset({
-    name,
-    data: bytes,
-    shape: [bytes.length],
-    dtype: "<B",
-  });
-  const ds = file.get(name);
-  setStringAttr(ds, "json", json);
+  file.create_dataset({ name, data: values.map((value) => value ?? "") });
 }
 
 const SPAWNED_ON = 0;
@@ -4492,8 +4487,7 @@ function writeEncodedEmbeddedVideo(
  * pre-requisite for the fast in-place label save ({@link writeLabelTablesInPlace}).
  * The logical content is byte-for-byte identical to the contiguous layout; only
  * the storage layout changes. Used for the mutable label tables
- * (frames/instances/points/pred_points/negative_frames); the annotation tables
- * stay contiguous (`resizable` defaults to false).
+ * (frames/instances/points/pred_points/negative_frames).
  */
 function createMatrixDataset(
   file: any,
@@ -4585,6 +4579,81 @@ const NEGATIVE_FRAME_COMPOUND_FIELDS: CompoundField[] = [
   ["frame_idx", "<Q"], // u8
 ];
 
+// The annotation tables, with the members and dtypes of Python sleap-io's 2.x
+// layout (`write_rois`, `write_masks`, `write_label_images`; `legacy=` in
+// `_TABLE_SPECS` on release/0.10). Python indexes the score map tables by member
+// name straight after a plain `ds[:]`, so a flat matrix raises IndexError there;
+// and a float32 matrix (`<f8`, see above) rounds frame numbers and byte offsets
+// past 2^24. `/bboxes` is a group of columns instead: see writeBboxes.
+const ROI_COMPOUND_FIELDS: CompoundField[] = [
+  ["annotation_type", "<B"], // u1
+  ["video", "<i"], // i4 (carries -1)
+  ["frame_idx", "<q"], // i8 (carries -1)
+  ["track", "<i"], // i4 (carries -1)
+  ["is_predicted", "<B"], // u1
+  ["score", "<f"], // f4
+  ["tracking_score", "<f"], // f4
+  ["wkb_start", "<Q"], // u8
+  ["wkb_end", "<Q"], // u8
+  ["instance", "<i"], // i4 (carries -1)
+];
+const MASK_COMPOUND_FIELDS: CompoundField[] = [
+  ["height", "<I"], // u4
+  ["width", "<I"], // u4
+  ["annotation_type", "<B"], // u1
+  ["video", "<i"], // i4 (carries -1)
+  ["frame_idx", "<q"], // i8 (carries -1)
+  ["track", "<i"], // i4 (carries -1)
+  ["instance", "<i"], // i4 (carries -1)
+  ["from_predicted", "<i"], // i4 (carries -1)
+  ["is_predicted", "<B"], // u1
+  ["score", "<f"], // f4
+  ["tracking_score", "<f"], // f4
+  ["rle_start", "<Q"], // u8
+  ["rle_end", "<Q"], // u8
+  ["scale_x", "<f"], // f4
+  ["scale_y", "<f"], // f4
+  ["offset_x", "<f"], // f4
+  ["offset_y", "<f"], // f4
+];
+const LABEL_IMAGE_COMPOUND_FIELDS: CompoundField[] = [
+  ["video", "<i"], // i4 (carries -1)
+  ["frame_idx", "<q"], // i8 (carries -1)
+  ["height", "<I"], // u4
+  ["width", "<I"], // u4
+  ["n_objects", "<I"], // u4
+  ["objects_start", "<I"], // u4
+  ["data_start", "<Q"], // u8
+  ["data_end", "<Q"], // u8
+  ["is_predicted", "<B"], // u1
+  ["score", "<f"], // f4
+  ["scale_x", "<f"], // f4
+  ["scale_y", "<f"], // f4
+  ["offset_x", "<f"], // f4
+  ["offset_y", "<f"], // f4
+];
+const LABEL_IMAGE_OBJECT_COMPOUND_FIELDS: CompoundField[] = [
+  ["label_id", "<i"], // i4
+  ["track", "<i"], // i4 (carries -1)
+  ["instance", "<i"], // i4 (carries -1)
+  ["score", "<f"], // f4
+  ["tracking_score", "<f"], // f4
+];
+/** A score map index table, whose first member is `mask_idx` or `li_idx`. */
+function scoreMapIndexFields(ownerIndex: string): CompoundField[] {
+  return [
+    [ownerIndex, "<I"], // u4
+    ["data_start", "<Q"], // u8
+    ["data_end", "<Q"], // u8
+    ["height", "<I"], // u4
+    ["width", "<I"], // u4
+    ["scale_x", "<f"], // f4
+    ["scale_y", "<f"], // f4
+    ["offset_x", "<f"], // f4
+    ["offset_y", "<f"], // f4
+  ];
+}
+
 /**
  * Write `rows` as an HDF5 COMPOUND (structured) dataset — one struct per row,
  * each member with its own dtype — the layout Python sleap-io expects for the
@@ -4596,12 +4665,16 @@ const NEGATIVE_FRAME_COMPOUND_FIELDS: CompoundField[] = [
  * A `field_names` attribute is stamped too — Python ignores it (it reads the
  * compound member names), and it keeps this dataset shape identical to the old
  * matrix output for any JS reader that keys off the attribute.
+ *
+ * `resizable` is for the pose tables (below). The annotation tables are never
+ * saved in place ({@link checkInPlaceWritable}), so they stay contiguous.
  */
 function createCompoundDataset(
   file: any,
   name: string,
   rows: number[][],
   fields: CompoundField[],
+  resizable = true,
 ): void {
   const rowCount = rows.length;
   const columns = new Map<string, number[]>();
@@ -4622,8 +4695,7 @@ function createCompoundDataset(
     name,
     data: columns,
     shape: [rowCount],
-    maxshape: [null],
-    chunks: [chunkRows],
+    ...(resizable ? { maxshape: [null], chunks: [chunkRows] } : {}),
     dtype: fields,
   });
   setStringAttr(
@@ -4631,6 +4703,26 @@ function createCompoundDataset(
     "field_names",
     JSON.stringify(fields.map(([fieldName]) => fieldName)),
   );
+}
+
+/**
+ * The [height, width] to store a score map under: the size it had in the file it
+ * was read from, if it still fits, else its owner's width. A map can have another
+ * size than its mask or label image, and a flat array doesn't say.
+ */
+function scoreMapSize(
+  scoreMap: Float32Array,
+  owner: { width: number; _scoreMapSize: [number, number] | null },
+): [number, number] {
+  const read = owner._scoreMapSize;
+  if (read && read[0] * read[1] === scoreMap.length) return read;
+  const height = scoreMap.length / owner.width;
+  if (!Number.isInteger(height)) {
+    throw new Error(
+      `Score map size ${scoreMap.length} not divisible by width ${owner.width}`,
+    );
+  }
+  return [height, owner.width];
 }
 
 function writeRois(
@@ -4680,36 +4772,19 @@ function writeRois(
       videoIdx,
       frameIdx,
       trackIdx,
+      isPredicted,
       score,
       trackingScore,
       wkbStart,
       wkbEnd,
       instanceIdx,
-      isPredicted,
     ]);
     categories.push(roi.category);
     names.push(roi.name);
     sources.push(roi.source);
   }
 
-  createMatrixDataset(
-    file,
-    "rois",
-    rows,
-    [
-      "annotation_type",
-      "video",
-      "frame_idx",
-      "track",
-      "score",
-      "tracking_score",
-      "wkb_start",
-      "wkb_end",
-      "instance",
-      "is_predicted",
-    ],
-    "<f8",
-  );
+  createCompoundDataset(file, "rois", rows, ROI_COMPOUND_FIELDS, false);
 
   // Write string metadata as datasets at root level (v1.9+)
   writeStringDataset(file, "roi_categories", categories);
@@ -4822,17 +4897,17 @@ function writeMasks(
       videoIdx,
       frameIdx,
       trackIdx,
+      instanceIdx,
+      fromPredictedIdx,
+      isPredicted,
       score,
+      maskTrackingScore,
       rleStart,
       rleEnd,
-      isPredicted,
-      instanceIdx,
-      maskTrackingScore,
       mask.scale[0],
       mask.scale[1],
       mask.offset[0],
       mask.offset[1],
-      fromPredictedIdx,
     ]);
     categories.push(mask.category);
     names.push(mask.name);
@@ -4848,18 +4923,17 @@ function writeMasks(
           pm.scoreMap.byteLength,
         );
         const compressed = deflate(smBytes);
-        const smH = pm.scoreMap.length / mask.width;
-        if (!Number.isInteger(smH)) {
-          throw new Error(
-            `Score map size ${pm.scoreMap.length} not divisible by width ${mask.width}`,
-          );
-        }
+        const [smH, smW] = scoreMapSize(pm.scoreMap, pm);
         scoreMapIndexRows.push([
           i,
           smOffset,
           smOffset + compressed.length,
           smH,
-          mask.width,
+          smW,
+          pm.scoreMapScale[0],
+          pm.scoreMapScale[1],
+          pm.scoreMapOffset[0],
+          pm.scoreMapOffset[1],
         ]);
         scoreMapChunks.push(compressed);
         smOffset += compressed.length;
@@ -4867,31 +4941,7 @@ function writeMasks(
     }
   }
 
-  createMatrixDataset(
-    file,
-    "masks",
-    rows,
-    [
-      "height",
-      "width",
-      "annotation_type",
-      "video",
-      "frame_idx",
-      "track",
-      "score",
-      "rle_start",
-      "rle_end",
-      "is_predicted",
-      "instance",
-      "tracking_score",
-      "scale_x",
-      "scale_y",
-      "offset_x",
-      "offset_y",
-      "from_predicted",
-    ],
-    "<f8",
-  );
+  createCompoundDataset(file, "masks", rows, MASK_COMPOUND_FIELDS, false);
 
   // Write string metadata as datasets at root level (v1.9+)
   writeStringDataset(file, "mask_categories", categories);
@@ -4933,12 +4983,12 @@ function writeMasks(
 
   // Write score maps
   if (scoreMapIndexRows.length > 0) {
-    createMatrixDataset(
+    createCompoundDataset(
       file,
       "mask_score_map_index",
       scoreMapIndexRows,
-      ["mask_idx", "data_start", "data_end", "height", "width"],
-      "<f8",
+      scoreMapIndexFields("mask_idx"),
+      false,
     );
     const totalSm = scoreMapChunks.reduce((sum, c) => sum + c.length, 0);
     const smFlat = new Uint8Array(totalSm);
@@ -4966,68 +5016,69 @@ function writeBboxes(
 ): void {
   if (!bboxes.length) return;
 
-  const rows: number[][] = [];
+  const n = bboxes.length;
+  const x1 = new Float64Array(n);
+  const y1 = new Float64Array(n);
+  const x2 = new Float64Array(n);
+  const y2 = new Float64Array(n);
+  const angle = new Float64Array(n);
+  const video = new Int32Array(n);
+  const frameIdx = new BigInt64Array(n);
+  const track = new Int32Array(n);
+  const instance = new Int32Array(n);
+  const isPredicted = new Uint8Array(n);
+  const score = new Float32Array(n);
+  const trackingScore = new Float32Array(n);
   const categories: string[] = [];
   const names: string[] = [];
   const sources: string[] = [];
 
-  for (let i = 0; i < bboxes.length; i++) {
+  for (let i = 0; i < n; i++) {
     const bbox = bboxes[i];
-    const videoIdx = contexts ? contexts[i][0] : -1;
-    const frameIdx = contexts ? contexts[i][1] : -1;
-    const trackIdx = bbox.track ? tracks.indexOf(bbox.track as any) : -1;
-    const score = bbox.isPredicted
-      ? (bbox as PredictedBoundingBox).score
-      : Number.NaN;
+    x1[i] = bbox.x1;
+    y1[i] = bbox.y1;
+    x2[i] = bbox.x2;
+    y2[i] = bbox.y2;
+    angle[i] = bbox.angle;
+    video[i] = contexts ? contexts[i][0] : -1;
+    frameIdx[i] = BigInt(contexts ? contexts[i][1] : -1);
+    track[i] = bbox.track ? tracks.indexOf(bbox.track as any) : -1;
     // Fall back to stored _instanceIdx when no live instance link (e.g., lazy mode).
-    const instanceIdx = bbox.instance
+    instance[i] = bbox.instance
       ? instances.indexOf(bbox.instance as Instance)
       : (bbox._instanceIdx ?? -1);
-
-    const trackingScore = bbox.trackingScore ?? Number.NaN;
-
-    rows.push([
-      bbox.x1,
-      bbox.y1,
-      bbox.x2,
-      bbox.y2,
-      bbox.angle,
-      videoIdx,
-      frameIdx,
-      trackIdx,
-      score,
-      instanceIdx,
-      trackingScore,
-    ]);
+    isPredicted[i] = bbox.isPredicted ? 1 : 0;
+    score[i] = bbox.isPredicted
+      ? (bbox as PredictedBoundingBox).score
+      : Number.NaN;
+    trackingScore[i] = bbox.trackingScore ?? Number.NaN;
     categories.push(bbox.category);
     names.push(bbox.name);
     sources.push(bbox.source);
   }
 
-  createMatrixDataset(
-    file,
-    "bboxes",
-    rows,
-    [
-      "x1",
-      "y1",
-      "x2",
-      "y2",
-      "angle",
-      "video",
-      "frame_idx",
-      "track",
-      "score",
-      "instance",
-      "tracking_score",
-    ],
-    "<f8",
-  );
-
-  // Write string metadata as datasets at root level (v1.9+)
-  writeStringDataset(file, "bbox_categories", categories);
-  writeStringDataset(file, "bbox_names", names);
-  writeStringDataset(file, "bbox_sources", sources);
+  // Python's layout since format 2.0: a `/bboxes` GROUP with one dataset per field,
+  // the same as `/centroids`. It reads any other layout as the centered boxes from
+  // before 2.0, which raised ("no field of name x_center") on a compound table and
+  // IndexError on a flat matrix.
+  file.create_group("bboxes");
+  const col = (name: string, data: ArrayLike<unknown>, dtype: string) =>
+    file.create_dataset({ name: `bboxes/${name}`, data, shape: [n], dtype });
+  col("x1", x1, "<d");
+  col("y1", y1, "<d");
+  col("x2", x2, "<d");
+  col("y2", y2, "<d");
+  col("angle", angle, "<d");
+  col("video", video, "<i");
+  col("frame_idx", frameIdx, "<q");
+  col("track", track, "<i");
+  col("instance", instance, "<i");
+  col("is_predicted", isPredicted, "<B");
+  col("score", score, "<f");
+  col("tracking_score", trackingScore, "<f");
+  writeStringDataset(file, "bboxes/category", categories);
+  writeStringDataset(file, "bboxes/name", names);
+  writeStringDataset(file, "bboxes/source", sources);
 }
 
 function writeLabelImages(
@@ -5137,18 +5188,17 @@ function writeLabelImages(
           pli.scoreMap.byteLength,
         );
         const smCompressed = deflate(smBytes);
-        const smH = pli.scoreMap.length / li.width;
-        if (!Number.isInteger(smH)) {
-          throw new Error(
-            `Score map size ${pli.scoreMap.length} not divisible by width ${li.width}`,
-          );
-        }
+        const [smH, smW] = scoreMapSize(pli.scoreMap, pli);
         smIndexRows.push([
           liIdx,
           smOffset,
           smOffset + smCompressed.length,
           smH,
-          li.width,
+          smW,
+          pli.scoreMapScale[0],
+          pli.scoreMapScale[1],
+          pli.scoreMapOffset[0],
+          pli.scoreMapOffset[1],
         ]);
         smChunks.push(smCompressed);
         smOffset += smCompressed.length;
@@ -5157,27 +5207,12 @@ function writeLabelImages(
   }
 
   // Write main metadata table
-  createMatrixDataset(
+  createCompoundDataset(
     file,
     "label_images",
     rows,
-    [
-      "video",
-      "frame_idx",
-      "height",
-      "width",
-      "n_objects",
-      "objects_start",
-      "data_start",
-      "data_end",
-      "is_predicted",
-      "score",
-      "scale_x",
-      "scale_y",
-      "offset_x",
-      "offset_y",
-    ],
-    "<f8",
+    LABEL_IMAGE_COMPOUND_FIELDS,
+    false,
   );
 
   // Write string metadata as datasets at root level (v1.9+)
@@ -5185,12 +5220,12 @@ function writeLabelImages(
 
   // Write objects table (if any objects exist)
   if (objectRows.length > 0) {
-    createMatrixDataset(
+    createCompoundDataset(
       file,
       "label_image_objects",
       objectRows,
-      ["label_id", "track", "instance", "score", "tracking_score"],
-      "<f8",
+      LABEL_IMAGE_OBJECT_COMPOUND_FIELDS,
+      false,
     );
     // Write string metadata as datasets at root level (v1.9+)
     writeStringDataset(file, "label_image_obj_categories", objectCategories);
@@ -5214,12 +5249,12 @@ function writeLabelImages(
 
   // Write score maps
   if (smIndexRows.length > 0) {
-    createMatrixDataset(
+    createCompoundDataset(
       file,
       "label_image_score_map_index",
       smIndexRows,
-      ["li_idx", "data_start", "data_end", "height", "width"],
-      "<f8",
+      scoreMapIndexFields("li_idx"),
+      false,
     );
     const totalSm = smChunks.reduce((sum, c) => sum + c.length, 0);
     const smFlat = new Uint8Array(totalSm);

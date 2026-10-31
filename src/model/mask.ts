@@ -691,6 +691,12 @@ export class PredictedSegmentationMask extends SegmentationMask {
   scoreMapScale: [number, number];
   /** Spatial offset for the score map. Default [0, 0]. */
   scoreMapOffset: [number, number];
+  /**
+   * @internal The score map's [height, width] as stored in the file it was read
+   * from, which can differ from this one's own size. Saving needs it: the flat array
+   * doesn't say.
+   */
+  _scoreMapSize: [number, number] | null;
 
   constructor(
     options: SegmentationMaskOptions & {
@@ -698,6 +704,7 @@ export class PredictedSegmentationMask extends SegmentationMask {
       scoreMap?: Float32Array | null;
       scoreMapScale?: [number, number];
       scoreMapOffset?: [number, number];
+      _scoreMapSize?: [number, number] | null;
     },
   ) {
     super(options);
@@ -705,6 +712,7 @@ export class PredictedSegmentationMask extends SegmentationMask {
     this.scoreMap = options.scoreMap ?? null;
     this.scoreMapScale = options.scoreMapScale ?? [1, 1];
     this.scoreMapOffset = options.scoreMapOffset ?? [0, 0];
+    this._scoreMapSize = options._scoreMapSize ?? null;
   }
 
   get isPredicted(): boolean {

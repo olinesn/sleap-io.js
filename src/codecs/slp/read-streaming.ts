@@ -1726,7 +1726,7 @@ async function readSessionDataStreaming(
 /**
  * Read a structured dataset and normalize to column format.
  */
-async function readStructDatasetStreaming(
+export async function readStructDatasetStreaming(
   file: StreamingH5File,
   path: string,
   assumePresent = false,
@@ -1738,7 +1738,6 @@ async function readStructDatasetStreaming(
     if (!assumePresent && !file.keys().includes(path)) return {};
 
     const meta = await file.getDatasetMeta(path);
-    const data = await file.getDatasetValue(path);
 
     // Get field names: try dtype metadata first, then HDF5 dataset attributes.
     // Matches main-thread reader's getFieldNames (read.ts:1356-1372).
@@ -1776,10 +1775,151 @@ async function readStructDatasetStreaming(
       }
     }
 
+    const shape = (meta.shape ?? []).map(Number);
+    if (shape.length === 2 && shape[0] > 0 && fieldNames.length === shape[1]) {
+      const columns = await readMatrixColumns(
+        file,
+        path,
+        shape[0],
+        shape[1],
+        fieldNames,
+      );
+      if (columns) return columns;
+    }
+    const members = (meta as DatasetMetaWithMembers).metadata?.compound_type
+      ?.members;
+    if (
+      shape.length === 1 &&
+      members?.length &&
+      shape[0] * members.length > MATRIX_SLICE_ELEMENTS
+    ) {
+      const columns = await readCompoundColumns(file, path, shape[0], members);
+      if (columns) return columns;
+    }
+
+    const data = await file.getDatasetValue(path);
     return normalizeStructData(data.value, data.shape, fieldNames);
   } catch {
     return {};
   }
+}
+
+/** Elements of a table read per request, so no read holds the whole table. */
+const MATRIX_SLICE_ELEMENTS = 1 << 19;
+
+/** The compound layout h5wasm reports in a dataset's metadata. */
+interface DatasetMetaWithMembers {
+  metadata?: {
+    compound_type?: {
+      members?: CompoundMember[];
+    };
+  };
+}
+
+interface CompoundMember {
+  name: string;
+  type: number;
+  size: number;
+  signed?: boolean;
+}
+
+/**
+ * Read a big compound table (what Python and the eager writer save) in row slices, into
+ * one column per member, sized to the member: a whole read needs the records and the
+ * columns at once, in one worker. Returns null when the worker cannot split a slice into
+ * columns, and the caller reads the table whole.
+ */
+async function readCompoundColumns(
+  file: StreamingH5File,
+  path: string,
+  rowCount: number,
+  members: CompoundMember[],
+): Promise<Record<string, unknown[]> | null> {
+  const rowsPerSlice = Math.max(
+    1,
+    Math.floor(MATRIX_SLICE_ELEMENTS / members.length),
+  );
+  const columns: Record<string, Float64Array | Float32Array | Uint8Array> = {};
+  for (const m of members) {
+    // A float member keeps its width; one-byte flags (visible, complete: unsigned, or an
+    // enum) stay one byte, which every reader treats as a number. Any other integer needs
+    // f64 (ids past 2^32, and -1).
+    const flag =
+      m.type !== 1 && m.size === 1 && (m.type === 8 || m.signed === false);
+    const Column =
+      m.type === 1 && m.size === 4
+        ? Float32Array
+        : flag
+          ? Uint8Array
+          : Float64Array;
+    columns[m.name] = new Column(rowCount);
+  }
+  for (let start = 0; start < rowCount; start += rowsPerSlice) {
+    const end = Math.min(rowCount, start + rowsPerSlice);
+    const { value } = await file.getDatasetValue(path, [[start, end]]);
+    if (!value || typeof value !== "object" || ArrayBuffer.isView(value)) {
+      return null;
+    }
+    if (Array.isArray(value)) return null;
+    for (const m of members) {
+      const part = (value as Record<string, unknown>)[m.name];
+      if (!(part instanceof Float64Array)) return null;
+      columns[m.name].set(part, start);
+    }
+  }
+  return columns as unknown as Record<string, unknown[]>;
+}
+
+/**
+ * Read a flat 2-D table (the streaming writer's layout) in row slices into one typed
+ * column per field. A whole read holds the table twice, once in the worker's wasm heap
+ * and once on the main thread, and columns of plain numbers live on the JS heap, which
+ * is capped near 4 GB: a table of tens of millions of points cannot be read that way.
+ * The values are the same either way. Returns null when a slice is not numeric, and the
+ * caller reads the table whole.
+ */
+async function readMatrixColumns(
+  file: StreamingH5File,
+  path: string,
+  rowCount: number,
+  colCount: number,
+  fieldNames: string[],
+): Promise<Record<string, unknown[]> | null> {
+  const rowsPerSlice = Math.max(
+    1,
+    Math.floor(MATRIX_SLICE_ELEMENTS / colCount),
+  );
+  let columns: Array<Float64Array | Float32Array | Int32Array> | null = null;
+  for (let start = 0; start < rowCount; start += rowsPerSlice) {
+    const end = Math.min(rowCount, start + rowsPerSlice);
+    const { value } = await file.getDatasetValue(path, [[start, end]]);
+    if (!ArrayBuffer.isView(value) || value instanceof DataView) return null;
+    if (!columns) {
+      const Column =
+        value instanceof Float32Array
+          ? Float32Array
+          : value instanceof Int32Array
+            ? Int32Array
+            : Float64Array;
+      columns = fieldNames.map(() => new Column(rowCount));
+    }
+    const slice = value as unknown as ArrayLike<number | bigint>;
+    const rows = end - start;
+    for (let c = 0; c < colCount; c += 1) {
+      const column = columns[c];
+      for (let r = 0; r < rows; r += 1) {
+        column[start + r] = Number(slice[r * colCount + c]);
+      }
+    }
+  }
+  if (!columns) return null;
+  const result: Record<string, unknown[]> = {};
+  fieldNames.forEach((name, c) => {
+    result[name] = (columns as NonNullable<typeof columns>)[
+      c
+    ] as unknown as unknown[];
+  });
+  return result;
 }
 
 /**

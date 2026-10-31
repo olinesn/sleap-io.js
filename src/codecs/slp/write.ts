@@ -18,7 +18,12 @@ import {
   isImageBitmapLike,
   isImageDataLike,
 } from "../../video/image-decode.js";
-import { getH5Module, getH5FileSystem, ensureH5StagingDir } from "./h5.js";
+import {
+  getH5Module,
+  getH5EmscriptenModule,
+  getH5FileSystem,
+  ensureH5StagingDir,
+} from "./h5.js";
 import { type ROI, type PredictedROI, encodeWkb } from "../../model/roi.js";
 import type {
   SegmentationMask,
@@ -172,6 +177,7 @@ function isRawCopyable(video: Video): boolean {
 function writeSlpToFile(
   file: any,
   labels: Labels,
+  raw: RawWriteModule,
   plan?: EmbedPlan | null,
 ): void {
   labels._collectEvents();
@@ -195,7 +201,7 @@ function writeSlpToFile(
     labels.labeledFrames,
     labels.identities,
   );
-  writeLabeledFrames(file, labels);
+  writeLabeledFrames(file, labels, raw);
   writeNegativeFrames(file, labels);
   const allInstances = labels.labeledFrames.flatMap((f) => f.instances);
 
@@ -1903,10 +1909,11 @@ async function writeSlpBytes(
     : null;
 
   const fs = getH5FileSystem(module);
+  const raw = (await getH5EmscriptenModule()) as RawWriteModule;
   const file = new module.File(memPath, "w");
   try {
     try {
-      writeSlpToFile(file, writeLabels, plan);
+      writeSlpToFile(file, writeLabels, raw, plan);
       if (includeEmbeddedData && plan && plan.size > 0) {
         await writeEmbeddedVideoData(file, labels, plan, options?.onProgress);
       }
@@ -2945,6 +2952,16 @@ function createGzipFloatMatrix(
     const off = i * ncols;
     for (let j = 0; j < ncols; j++) data[off + j] = r[j];
   }
+  writeGzipFloatMatrix(file, name, data, n, ncols);
+}
+
+function writeGzipFloatMatrix(
+  file: any,
+  name: string,
+  data: Float64Array,
+  n: number,
+  ncols: number,
+): void {
   file.create_dataset({
     name,
     data,
@@ -2954,6 +2971,96 @@ function createGzipFloatMatrix(
     compression: "gzip",
     compression_opts: 1,
   });
+}
+
+/**
+ * Rows of numbers held flat in one growing typed array: millions of rows without one
+ * array per row on the JS heap (capped near 4 GB).
+ */
+class FlatRows {
+  length = 0;
+  private data = new Float64Array(0);
+
+  constructor(readonly ncols: number) {}
+
+  private reserve(): number {
+    const offset = this.length * this.ncols;
+    if (offset + this.ncols > this.data.length) {
+      const next = new Float64Array(
+        Math.max(1024 * this.ncols, this.data.length * 2),
+      );
+      next.set(this.data);
+      this.data = next;
+    }
+    this.length += 1;
+    return offset;
+  }
+
+  push3(a: number, b: number, c: number): void {
+    const o = this.reserve();
+    this.data[o] = a;
+    this.data[o + 1] = b;
+    this.data[o + 2] = c;
+  }
+
+  push4(a: number, b: number, c: number, d: number): void {
+    const o = this.reserve();
+    this.data[o] = a;
+    this.data[o + 1] = b;
+    this.data[o + 2] = c;
+    this.data[o + 3] = d;
+  }
+
+  push8(
+    a: number,
+    b: number,
+    c: number,
+    d: number,
+    e: number,
+    f: number,
+    g: number,
+    h: number,
+  ): void {
+    const o = this.reserve();
+    this.data[o] = a;
+    this.data[o + 1] = b;
+    this.data[o + 2] = c;
+    this.data[o + 3] = d;
+    this.data[o + 4] = e;
+    this.data[o + 5] = f;
+    this.data[o + 6] = g;
+    this.data[o + 7] = h;
+  }
+
+  /** The rows so far, row after row (a view: copy it to keep it past the next push). */
+  values(): Float64Array {
+    return this.data.subarray(0, this.length * this.ncols);
+  }
+}
+
+/** {@link createMatrixDataset} of a `"<d"` table from {@link FlatRows}. */
+function createFlatMatrixDataset(
+  file: any,
+  name: string,
+  rows: FlatRows,
+  fieldNames: string[],
+): void {
+  file.create_dataset({
+    name,
+    data: rows.values(),
+    shape: [rows.length, rows.ncols],
+    dtype: "<d",
+  });
+  setStringAttr(file.get(name), "field_names", JSON.stringify(fieldNames));
+}
+
+/** {@link createGzipFloatMatrix} from {@link FlatRows}. */
+function createFlatGzipFloatMatrix(
+  file: any,
+  name: string,
+  rows: FlatRows,
+): void {
+  writeGzipFloatMatrix(file, name, rows.values(), rows.length, rows.ncols);
 }
 
 /**
@@ -2981,15 +3088,16 @@ function writeSessions(
     labeledFrameIndex.set(lf, idx);
   });
 
-  // Columnar accumulators for /session_data (small: fixed-width ints/floats per frame
-  // group / instance group / member, plus the 3-D point rows).
-  const fgRows: number[][] = []; // [frame_idx, ig_start, ig_end]
-  const igRows: number[][] = []; // SESSION_INSTANCE_GROUP_FIELDS
-  const memberRows: number[][] = []; // [camera, lf, inst]
+  // Columnar accumulators for /session_data: fixed-width ints/floats per frame group /
+  // instance group / member, plus the 3-D point rows. Typed, because they are not small
+  // on a long multi-camera recording (millions of rows, each its own array otherwise).
+  const fgRows = new FlatRows(3); // [frame_idx, ig_start, ig_end]
+  const igRows = new FlatRows(8); // SESSION_INSTANCE_GROUP_FIELDS
+  const memberRows = new FlatRows(3); // [camera, lf, inst]
   const fgMeta: string[] = [];
   const igMeta: string[] = [];
-  const pts3dRows: number[][] = []; // [x, y, z]
-  const predPts3dRows: number[][] = []; // [x, y, z, score]
+  const pts3dRows = new FlatRows(3); // [x, y, z]
+  const predPts3dRows = new FlatRows(4); // [x, y, z, score]
 
   const sessionsJson: string[] = [];
   for (const session of sessions) {
@@ -3011,7 +3119,7 @@ function writeSessions(
           frameGroup,
           labeledFrameIndex,
         )) {
-          memberRows.push(m);
+          memberRows.push3(m[0], m[1], m[2]);
         }
         const memberEnd = memberRows.length;
 
@@ -3045,24 +3153,27 @@ function writeSessions(
             points3d.forEach((row, i) => {
               const xyz = coerce3dRow(row, 3);
               const s = scores[i];
-              predPts3dRows.push([
+              predPts3dRows.push4(
                 xyz[0],
                 xyz[1],
                 xyz[2],
                 s == null ? Number.NaN : Number(s),
-              ]);
+              );
             });
             pts3dEnd = predPts3dRows.length;
             pts3dPredicted = 1;
           } else {
             pts3dStart = pts3dRows.length;
-            for (const row of points3d) pts3dRows.push(coerce3dRow(row, 3));
+            for (const row of points3d) {
+              const xyz = coerce3dRow(row, 3);
+              pts3dRows.push3(xyz[0], xyz[1], xyz[2]);
+            }
             pts3dEnd = pts3dRows.length;
           }
           if (inst3d?.score != null) i3dScore = inst3d.score;
         }
 
-        igRows.push([
+        igRows.push8(
           identityIdx,
           score,
           i3dScore,
@@ -3071,7 +3182,7 @@ function writeSessions(
           pts3dPredicted,
           memberStart,
           memberEnd,
-        ]);
+        );
         igMeta.push(
           group.metadata && Object.keys(group.metadata).length
             ? JSON.stringify(group.metadata)
@@ -3079,7 +3190,7 @@ function writeSessions(
         );
       }
       const igEnd = igRows.length;
-      fgRows.push([frameGroup.frameIdx, igStart, igEnd]);
+      fgRows.push3(frameGroup.frameIdx, igStart, igEnd);
       fgMeta.push(
         frameGroup.metadata && Object.keys(frameGroup.metadata).length
           ? JSON.stringify(frameGroup.metadata)
@@ -3104,36 +3215,32 @@ function writeSessions(
   // Columnar /session_data group — only when some session has frame groups.
   if (fgRows.length > 0) {
     file.create_group("session_data");
-    createMatrixDataset(
+    createFlatMatrixDataset(
       file,
       "session_data/frame_groups",
       fgRows,
       SESSION_FRAME_GROUP_FIELDS,
-      "<d",
     );
-    createMatrixDataset(
+    createFlatMatrixDataset(
       file,
       "session_data/instance_groups",
       igRows,
       SESSION_INSTANCE_GROUP_FIELDS,
-      "<d",
     );
-    createMatrixDataset(
+    createFlatMatrixDataset(
       file,
       "session_data/instance_group_members",
       memberRows,
       SESSION_INSTANCE_GROUP_MEMBER_FIELDS,
-      "<d",
     );
     if (pts3dRows.length > 0) {
-      createGzipFloatMatrix(file, "session_data/points_3d", pts3dRows, 3);
+      createFlatGzipFloatMatrix(file, "session_data/points_3d", pts3dRows);
     }
     if (predPts3dRows.length > 0) {
-      createGzipFloatMatrix(
+      createFlatGzipFloatMatrix(
         file,
         "session_data/pred_points_3d",
         predPts3dRows,
-        4,
       );
     }
     // Per-row metadata JSON blobs, presence-guarded (omitted when all empty).
@@ -3217,92 +3324,196 @@ function buildNegativeFrameRows(labels: Labels): number[][] {
   return rows;
 }
 
+/** Where {@link walkLabelTableRows} sends each row of the four pose tables. */
+interface LabelTableSink {
+  frame(
+    frameId: number,
+    video: number,
+    frameIdx: number,
+    instanceStart: number,
+    instanceEnd: number,
+  ): void;
+  instance(
+    instanceId: number,
+    instanceType: number,
+    frameId: number,
+    skeleton: number,
+    track: number,
+    fromPredicted: number,
+    score: number,
+    pointStart: number,
+    pointEnd: number,
+    trackingScore: number,
+  ): void;
+  point(x: number, y: number, visible: number, complete: number): void;
+  predPoint(
+    x: number,
+    y: number,
+    visible: number,
+    complete: number,
+    score: number,
+  ): void;
+}
+
+/**
+ * Send one instance's point rows to `sink`, enforcing the node-count rule of
+ * {@link emitInstancePoints}. An instance's columns are read directly (what its
+ * `PointView`s read), so no view or `xy` pair is allocated per keypoint.
+ */
+function walkInstancePoints(
+  sink: LabelTableSink,
+  instance: Instance | PredictedInstance,
+  predicted: boolean,
+): void {
+  const nNodes = instance.skeleton.nodeNames.length;
+  const n = instance._n;
+  if (n !== nNodes && !_spanWarned.has(instance.skeleton.name ?? "")) {
+    _spanWarned.add(instance.skeleton.name ?? "");
+    console.warn(
+      `Instance has ${n} point(s) but its skeleton "${instance.skeleton.name ?? "?"}" has ${nNodes} node(s); ` +
+        "padding/truncating to the node count so the written SLP stays self-consistent (a mismatch would break the Python reader).",
+    );
+  }
+  const xy = instance._xy;
+  const visible = instance._visible;
+  const complete = instance._complete;
+  const score = instance._score;
+  for (let i = 0; i < nNodes; i += 1) {
+    const inRange = i < n;
+    const x = inRange ? xy[i << 1] : Number.NaN;
+    const y = inRange ? xy[(i << 1) + 1] : Number.NaN;
+    const v = inRange && visible[i] !== 0 ? 1 : 0;
+    const c = inRange && complete[i] !== 0 ? 1 : 0;
+    if (predicted) {
+      sink.predPoint(x, y, v, c, inRange && score ? score[i] : 0);
+    } else {
+      sink.point(x, y, v, c);
+    }
+  }
+}
+
+/**
+ * Walk `labels` as the eager writer serializes it, sending every row of the
+ * `frames`/`instances`/`points`/`pred_points` tables to `sink`, in file order. Ids
+ * are row numbers, and `from_predicted` is resolved before its row is sent, so a
+ * sink can write each row as it arrives: a table's rows never have to exist together.
+ * An instance listed twice resolves to its last row.
+ */
+function walkLabelTableRows(labels: Labels, sink: LabelTableSink): void {
+  const videoIndexOf = new Map<Video, number>();
+  labels.videos.forEach((v, i) => {
+    if (!videoIndexOf.has(v)) videoIndexOf.set(v, i);
+  });
+  const trackIndexOf = new Map<Track, number>();
+  labels.tracks.forEach((t, i) => {
+    if (!trackIndexOf.has(t)) trackIndexOf.set(t, i);
+  });
+
+  // The ids `from_predicted` links need, found first: most projects have none.
+  const linked = new Set<Instance>();
+  for (const labeledFrame of labels.labeledFrames) {
+    for (const instance of labeledFrame.instances) {
+      if (!(instance instanceof PredictedInstance) && instance.fromPredicted) {
+        linked.add(instance.fromPredicted as unknown as Instance);
+      }
+    }
+  }
+  const linkedId = new Map<Instance, number>();
+  if (linked.size > 0) {
+    let id = 0;
+    for (const labeledFrame of labels.labeledFrames) {
+      for (const instance of labeledFrame.instances) {
+        if (linked.has(instance as Instance)) {
+          linkedId.set(instance as Instance, id);
+        }
+        id += 1;
+      }
+    }
+  }
+
+  let frameId = 0;
+  let instanceId = 0;
+  let pointRows = 0;
+  let predPointRows = 0;
+  for (const labeledFrame of labels.labeledFrames) {
+    const instanceStart = instanceId;
+    const videoIndex = Math.max(0, videoIndexOf.get(labeledFrame.video) ?? -1);
+
+    for (const instance of labeledFrame.instances) {
+      const skeletonId = Math.max(
+        0,
+        labels.skeletons.indexOf(instance.skeleton),
+      );
+      const trackId = instance.track
+        ? (trackIndexOf.get(instance.track) ?? -1)
+        : -1;
+      const trackingScore = instance.trackingScore ?? 0;
+      const nNodes = instance.skeleton.nodeNames.length;
+      if (instance instanceof PredictedInstance) {
+        walkInstancePoints(sink, instance, true);
+        sink.instance(
+          instanceId,
+          1,
+          frameId,
+          skeletonId,
+          trackId,
+          -1,
+          instance.score ?? 0,
+          predPointRows,
+          predPointRows + nNodes,
+          trackingScore,
+        );
+        predPointRows += nNodes;
+      } else {
+        walkInstancePoints(sink, instance as Instance, false);
+        const fromPredicted = instance.fromPredicted
+          ? (linkedId.get(instance.fromPredicted as unknown as Instance) ?? -1)
+          : -1;
+        sink.instance(
+          instanceId,
+          0,
+          frameId,
+          skeletonId,
+          trackId,
+          fromPredicted,
+          0,
+          pointRows,
+          pointRows + nNodes,
+          trackingScore,
+        );
+        pointRows += nNodes;
+      }
+      instanceId += 1;
+    }
+
+    sink.frame(
+      frameId,
+      videoIndex,
+      labeledFrame.frameIdx,
+      instanceStart,
+      instanceId,
+    );
+    frameId += 1;
+  }
+}
+
 /**
  * Build the `frames`/`instances`/`points`/`pred_points`/`negative_frames` row
- * matrices from `labels`, exactly as the eager writer would serialize them.
- *
- * Shared by {@link writeLabeledFrames} (the full save path) and
- * {@link buildLabelTableUpdate} (the in-place save path) so both emit
- * byte-identical columns using the same field-name constants. Contains no HDF5
- * I/O — pure `Labels` → `number[][]`.
+ * matrices from `labels`, exactly as the eager writer would serialize them. Used by
+ * {@link buildLabelTableUpdate} (the in-place save path); the full save writes the
+ * same rows through {@link writeLabeledFrames} without holding them.
  */
 export function buildLabelTableRows(labels: Labels): LabelTableRows {
   const frames: number[][] = [];
   const instances: number[][] = [];
   const points: number[][] = [];
   const predPoints: number[][] = [];
-  const instanceIndex = new Map<Instance, number>();
-  const predictedLinks: Array<[number, PredictedInstance]> = [];
-
-  for (const labeledFrame of labels.labeledFrames) {
-    const frameId = frames.length;
-    const instanceStart = instances.length;
-    const videoIndex = Math.max(0, labels.videos.indexOf(labeledFrame.video));
-
-    for (const instance of labeledFrame.instances) {
-      const instanceId = instances.length;
-      instanceIndex.set(instance as Instance, instanceId);
-
-      const skeletonId = Math.max(
-        0,
-        labels.skeletons.indexOf(instance.skeleton),
-      );
-      const trackId = instance.track
-        ? labels.tracks.indexOf(instance.track)
-        : -1;
-      const trackingScore = instance.trackingScore ?? 0;
-      const fromPredicted = -1;
-      let score = 0;
-      let pointStart = 0;
-      let pointEnd = 0;
-
-      if (instance instanceof PredictedInstance) {
-        score = instance.score ?? 0;
-        pointStart = predPoints.length;
-        emitInstancePoints(predPoints, instance, true);
-        pointEnd = predPoints.length;
-      } else {
-        pointStart = points.length;
-        emitInstancePoints(points, instance as Instance, false);
-        pointEnd = points.length;
-        if (instance.fromPredicted) {
-          predictedLinks.push([instanceId, instance.fromPredicted]);
-        }
-      }
-
-      instances.push([
-        instanceId,
-        instance instanceof PredictedInstance ? 1 : 0,
-        frameId,
-        skeletonId,
-        trackId,
-        fromPredicted,
-        score,
-        pointStart,
-        pointEnd,
-        trackingScore,
-      ]);
-    }
-
-    const instanceEnd = instances.length;
-    frames.push([
-      frameId,
-      videoIndex,
-      labeledFrame.frameIdx,
-      instanceStart,
-      instanceEnd,
-    ]);
-  }
-
-  for (const [instanceId, fromPredictedInstance] of predictedLinks) {
-    const fromIndex = instanceIndex.get(fromPredictedInstance as Instance);
-    if (fromIndex != null) {
-      instances[instanceId][5] = fromIndex;
-    } else {
-      instances[instanceId][5] = -1;
-    }
-  }
-
+  walkLabelTableRows(labels, {
+    frame: (...row) => frames.push(row),
+    instance: (...row) => instances.push(row),
+    point: (...row) => points.push(row),
+    predPoint: (...row) => predPoints.push(row),
+  });
   return {
     frames,
     instances,
@@ -3312,8 +3523,208 @@ export function buildLabelTableRows(labels: Labels): LabelTableRows {
   };
 }
 
-function writeLabeledFrames(file: any, labels: Labels): void {
-  const { frames, instances, points, predPoints } = buildLabelTableRows(labels);
+/** From this many rows a pose table is gzipped: about what a save rewrites in a second. */
+const GZIP_MIN_TABLE_ROWS = 1_000_000;
+
+/** The Emscripten surface {@link CompoundAppendTable} writes packed records through. */
+interface RawWriteModule {
+  _malloc(size: number): number;
+  _free(ptr: number): void;
+  HEAPU8: Uint8Array;
+  set_dataset_data(
+    fileId: unknown,
+    path: string,
+    count: bigint[],
+    offset: bigint[],
+    strides: bigint[],
+    dataPtr: bigint,
+  ): number;
+}
+
+/**
+ * A pose table written as it is built: rows wait in a fixed buffer of numbers and go
+ * to the file a chunk at a time, so the JS heap (capped near 4 GB) never holds a table
+ * of tens of millions of points as rows. Same members, values and chunking as
+ * {@link createCompoundDataset}; a table that never fills its buffer is written by that
+ * very call, so a small project's file does not change.
+ */
+class CompoundAppendTable {
+  total = 0;
+  private staged = 0;
+  private created = false;
+  private readonly columnCount: number;
+  private readonly buffer: Float64Array;
+
+  constructor(
+    private readonly file: any,
+    private readonly name: string,
+    private readonly fields: CompoundField[],
+    private readonly gzip: boolean,
+    private readonly raw: RawWriteModule,
+  ) {
+    this.columnCount = fields.length;
+    this.buffer = new Float64Array(this.columnCount * WRITE_CHUNK_ROWS);
+  }
+
+  /** The next row's offset in the buffer. Fill `columnCount` values from there. */
+  nextRow(): Float64Array {
+    if (this.staged === WRITE_CHUNK_ROWS) this.flush();
+    this.staged += 1;
+    this.total += 1;
+    return this.buffer;
+  }
+
+  get rowOffset(): number {
+    return (this.staged - 1) * this.columnCount;
+  }
+
+  private create(): void {
+    const columns = new Map<string, number[]>();
+    for (const [fieldName] of this.fields) columns.set(fieldName, []);
+    this.file.create_dataset({
+      name: this.name,
+      data: columns,
+      shape: [0],
+      maxshape: [null],
+      chunks: [WRITE_CHUNK_ROWS],
+      dtype: this.fields,
+      ...(this.gzip ? { compression: "gzip", compression_opts: 1 } : {}),
+    });
+    setStringAttr(
+      this.file.get(this.name),
+      "field_names",
+      JSON.stringify(this.fields.map(([fieldName]) => fieldName)),
+    );
+    this.created = true;
+  }
+
+  private flush(): void {
+    if (this.staged === 0) return;
+    if (!this.created) this.create();
+    const rows = this.staged;
+    const ds = this.file.get(this.name);
+    ds.resize([this.total]);
+    writePackedRows(
+      ds,
+      ds.metadata.compound_type.members as CompoundWriteMember[],
+      this.buffer,
+      rows,
+      this.fields,
+      this.raw,
+      this.total - rows,
+    );
+    this.staged = 0;
+  }
+
+  /** Write what is left; a table that never overflowed is written in one piece. */
+  finish(): void {
+    if (this.created) {
+      this.flush();
+      return;
+    }
+    const rows: number[][] = new Array(this.staged);
+    for (let i = 0; i < this.staged; i += 1) {
+      rows[i] = Array.from(
+        this.buffer.subarray(i * this.columnCount, (i + 1) * this.columnCount),
+      );
+    }
+    createCompoundDataset(this.file, this.name, rows, this.fields);
+    this.staged = 0;
+    this.created = true;
+  }
+}
+
+/** A compound member as h5wasm reports it. */
+interface CompoundWriteMember {
+  name: string;
+  type: number;
+  size?: number;
+  offset: number;
+  signed?: boolean;
+  littleEndian?: boolean;
+}
+
+/**
+ * Pack `rows` staged rows into the dataset's record layout and write them at `base`.
+ * What `write_slice` does for a compound column map, without its slice per value: on a
+ * table of 60 million points that allocation is most of the save.
+ */
+function writePackedRows(
+  ds: any,
+  members: CompoundWriteMember[],
+  staged: Float64Array,
+  rows: number,
+  fields: CompoundField[],
+  raw: RawWriteModule,
+  base: number,
+): void {
+  const recordSize = members.reduce(
+    (end, m) => Math.max(end, m.offset + (m.size ?? 8)),
+    0,
+  );
+  const nbytes = recordSize * rows;
+  const ptr = raw._malloc(nbytes);
+  if (!ptr)
+    throw new Error(`could not allocate ${nbytes} bytes for a table write`);
+  try {
+    const view = new DataView(raw.HEAPU8.buffer, ptr, nbytes);
+    const columnCount = fields.length;
+    for (const m of members) {
+      const j = fields.findIndex(([fieldName]) => fieldName === m.name);
+      const size = m.size ?? 8;
+      const le = m.littleEndian !== false;
+      const signed = m.signed !== false;
+      const isFloat = m.type === H5T_FLOAT_CLASS;
+      for (let i = 0; i < rows; i += 1) {
+        const v = staged[i * columnCount + j];
+        const at = i * recordSize + m.offset;
+        if (isFloat) {
+          if (size === 8) view.setFloat64(at, v, le);
+          else view.setFloat32(at, v, le);
+        } else if (size === 1) {
+          view.setUint8(at, v);
+        } else if (size === 4) {
+          if (signed) view.setInt32(at, v, le);
+          else view.setUint32(at, v, le);
+        } else if (size === 8) {
+          const big = BigInt(Math.trunc(v));
+          if (signed) view.setBigInt64(at, big, le);
+          else view.setBigUint64(at, big, le);
+        } else {
+          view.setUint16(at, v, le);
+        }
+      }
+    }
+    raw.set_dataset_data(
+      ds.file_id,
+      ds.path,
+      [BigInt(rows)],
+      [BigInt(base)],
+      [1n],
+      BigInt(ptr),
+    );
+  } finally {
+    raw._free(ptr);
+  }
+}
+
+function writeLabeledFrames(
+  file: any,
+  labels: Labels,
+  raw: RawWriteModule,
+): void {
+  // Table sizes first: only a big table is gzipped, and gzip is chosen at creation.
+  let instanceRows = 0;
+  let pointRows = 0;
+  let predPointRows = 0;
+  for (const labeledFrame of labels.labeledFrames) {
+    for (const instance of labeledFrame.instances) {
+      instanceRows += 1;
+      const nNodes = instance.skeleton.nodeNames.length;
+      if (instance instanceof PredictedInstance) predPointRows += nNodes;
+      else pointRows += nNodes;
+    }
+  }
 
   // `frames` stays a flat int matrix (Python reads it positionally), written
   // CHUNKED + unlimited (resizable=true) so it can be resized in place on an edit
@@ -3322,15 +3733,80 @@ function writeLabeledFrames(file: any, labels: Labels): void {
   // the fast in-place edit-save can patch them via write_slice / resize without
   // rewriting the embedded video groups. See createCompoundDataset /
   // writeLabelTablesInPlace.
-  createMatrixDataset(file, "frames", frames, FRAMES_FIELDS, "<i8", true);
-  createCompoundDataset(file, "instances", instances, INSTANCE_COMPOUND_FIELDS);
-  createCompoundDataset(file, "points", points, POINT_COMPOUND_FIELDS);
-  createCompoundDataset(
+  const frames: number[][] = [];
+  const instances = new CompoundAppendTable(
+    file,
+    "instances",
+    INSTANCE_COMPOUND_FIELDS,
+    instanceRows >= GZIP_MIN_TABLE_ROWS,
+    raw,
+  );
+  const points = new CompoundAppendTable(
+    file,
+    "points",
+    POINT_COMPOUND_FIELDS,
+    pointRows >= GZIP_MIN_TABLE_ROWS,
+    raw,
+  );
+  const predPoints = new CompoundAppendTable(
     file,
     "pred_points",
-    predPoints,
     PRED_POINT_COMPOUND_FIELDS,
+    predPointRows >= GZIP_MIN_TABLE_ROWS,
+    raw,
   );
+  walkLabelTableRows(labels, {
+    frame: (frameId, video, frameIdx, instanceStart, instanceEnd) => {
+      frames.push([frameId, video, frameIdx, instanceStart, instanceEnd]);
+    },
+    instance: (
+      instanceId,
+      instanceType,
+      frameId,
+      skeleton,
+      track,
+      fromPredicted,
+      score,
+      pointStart,
+      pointEnd,
+      trackingScore,
+    ) => {
+      const buf = instances.nextRow();
+      const o = instances.rowOffset;
+      buf[o] = instanceId;
+      buf[o + 1] = instanceType;
+      buf[o + 2] = frameId;
+      buf[o + 3] = skeleton;
+      buf[o + 4] = track;
+      buf[o + 5] = fromPredicted;
+      buf[o + 6] = score;
+      buf[o + 7] = pointStart;
+      buf[o + 8] = pointEnd;
+      buf[o + 9] = trackingScore;
+    },
+    point: (x, y, visible, complete) => {
+      const buf = points.nextRow();
+      const o = points.rowOffset;
+      buf[o] = x;
+      buf[o + 1] = y;
+      buf[o + 2] = visible;
+      buf[o + 3] = complete;
+    },
+    predPoint: (x, y, visible, complete, score) => {
+      const buf = predPoints.nextRow();
+      const o = predPoints.rowOffset;
+      buf[o] = x;
+      buf[o + 1] = y;
+      buf[o + 2] = visible;
+      buf[o + 3] = complete;
+      buf[o + 4] = score;
+    },
+  });
+
+  createMatrixDataset(file, "frames", frames, FRAMES_FIELDS, "<i8", true);
+  instances.finish();
+  points.finish();
+  predPoints.finish();
 }
 
 function writeNegativeFrames(file: any, labels: Labels): void {

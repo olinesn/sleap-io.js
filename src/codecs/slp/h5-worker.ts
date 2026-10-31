@@ -1288,7 +1288,7 @@ function getDatasetMeta(path) {
 // instead of being structured-cloned. Returns null (caller falls back to .value)
 // for anything not a plain-numeric compound. Values match .value except int64
 // comes back as number (every consumer routes these through Number()).
-function readCompoundColumnsWorker(dataset, M) {
+function readCompoundColumnsWorker(dataset, M, rowRange) {
   const md = dataset.metadata;
   const members = md && md.compound_type && md.compound_type.members;
   if (!members || !members.length || (md && md.vlen)) return null;
@@ -1303,7 +1303,8 @@ function readCompoundColumnsWorker(dataset, M) {
     if (mt.size !== 1 && mt.size !== 2 && mt.size !== 4 && mt.size !== 8) return null;
   }
   if (!(M && M._malloc && M.get_dataset_data && M.HEAPU8 && M._free)) return null;
-  const n = shape[0];
+  const first = rowRange ? rowRange[0] : 0;
+  const n = rowRange ? rowRange[1] - rowRange[0] : shape[0];
   // Columns are Float64Array (every SLEAP field — coords, scores, and integer
   // id/index columns up to 2^53 — is exact in f64) so their backing buffers can
   // be TRANSFERRED to the main thread instead of structured-cloned. \`buffers\`
@@ -1323,7 +1324,7 @@ function readCompoundColumnsWorker(dataset, M) {
   if (!dptr) return null;
   let buf;
   try {
-    M.get_dataset_data(dataset.file_id, dataset.path, [BigInt(n)], [0n], [1n], BigInt(dptr));
+    M.get_dataset_data(dataset.file_id, dataset.path, [BigInt(n)], [BigInt(first)], [1n], BigInt(dptr));
     buf = M.HEAPU8.slice(dptr, dptr + nbytes);
   } finally {
     M._free(dptr);
@@ -1405,9 +1406,11 @@ function getDatasetValue(path, slice) {
   // Fixed-size compound full read (frames/instances/points/pred_points): return
   // per-member columns read directly from the record blob, skipping h5wasm's slow
   // Dataset.value. normalizeStructData accepts a { field: array } record as-is, so
-  // no caller change is needed; falls through to .value when not applicable.
-  if (!slice) {
-    const res = readCompoundColumnsWorker(dataset, M);
+  // no caller change is needed; falls through to .value when not applicable. A
+  // [[start, end]] slice of rows is split into columns the same way.
+  const rowRange = slice && slice.length === 1 && Array.isArray(slice[0]) && slice[0].length === 2 ? slice[0] : null;
+  if (!slice || rowRange) {
+    const res = readCompoundColumnsWorker(dataset, M, rowRange);
     if (res) {
       return {
         value: { type: 'columns', columns: res.columns },

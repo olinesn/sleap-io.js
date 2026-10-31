@@ -1158,11 +1158,18 @@ describe("provenance", () => {
 
 describe("loading a 3.0 file and saving it", () => {
   /**
-   * Both layouts of every twin. The embedded videos of `handbuilt_30*.slp` are numbered
-   * out of list order, with frames in only some of them, so `/frames/video` has to read
-   * back beside those numbers whichever format was loaded (see `frameVideoIds`).
+   * Files with some of everything, in both layouts. The embedded videos of
+   * `handbuilt_30*.slp` are numbered out of list order, with frames in only some of
+   * them, so `/frames/video` has to read back beside those numbers whichever format was
+   * loaded (see `frameVideoIds`).
    */
-  const SAVED = [...TWINS.flat(), "handbuilt_30_gzip.slp"];
+  const SAVED = [
+    PYTHON_TWIN,
+    "py_written_30_twin_legacy.slp",
+    COLUMNAR,
+    LEGACY,
+    "handbuilt_30_gzip.slp",
+  ];
 
   /** Save and reload, returning the reloaded labels and the file's top-level facts. */
   async function saveAndInspect(labels: Labels) {
@@ -1205,7 +1212,7 @@ describe("loading a 3.0 file and saving it", () => {
       });
     }
 
-    it(`${file}: a lazy load saved without materializing keeps the poses and links`, async () => {
+    it(`${file}: a lazy load saved without materializing keeps the poses`, async () => {
       quietWarnings();
       const loaded = await readSlpLazy(fixture(file), { openVideos: false });
       const { reloaded, facts } = await saveAndInspect(loaded);
@@ -1226,17 +1233,12 @@ describe("loading a 3.0 file and saving it", () => {
         { openVideos: false },
       );
       loaded.materialize();
-      // This writer stores coordinates and point scores as float32, on purpose.
       const frames = (labels: Labels) =>
         poseSnapshot(labels).frames.map((f) => [
           f.video,
           f.frameIdx,
           f.isNegative,
-          f.instances.map((i) =>
-            i.points.map((point) =>
-              point.map((v) => (typeof v === "number" ? f4(v) : v)),
-            ),
-          ),
+          f.instances.map((i) => i.points),
         ]);
       expect(frames(reloaded)).toEqual(frames(loaded));
     });

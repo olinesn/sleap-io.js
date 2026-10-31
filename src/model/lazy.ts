@@ -199,6 +199,8 @@ export class LazyDataStore {
       const instanceType = Number(
         this.instancesData.instance_type?.[instIdx] ?? 0,
       );
+      // Rows of an unknown type are skipped, as in Python.
+      if (instanceType !== 0 && instanceType !== 1) continue;
       const skeletonId = Number(this.instancesData.skeleton?.[instIdx] ?? 0);
       const trackId = Number(this.instancesData.track?.[instIdx] ?? -1);
       const pointStart = Number(

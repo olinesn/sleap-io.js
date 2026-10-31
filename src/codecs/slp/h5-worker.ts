@@ -1179,6 +1179,9 @@ function writeOneTableInPlaceWorker(file, diskName, fields, flat, rowCount, colC
     setStringAttrWorker(file.get(diskName), 'field_names', JSON.stringify(fields));
     return;
   }
+  if (typeof ds.keys === 'function' && ds.shape === undefined) {
+    throw new Error('in-place update of ' + diskName + ': it is a group of columns (SLP format 3.0), which cannot be written in place - re-save the whole file instead');
+  }
   var md = ds.metadata;
   var members = md && md.compound_type && md.compound_type.members;
   var isCompound = !!(members && members.length > 0);
@@ -1362,10 +1365,68 @@ function readCompoundColumnsWorker(dataset, M) {
   return { columns: columns, buffers: buffers };
 }
 
+// Refuse a filter this HDF5 build doesn't have: h5wasm logs the failure but hands back
+// the buffer it allocated, so the file would read as garbage numbers with no error.
+// Mirrors checkDatasetFilters in ./columnar.ts (keep them in lockstep).
+function checkDatasetFiltersWorker(dataset, path) {
+  let filters;
+  try {
+    filters = dataset.filters;
+  } catch (e) {
+    return; // an h5wasm that can't list filters; nothing to go on
+  }
+  if (!Array.isArray(filters)) return;
+  for (let i = 0; i < filters.length; i++) {
+    if (filters[i].id > 6) {
+      throw new Error('/' + path + ' is compressed with "' + (filters[i].name || filters[i].id) + '", which sleap-io.js cannot read. Re-save the file from Python sleap-io with compression="gzip" or without compression.');
+    }
+  }
+}
+
+// Read a table stored as a group with one 1-D dataset per column (SLP 3.0), so it
+// reaches the main thread in the same { field: array } shape as a compound table.
+// Subgroups and other shapes aren't columns. 64-bit integers become Float64Array
+// (exact below 2^53, as in readCompoundColumnsWorker); mirrors numberColumn and
+// readH5GroupColumns in ./columnar.ts (keep them in lockstep).
+function readGroupColumnsWorker(group, path) {
+  const columns = {};
+  const buffers = [];
+  const names = group.keys();
+  for (let k = 0; k < names.length; k++) {
+    const child = group.get(names[k]);
+    if (!child || !child.shape || child.shape.length !== 1) continue;
+    checkDatasetFiltersWorker(child, path + '/' + names[k]);
+    let col = child.value;
+    const signed = col instanceof BigInt64Array;
+    if (signed || col instanceof BigUint64Array) {
+      const lo = new Uint32Array(col.buffer, col.byteOffset, col.length * 2);
+      const hi = signed ? new Int32Array(col.buffer, col.byteOffset, lo.length) : lo;
+      const out = new Float64Array(col.length);
+      for (let i = 0; i < out.length; i++) out[i] = hi[2 * i + 1] * 4294967296 + lo[2 * i];
+      col = out;
+    }
+    columns[names[k]] = col;
+    if (ArrayBuffer.isView(col)) buffers.push(col.buffer);
+  }
+  return { columns: columns, buffers: buffers };
+}
+
 function getDatasetValue(path, slice) {
   if (!currentFile) throw new Error('No file open');
   const dataset = currentFile.get(path);
   if (!dataset) throw new Error('Dataset not found: ' + path);
+
+  if (typeof dataset.keys === 'function' && dataset.shape === undefined) {
+    const res = readGroupColumnsWorker(dataset, path);
+    return {
+      value: { type: 'columns', columns: res.columns },
+      shape: dataset.shape,
+      dtype: dataset.dtype,
+      transferables: res.buffers
+    };
+  }
+  // Whole reads only: a frame read of an embedded video shouldn't pay for this.
+  if (!slice) checkDatasetFiltersWorker(dataset, path);
 
   // Variable-length (vlen) datasets: h5wasm's high-level dataset.slice() corrupts
   // the heap here — its post-read reclaim walks the FULL dataset dataspace over a

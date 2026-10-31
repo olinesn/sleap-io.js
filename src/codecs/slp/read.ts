@@ -7,11 +7,30 @@ import {
 } from "./h5.js";
 import { readCompoundColumnsManual } from "./h5-compound.js";
 import {
+  annotationProblems,
+  checkDatasetFilters,
+  type ColumnarTableName,
+  indexOutOfRange,
+  isH5Group,
+  legacyTablePath,
+  normalizeColumnarTable,
+  normalizePoseTables,
+  type PoseTables,
+  type RawTable,
+  readH5GroupColumns,
+  reportTableProblems,
+  sessionProblems,
+  spanOutOfRange,
+  tableBufferPath,
+  tableMembers,
+} from "./columnar.js";
+import {
   attrToNumber,
   attrToString,
-  checkFormatId,
+  checkSlpFormat,
   datasetValueToString,
   parseMetadataJson,
+  parseProvenance,
   missingMetadataJsonError,
   parseJsonEntry,
   sessionsReadError,
@@ -167,10 +186,7 @@ export async function readSlp(
 
     const metadataAttrs =
       (metadataGroup as unknown as { attrs?: Record<string, any> }).attrs ?? {};
-    const formatId = Number(
-      metadataAttrs["format_id"]?.value ?? metadataAttrs["format_id"] ?? 1.0,
-    );
-    checkFormatId(formatId, labelsPath);
+    const formatId = checkSlpFormat(metadataAttrs, labelsPath);
     // Throws the same helpful error if the `metadata` group exists but its
     // required `json` attribute is missing/empty (truncated/corrupt file);
     // mirrors Python sleap-io PR #446.
@@ -208,17 +224,11 @@ export async function readSlp(
     // `.value` when unavailable). Fetched once; null on browsers without the
     // raw surface, which is fine — normalizeStructDataset then uses `.value`.
     const emscripten = await getH5EmscriptenModule();
-    const framesData = normalizeStructDataset(file.get("frames"), emscripten);
-    const instancesData = normalizeStructDataset(
-      file.get("instances"),
-      emscripten,
-    );
-    const pointsData = normalizeStructDataset(file.get("points"), emscripten);
-    const predPointsData = normalizeStructDataset(
-      file.get("pred_points"),
-      emscripten,
-    );
+    const pose = readPoseTables(file, labelsPath, videos.length, emscripten);
+    const { framesData, instancesData, pointsData, predPointsData } = pose;
 
+    // One entry per /instances row, so links to instances index it by row.
+    const allInstances: Array<Instance | PredictedInstance> = [];
     const labeledFrames = buildLabeledFrames({
       framesData,
       instancesData,
@@ -228,50 +238,54 @@ export async function readSlp(
       tracks,
       videos,
       formatId,
+      instancesByRow: allInstances,
     });
 
     // Read negative frames (video ids resolved like /frames', see helper)
-    const negativeFramesDs = file.get("negative_frames");
-    if (negativeFramesDs) {
-      markNegativeFrames(
-        labeledFrames,
-        negativeFrameKeys(normalizeStructDataset(negativeFramesDs)),
-        framesData,
-        videos,
-      );
-    }
+    markNegativeFrames(
+      labeledFrames,
+      readNegativeFrames(file, pose),
+      framesData,
+      videos,
+    );
 
     report(5); // Reading identities
     const identities = readIdentityCatalog(file);
     report(6); // Reading sessions
+    const nFrameRows = (framesData.frame_id ?? []).length;
     const sessions = readSessions(
       file.get("sessions_json"),
       videos,
       skeletons,
       identities,
       options?.rawSessions ?? false,
-      readSessionDataEager(file, emscripten),
+      readSessionDataEager(file, labelsPath, nFrameRows, emscripten),
     );
     report(7); // Reading annotations
-    const allInstances = labeledFrames.flatMap((f) => f.instances);
+    const tableContext: TableContext = {
+      labelsPath,
+      nInstances: (instancesData.instance_type ?? []).length,
+    };
     const { rois: roiTuples, bboxes: bboxTuples } = readRoisAndBboxes(
       file,
       videos,
       tracks,
+      tableContext,
       allInstances,
     );
-    const maskTuples = readMasks(file, videos, tracks);
+    const maskTuples = readMasks(file, videos, tracks, tableContext);
     const centroidTuples = readCentroids(file, videos, tracks);
     const labelImageTuples = readLabelImages(
       file,
       videos,
       tracks,
+      tableContext,
       allInstances,
     );
 
     // Per-detection re-ID identity (SLP 2.5) + category (SLP 2.7): attach onto each
     // modality's ordered detection list (index == owner_id). No-op on older files.
-    const pdMaps = readPerDetectionMaps(file, emscripten);
+    const pdMaps = readPerDetectionMaps(file, labelsPath, emscripten);
     attachOwnerType(pdMaps, 0, allInstances, identities);
     attachOwnerType(
       pdMaps,
@@ -348,7 +362,6 @@ export async function readSlp(
     // Mirrors Labels.materialize() for eager mode so bboxes/centroids/masks/
     // labelImages get their .instance set on read (ROIs are already resolved
     // in readRoisWithMigration since it receives `instances`).
-    const allInstancesFlat = labeledFrames.flatMap((lf) => lf.instances);
     const resolveInstanceRef = (ann: {
       _instanceIdx: number | null;
       instance: Instance | null;
@@ -356,9 +369,9 @@ export async function readSlp(
       if (
         ann._instanceIdx !== null &&
         ann._instanceIdx >= 0 &&
-        ann._instanceIdx < allInstancesFlat.length
+        allInstances[ann._instanceIdx]
       ) {
-        ann.instance = allInstancesFlat[ann._instanceIdx];
+        ann.instance = allInstances[ann._instanceIdx];
         ann._instanceIdx = null;
       }
     };
@@ -371,8 +384,8 @@ export async function readSlp(
         if (li._objectInstanceIdxs) {
           for (const [labelId, instIdx] of li._objectInstanceIdxs) {
             const obj = li.objects.get(labelId);
-            if (obj && instIdx >= 0 && instIdx < allInstancesFlat.length) {
-              obj.instance = allInstancesFlat[instIdx];
+            if (obj && instIdx >= 0 && allInstances[instIdx]) {
+              obj.instance = allInstances[instIdx];
             }
           }
           li._objectInstanceIdxs = null;
@@ -389,7 +402,7 @@ export async function readSlp(
       suggestions,
       sessions,
       identities,
-      provenance: (metadataJson?.provenance as Record<string, unknown>) ?? {},
+      provenance: readProvenance(file, metadataJson),
       rois: staticRois,
     });
     // Sessions are read before the frame store exists; wire the lazy frame
@@ -473,10 +486,7 @@ export async function readSlpLazy(
 
     const metadataAttrs =
       (metadataGroup as unknown as { attrs?: Record<string, any> }).attrs ?? {};
-    const formatId = Number(
-      metadataAttrs["format_id"]?.value ?? metadataAttrs["format_id"] ?? 1.0,
-    );
-    checkFormatId(formatId, labelsPath);
+    const formatId = checkSlpFormat(metadataAttrs, labelsPath);
     // Throws the same helpful error if the `metadata` group exists but its
     // required `json` attribute is missing/empty (truncated/corrupt file);
     // mirrors Python sleap-io PR #446.
@@ -513,22 +523,11 @@ export async function readSlpLazy(
     // Read raw data but don't build frames yet. Use the fast columnar compound
     // read (falls back to `.value`); see normalizeStructDataset / h5-compound.ts.
     const emscripten = await getH5EmscriptenModule();
-    const framesData = normalizeStructDataset(file.get("frames"), emscripten);
-    const instancesData = normalizeStructDataset(
-      file.get("instances"),
-      emscripten,
-    );
-    const pointsData = normalizeStructDataset(file.get("points"), emscripten);
-    const predPointsData = normalizeStructDataset(
-      file.get("pred_points"),
-      emscripten,
-    );
+    const pose = readPoseTables(file, labelsPath, videos.length, emscripten);
+    const { framesData, instancesData, pointsData, predPointsData } = pose;
 
     // Read negative frames (raw video ids; the store resolves them per frame)
-    const negativeFramesDs = file.get("negative_frames");
-    const negativeFrames = negativeFramesDs
-      ? negativeFrameKeys(normalizeStructDataset(negativeFramesDs))
-      : new Set<string>();
+    const negativeFrames = readNegativeFrames(file, pose);
 
     const store = new LazyDataStore({
       framesData,
@@ -555,23 +554,38 @@ export async function readSlpLazy(
       skeletons,
       identities,
       options?.rawSessions ?? false,
-      readSessionDataEager(file, emscripten),
+      readSessionDataEager(
+        file,
+        labelsPath,
+        (framesData.frame_id ?? []).length,
+        emscripten,
+      ),
     );
     report(7); // Reading annotations
+    const tableContext: TableContext = {
+      labelsPath,
+      nInstances: (instancesData.instance_type ?? []).length,
+    };
     const { rois: roiTuples, bboxes: bboxTuples } = readRoisAndBboxes(
       file,
       videos,
       tracks,
+      tableContext,
     );
-    const maskTuples = readMasks(file, videos, tracks);
+    const maskTuples = readMasks(file, videos, tracks, tableContext);
     const centroidTuples = readCentroids(file, videos, tracks);
-    const labelImageTuples = readLabelImages(file, videos, tracks);
+    const labelImageTuples = readLabelImages(
+      file,
+      videos,
+      tracks,
+      tableContext,
+    );
 
     // Per-detection identity (SLP 2.5) + category (SLP 2.7). Instances materialize
     // lazily, so the OWNER_INSTANCE maps + catalogs are handed to the store and
     // attached in materializeFrame; the other modalities are concrete and attached
     // now.
-    const pdMaps = readPerDetectionMaps(file, emscripten);
+    const pdMaps = readPerDetectionMaps(file, labelsPath, emscripten);
     store.identities = identities;
     store._instanceIdentityLinks = pdMaps.idLinks.get(0);
     store._instanceEmbeddings = pdMaps.idEmbs.get(0);
@@ -644,8 +658,12 @@ export async function readSlpLazy(
     const frameKeys = new Set<string>();
     const frameVideoIds = framesData.video ?? [];
     const frameFrameIdxs = framesData.frame_idx ?? [];
+    // Annotations are keyed by video index, which a sparse `video` id is not.
+    const videoIdToIndex = buildVideoIdMap(framesData, videos);
     for (let i = 0; i < (framesData.frame_id ?? []).length; i++) {
-      frameKeys.add(`${Number(frameVideoIds[i])}:${Number(frameFrameIdxs[i])}`);
+      const rawVideoId = Number(frameVideoIds[i]);
+      const videoIndex = videoIdToIndex.get(rawVideoId) ?? rawVideoId;
+      frameKeys.add(`${videoIndex}:${Number(frameFrameIdxs[i])}`);
     }
 
     const allAnnKeys = new Set<string>();
@@ -688,7 +706,7 @@ export async function readSlpLazy(
       suggestions,
       sessions,
       identities,
-      provenance: (metadataJson?.provenance as Record<string, unknown>) ?? {},
+      provenance: readProvenance(file, metadataJson),
     });
 
     // Replace the eager labeledFrames with lazy proxy
@@ -707,6 +725,92 @@ export async function readSlpLazy(
 }
 
 // parseJsonAttr and parseSkeletons are imported from parsers.ts
+
+/** What the annotation tables need to know about the rest of the file. */
+interface TableContext {
+  labelsPath: string;
+  /** Number of rows in `/instances`. */
+  nInstances: number;
+}
+
+/** A table's group of columns (SLP 3.0), or `null` if it isn't stored as one. */
+function findTableGroup(file: any, table: string): any {
+  let path = "";
+  let node: any = file;
+  for (const part of table.split("/")) {
+    path = path ? `${path}/${part}` : part;
+    if (!isH5Group(node) || !node.keys().includes(part)) return null;
+    node = file.get(path);
+  }
+  return isH5Group(node) ? node : null;
+}
+
+/**
+ * Read one table, whichever layout it is in: as columns the rest of this file can
+ * index (`columnar` says it was a group of them), or `null` if the file doesn't have
+ * it. Mirrors Python's `_read_table`.
+ */
+function readTable(
+  file: any,
+  table: ColumnarTableName,
+  labelsPath: string,
+  module?: unknown,
+): { rows: Record<string, any[]>; columnar: boolean } | null {
+  const group = findTableGroup(file, table);
+  if (group) {
+    const raw = readH5GroupColumns(group, table, tableMembers(table));
+    return {
+      rows: normalizeColumnarTable(labelsPath, table, raw) as Record<
+        string,
+        any[]
+      >,
+      columnar: true,
+    };
+  }
+  const dataset = file.get(legacyTablePath(table));
+  return dataset
+    ? { rows: normalizeStructDataset(dataset, module), columnar: false }
+    : null;
+}
+
+/** Read and normalize `/frames`, `/instances`, `/points` and `/pred_points`. */
+function readPoseTables(
+  file: any,
+  labelsPath: string,
+  nVideos: number,
+  module: unknown,
+): PoseTables {
+  const raw = (path: string): RawTable => {
+    const node = file.get(path);
+    return isH5Group(node)
+      ? { ...readH5GroupColumns(node, path), columnar: true }
+      : { columns: normalizeStructDataset(node, module), columnar: false };
+  };
+  return normalizePoseTables(labelsPath, nVideos, {
+    frames: raw("frames"),
+    instances: raw("instances"),
+    points: raw("points"),
+    predPoints: raw("pred_points"),
+  });
+}
+
+/** The raw negative frame keys: from a 3.0 `/frames`, else `/negative_frames`. */
+function readNegativeFrames(file: any, pose: PoseTables): Set<string> {
+  if (pose.negativeFrames) return pose.negativeFrames;
+  const dataset = file.get("negative_frames");
+  return dataset
+    ? negativeFrameKeys(normalizeStructDataset(dataset))
+    : new Set<string>();
+}
+
+/** The file's provenance: its own dataset if it has one, else the metadata's. */
+function readProvenance(
+  file: any,
+  metadataJson: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const dataset = file.get("provenance_json");
+  return parseProvenance(dataset ? dataset.value : undefined, metadataJson);
+}
 
 function readTracks(dataset: any): Track[] {
   if (!dataset) return [];
@@ -1279,15 +1383,26 @@ interface IdentityBearingRead {
  */
 function readLinksTable(
   file: any,
-  path: string,
+  table: "identity/links" | "categories/links",
   idxField: string,
   scoreField: string,
+  labelsPath: string,
   emscripten?: unknown,
 ): Map<number, Map<number, [number, number | null]>> {
   const result = new Map<number, Map<number, [number, number | null]>>();
-  const ds = file.get(path);
-  if (!ds) return result;
-  const cols = normalizeStructDataset(ds, emscripten);
+  const read = readTable(file, table, labelsPath, emscripten);
+  if (!read) return result;
+  const cols = read.rows;
+  const catalog = file.get(`${table.split("/")[0]}/name`);
+  if (
+    read.columnar &&
+    catalog &&
+    indexOutOfRange(cols[idxField] ?? [], catalog.shape[0], false)
+  ) {
+    reportTableProblems(labelsPath, [
+      `/${table} ${idxField} is not one of the ${catalog.shape[0]} catalog entries`,
+    ]);
+  }
   const ot = cols.owner_type ?? [];
   const oid = cols.owner_id ?? [];
   const idx = cols[idxField] ?? [];
@@ -1306,21 +1421,31 @@ function readLinksTable(
   return result;
 }
 
-const readIdentityLinks = (file: any, emscripten?: unknown) =>
+const readIdentityLinks = (
+  file: any,
+  labelsPath: string,
+  emscripten?: unknown,
+) =>
   readLinksTable(
     file,
     "identity/links",
     "identity_idx",
     "identity_score",
+    labelsPath,
     emscripten,
   );
 
-const readCategoryLinks = (file: any, emscripten?: unknown) =>
+const readCategoryLinks = (
+  file: any,
+  labelsPath: string,
+  emscripten?: unknown,
+) =>
   readLinksTable(
     file,
     "categories/links",
     "category_idx",
     "category_score",
+    labelsPath,
     emscripten,
   );
 
@@ -1448,12 +1573,13 @@ interface PerDetectionMaps {
 
 function readPerDetectionMaps(
   file: any,
+  labelsPath: string,
   emscripten?: unknown,
 ): PerDetectionMaps {
   return {
-    idLinks: readIdentityLinks(file, emscripten),
+    idLinks: readIdentityLinks(file, labelsPath, emscripten),
     idEmbs: readEmbeddings(file),
-    catLinks: readCategoryLinks(file, emscripten),
+    catLinks: readCategoryLinks(file, labelsPath, emscripten),
     catEmbs: readCategoryEmbeddings(file),
     categoryCatalog: readCategoryCatalog(file),
   };
@@ -1484,19 +1610,25 @@ function attachOwnerType(
  * Read the columnar `/session_data` group (SLP 2.8) into an in-memory
  * {@link SessionData} for the eager (h5wasm) reader, or `null` when the group is
  * absent (legacy ≤2.7 files) or missing a required struct table. Struct tables go
- * through `normalizeStructDataset` (so both a JS-written flat-2D+`field_names` matrix
- * and a Python-written compound resolve to column records); the `points_3d` /
- * `pred_points_3d` float matrices are read raw (flat buffer + column count).
+ * through {@link readTable} (so a 3.0 group of columns, a JS-written
+ * flat-2D+`field_names` matrix and a Python-written compound all resolve to column
+ * records); the `points_3d` / `pred_points_3d` float matrices are read raw (flat buffer
+ * + column count).
  */
 function readSessionDataEager(
   file: any,
+  labelsPath: string,
+  nFrames: number,
   emscripten?: unknown,
 ): SessionData | null {
   if (!file.get("session_data")) return null;
-  const struct = (name: string): Record<string, any[]> | null => {
-    const ds = file.get(`session_data/${name}`);
-    return ds ? normalizeStructDataset(ds, emscripten) : null;
-  };
+  const struct = (name: string) =>
+    readTable(
+      file,
+      `session_data/${name}` as ColumnarTableName,
+      labelsPath,
+      emscripten,
+    );
   const frameGroups = struct("frame_groups");
   const instanceGroups = struct("instance_groups");
   const members = struct("instance_group_members");
@@ -1522,15 +1654,25 @@ function readSessionDataEager(
     return v != null ? Array.from(v as ArrayLike<unknown>) : null;
   };
 
-  return {
-    frameGroups,
-    instanceGroups,
-    members,
+  const sessionData: SessionData = {
+    frameGroups: frameGroups.rows,
+    instanceGroups: instanceGroups.rows,
+    members: members.rows,
     points3d: matrix("points_3d", 3),
     predPoints3d: matrix("pred_points_3d", 4),
     frameGroupMeta: meta("frame_group_meta"),
     instanceGroupMeta: meta("instance_group_meta"),
   };
+  if (frameGroups.columnar && instanceGroups.columnar && members.columnar) {
+    reportTableProblems(
+      labelsPath,
+      sessionProblems(sessionData, {
+        nIdentities: file.get("identity/name")?.shape?.[0] ?? 0,
+        nFrames,
+      }),
+    );
+  }
+  return sessionData;
 }
 
 function readSessions(
@@ -1801,15 +1943,17 @@ function readRoisAndBboxes(
   file: any,
   videos: Video[],
   tracks: Track[],
+  context: TableContext,
   instances?: Array<Instance | PredictedInstance>,
 ): { rois: [ROI, number, number][]; bboxes: [BoundingBox, number, number][] } {
   const { rois, migratedBboxes } = readRoisWithMigration(
     file,
     videos,
     tracks,
+    context,
     instances,
   );
-  let bboxes = readBboxes(file, videos, tracks);
+  let bboxes = readBboxes(file, videos, tracks, context.labelsPath);
   if (bboxes.length === 0 && migratedBboxes.length > 0) {
     bboxes = migratedBboxes;
   }
@@ -1820,33 +1964,50 @@ function readRoisWithMigration(
   file: any,
   videos: Video[],
   tracks: Track[],
+  context: TableContext,
   instances?: Array<Instance | PredictedInstance>,
 ): {
   rois: [ROI, number, number][];
   migratedBboxes: [BoundingBox, number, number][];
 } {
-  const roisDs = file.get("rois");
-  if (!roisDs) return { rois: [], migratedBboxes: [] };
-  const roisData = normalizeStructDataset(roisDs);
+  const table = readTable(file, "rois", context.labelsPath);
+  if (!table) return { rois: [], migratedBboxes: [] };
+  const roisData = table.rows;
   const annotationTypes = roisData.annotation_type ?? [];
   if (!annotationTypes.length) return { rois: [], migratedBboxes: [] };
 
-  const wkbDs = file.get("roi_wkb");
-  if (!wkbDs) return { rois: [], migratedBboxes: [] };
+  const wkbDs = file.get(tableBufferPath("rois", table.columnar) as string);
+  // A 2.x table without its geometry buffer has never been readable.
+  if (!wkbDs && !table.columnar) return { rois: [], migratedBboxes: [] };
   const wkbFlat: Uint8Array =
-    wkbDs.value instanceof Uint8Array
+    wkbDs?.value instanceof Uint8Array
       ? wkbDs.value
-      : new Uint8Array(wkbDs.value ?? []);
+      : new Uint8Array(wkbDs?.value ?? []);
 
-  // v1.9+: string datasets; fallback to JSON attrs
-  const categories = readStringMetadata(
-    file,
-    "roi_categories",
-    roisDs,
-    "categories",
-  );
-  const names = readStringMetadata(file, "roi_names", roisDs, "names");
-  const sources = readStringMetadata(file, "roi_sources", roisDs, "sources");
+  if (table.columnar) {
+    reportTableProblems(context.labelsPath, [
+      ...annotationProblems("rois", roisData, {
+        nVideos: videos.length,
+        nTracks: tracks.length,
+        nInstances: context.nInstances,
+      }),
+      ...(spanOutOfRange(roisData.wkb_start, roisData.wkb_end, wkbFlat.length)
+        ? [`/rois wkb ranges fall outside the buffer (${wkbFlat.length})`]
+        : []),
+    ]);
+  }
+
+  // v3.0: columns of the table; v1.9+: string datasets; fallback to JSON attrs
+  const roisDs = table.columnar ? null : file.get("rois");
+  const categories = table.columnar
+    ? roisData.category
+    : readStringMetadata(file, "roi_categories", roisDs, "categories");
+  const names = table.columnar
+    ? roisData.name
+    : readStringMetadata(file, "roi_names", roisDs, "names");
+  const sources = table.columnar
+    ? roisData.source
+    : readStringMetadata(file, "roi_sources", roisDs, "sources");
 
   const videoIndices = roisData.video ?? [];
   const frameIndices = roisData.frame_idx ?? [];
@@ -1924,7 +2085,7 @@ function readRoisWithMigration(
       // Format >= 1.6: resolve instance references for migrated bboxes
       if (instanceIndices.length > 0) {
         const instIdx = Number(instanceIndices[i]);
-        if (instances && instIdx >= 0 && instIdx < instances.length) {
+        if (instances && instIdx >= 0 && instances[instIdx]) {
           bbox.instance = instances[instIdx];
         } else if (instIdx >= 0) {
           bbox._instanceIdx = instIdx;
@@ -1957,7 +2118,7 @@ function readRoisWithMigration(
       // Format >= 1.6: resolve instance references
       if (instanceIndices.length > 0) {
         const instIdx = Number(instanceIndices[i]);
-        if (instances && instIdx >= 0 && instIdx < instances.length) {
+        if (instances && instIdx >= 0 && instances[instIdx]) {
           roi.instance = instances[instIdx];
         } else if (instIdx >= 0) {
           roi._instanceIdx = instIdx;
@@ -1975,10 +2136,20 @@ function readBboxes(
   file: any,
   _videos: Video[],
   tracks: Track[],
+  labelsPath: string,
 ): [BoundingBox, number, number][] {
   const bboxesDs = file.get("bboxes");
   if (!bboxesDs) return [];
-  const bboxesData = normalizeStructDataset(bboxesDs);
+  // Python has written /bboxes as a group of columns since format 2.0; sleap-io.js
+  // writes a flat matrix with sibling string datasets.
+  const columnar = isH5Group(bboxesDs);
+  const bboxesData = columnar
+    ? (normalizeColumnarTable(
+        labelsPath,
+        "bboxes",
+        readH5GroupColumns(bboxesDs, "bboxes"),
+      ) as Record<string, any[]>)
+    : normalizeStructDataset(bboxesDs);
 
   // Legacy format: center-based columns (x_center, y_center, width, height)
   const xCenters = bboxesData.x_center ?? [];
@@ -1989,15 +2160,17 @@ function readBboxes(
   const count = isLegacy ? xCenters.length : x1s.length;
   if (!count) return [];
 
-  // v1.9+: string datasets at root level; fallback to JSON attrs on dataset
-  const categories = readStringMetadata(
-    file,
-    "bbox_categories",
-    bboxesDs,
-    "categories",
-  );
-  const names = readStringMetadata(file, "bbox_names", bboxesDs, "names");
-  const sources = readStringMetadata(file, "bbox_sources", bboxesDs, "sources");
+  // v2.0+ groups: columns; v1.9+: string datasets at root level; fallback to JSON
+  // attrs on dataset
+  const categories = columnar
+    ? bboxesData.category
+    : readStringMetadata(file, "bbox_categories", bboxesDs, "categories");
+  const names = columnar
+    ? bboxesData.name
+    : readStringMetadata(file, "bbox_names", bboxesDs, "names");
+  const sources = columnar
+    ? bboxesData.source
+    : readStringMetadata(file, "bbox_sources", bboxesDs, "sources");
 
   const yCenters = bboxesData.y_center ?? [];
   const widths = bboxesData.width ?? [];
@@ -2012,6 +2185,7 @@ function readBboxes(
   const bboxScores = bboxesData.score ?? [];
   const instanceIndices = bboxesData.instance ?? [];
   const trackingScores = bboxesData.tracking_score ?? [];
+  const isPredictedCol = bboxesData.is_predicted ?? [];
 
   const bboxes: [BoundingBox, number, number][] = [];
   for (let i = 0; i < count; i++) {
@@ -2061,11 +2235,15 @@ function readBboxes(
       source: sources[i] ?? "",
     };
 
+    const isPred =
+      isPredictedCol.length > i
+        ? Number(isPredictedCol[i]) === 1
+        : !Number.isNaN(scoreVal);
     let bbox: BoundingBox;
-    if (Number.isNaN(scoreVal)) {
-      bbox = new UserBoundingBox(options);
-    } else {
+    if (isPred) {
       bbox = new PredictedBoundingBox({ ...options, score: scoreVal });
+    } else {
+      bbox = new UserBoundingBox(options);
     }
 
     if (instanceIdx >= 0) {
@@ -2107,18 +2285,20 @@ function readStringMetadata(
  */
 function readScoreMaps(
   file: any,
-  indexPath: string,
-  dataPath: string,
+  table: "masks/score_maps" | "label_images/score_maps",
+  nOwners: number,
+  labelsPath: string,
 ): Map<number, { scoreMap: Float32Array; height: number; width: number }> {
   const result = new Map<
     number,
     { scoreMap: Float32Array; height: number; width: number }
   >();
-  const indexDs = file.get(indexPath);
-  const dataDs = file.get(dataPath);
-  if (!indexDs || !dataDs) return result;
+  const index = readTable(file, table, labelsPath);
+  if (!index) return result;
+  const dataDs = file.get(tableBufferPath(table, index.columnar) as string);
+  if (!dataDs && !index.columnar) return result;
 
-  const indexData = normalizeStructDataset(indexDs);
+  const indexData = index.rows;
   const idxCol = indexData.mask_idx ?? indexData.li_idx ?? [];
   const starts = indexData.data_start ?? [];
   const ends = indexData.data_end ?? [];
@@ -2126,9 +2306,21 @@ function readScoreMaps(
   const smWidths = indexData.width ?? [];
 
   const dataFlat: Uint8Array =
-    dataDs.value instanceof Uint8Array
+    dataDs?.value instanceof Uint8Array
       ? dataDs.value
-      : new Uint8Array(dataDs.value ?? []);
+      : new Uint8Array(dataDs?.value ?? []);
+
+  if (index.columnar) {
+    const owner = table.split("/")[0];
+    reportTableProblems(labelsPath, [
+      ...(indexOutOfRange(idxCol, nOwners, false)
+        ? [`/${table} index is not one of the ${nOwners} /${owner}`]
+        : []),
+      ...(spanOutOfRange(starts, ends, dataFlat.length)
+        ? [`/${table} ranges fall outside the buffer (${dataFlat.length})`]
+        : []),
+    ]);
+  }
 
   for (let i = 0; i < idxCol.length; i++) {
     const annotIdx = Number(idxCol[i]);
@@ -2159,31 +2351,52 @@ function readScoreMaps(
 
 function readMasks(
   file: any,
-  _videos: Video[],
+  videos: Video[],
   tracks: Track[],
+  context: TableContext,
 ): [SegmentationMask, number, number][] {
-  const masksDs = file.get("masks");
-  if (!masksDs) return [];
-  const masksData = normalizeStructDataset(masksDs);
+  const table = readTable(file, "masks", context.labelsPath);
+  if (!table) return [];
+  const masksData = table.rows;
   const heights = masksData.height ?? [];
   if (!heights.length) return [];
 
-  const rleDs = file.get("mask_rle");
-  if (!rleDs) return [];
+  const rleDs = file.get(tableBufferPath("masks", table.columnar) as string);
+  // A 2.x table without its RLE buffer has never been readable.
+  if (!rleDs && !table.columnar) return [];
   const rleFlat: Uint8Array =
-    rleDs.value instanceof Uint8Array
+    rleDs?.value instanceof Uint8Array
       ? rleDs.value
-      : new Uint8Array(rleDs.value ?? []);
+      : new Uint8Array(rleDs?.value ?? []);
 
-  // v1.9+: string datasets at root level; fallback to JSON attrs on mask dataset
-  const categories = readStringMetadata(
-    file,
-    "mask_categories",
-    masksDs,
-    "categories",
-  );
-  const names = readStringMetadata(file, "mask_names", masksDs, "names");
-  const sources = readStringMetadata(file, "mask_sources", masksDs, "sources");
+  if (table.columnar) {
+    reportTableProblems(context.labelsPath, [
+      ...annotationProblems("masks", masksData, {
+        nVideos: videos.length,
+        nTracks: tracks.length,
+        nInstances: context.nInstances,
+      }),
+      ...(indexOutOfRange(masksData.from_predicted, heights.length)
+        ? ["/masks from_predicted is not a mask row"]
+        : []),
+      ...(spanOutOfRange(masksData.rle_start, masksData.rle_end, rleFlat.length)
+        ? [`/masks rle ranges fall outside the buffer (${rleFlat.length})`]
+        : []),
+    ]);
+  }
+
+  // v3.0: columns of the table; v1.9+: string datasets at root level; fallback to
+  // JSON attrs on mask dataset
+  const masksDs = table.columnar ? null : file.get("masks");
+  const categories = table.columnar
+    ? masksData.category
+    : readStringMetadata(file, "mask_categories", masksDs, "categories");
+  const names = table.columnar
+    ? masksData.name
+    : readStringMetadata(file, "mask_names", masksDs, "names");
+  const sources = table.columnar
+    ? masksData.source
+    : readStringMetadata(file, "mask_sources", masksDs, "sources");
 
   const widths = masksData.width ?? [];
   const videoIndices = masksData.video ?? [];
@@ -2209,8 +2422,9 @@ function readMasks(
   // Read score maps if present
   const scoreMaps = readScoreMaps(
     file,
-    "mask_score_map_index",
-    "mask_score_maps",
+    "masks/score_maps",
+    heights.length,
+    context.labelsPath,
   );
 
   const masks: [SegmentationMask, number, number][] = [];
@@ -2317,13 +2531,15 @@ function readMasks(
 // Dataset closure invalidated by Labels.__del__) does not apply here.
 function readLabelImages(
   file: any,
-  _videos: Video[],
+  videos: Video[],
   tracks: Track[],
+  context: TableContext,
   instances?: Array<Instance | PredictedInstance>,
 ): [LabelImage, number, number][] {
-  const liDs = file.get("label_images");
-  if (!liDs) return [];
-  const liData = normalizeStructDataset(liDs);
+  const { labelsPath } = context;
+  const table = readTable(file, "label_images", labelsPath);
+  if (!table) return [];
+  const liData = table.rows;
   const videoIndices = liData.video ?? [];
   if (!videoIndices.length) return [];
 
@@ -2335,13 +2551,15 @@ function readLabelImages(
   const dataStarts = liData.data_start ?? [];
   const dataEnds = liData.data_end ?? [];
 
-  // v1.9+: string datasets; fallback to JSON attrs
-  const sources = readStringMetadata(
-    file,
-    "label_image_sources",
-    liDs,
-    "sources",
-  );
+  // v3.0: a column of the table; v1.9+: string datasets; fallback to JSON attrs
+  const sources = table.columnar
+    ? liData.source
+    : readStringMetadata(
+        file,
+        "label_image_sources",
+        file.get("label_images"),
+        "sources",
+      );
 
   // v1.9+ columns (may not exist in older files)
   const isPredictedCol = liData.is_predicted ?? [];
@@ -2354,8 +2572,16 @@ function readLabelImages(
   const liOffsetYCol = liData.offset_y ?? [];
 
   // Read pixel data: either blob (1D, v1.8-v2.1) or chunked (3D, v2.2+)
-  const dataDs = file.get("label_image_data");
-  if (!dataDs) return [];
+  const dataDs = file.get(
+    tableBufferPath("label_images", table.columnar) as string,
+  );
+  if (!dataDs) {
+    // A 2.x table without pixel data has never been readable.
+    if (table.columnar) {
+      reportTableProblems(labelsPath, ["/label_images has no pixel data"]);
+    }
+    return [];
+  }
   const dataShape = dataDs.shape ?? [];
   const isChunked = dataShape.length === 3;
   // For blob format: flat Uint8Array of concatenated zlib-compressed frames
@@ -2380,34 +2606,73 @@ function readLabelImages(
   let objScoreCol: any[] = [];
   let objTrackingScoreCol: any[] = [];
 
-  const objDs = file.get("label_image_objects");
-  if (objDs) {
-    const objData = normalizeStructDataset(objDs);
+  const objTable = readTable(file, "label_images/objects", labelsPath);
+  if (objTable) {
+    const objData = objTable.rows;
     objLabelIds = objData.label_id ?? [];
     objTrackIndices = objData.track ?? [];
     objInstanceIndices = objData.instance ?? [];
-    // v1.9+: string datasets at root level
-    objCategories = readStringMetadata(
-      file,
-      "label_image_obj_categories",
-      objDs,
-      "categories",
-    );
-    objNames = readStringMetadata(
-      file,
-      "label_image_obj_names",
-      objDs,
-      "names",
-    );
+    // v3.0: columns of the table; v1.9+: string datasets at root level
+    const objDs = objTable.columnar ? null : file.get("label_image_objects");
+    objCategories = objTable.columnar
+      ? (objData.category as unknown as string[])
+      : readStringMetadata(
+          file,
+          "label_image_obj_categories",
+          objDs,
+          "categories",
+        );
+    objNames = objTable.columnar
+      ? (objData.name as unknown as string[])
+      : readStringMetadata(file, "label_image_obj_names", objDs, "names");
     objScoreCol = objData.score ?? [];
     objTrackingScoreCol = objData.tracking_score ?? [];
+  }
+
+  if (table.columnar) {
+    const nObjects = objLabelIds.length;
+    const problems: string[] = [
+      ...(indexOutOfRange(videoIndices, videos.length)
+        ? [`/label_images video is not one of the ${videos.length} videos`]
+        : []),
+      ...(objTable
+        ? annotationProblems("label_images/objects", objTable.rows, {
+            nVideos: videos.length,
+            nTracks: tracks.length,
+            nInstances: context.nInstances,
+          })
+        : []),
+    ];
+    for (let i = 0; i < videoIndices.length; i++) {
+      const start = Number(objectsStarts[i]);
+      const end = start + Number(nObjectsList[i]);
+      if (start < 0 || end < start || end > nObjects) {
+        problems.push(
+          `/label_images object ranges fall outside /label_images/objects (${nObjects} rows)`,
+        );
+        break;
+      }
+    }
+    if (dataShape.length === 3) {
+      if (dataShape[0] < videoIndices.length) {
+        problems.push(
+          `/label_images has ${videoIndices.length} rows but ${dataShape[0]} frames of data`,
+        );
+      }
+    } else if (spanOutOfRange(dataStarts, dataEnds, dataShape[0] ?? 0)) {
+      problems.push(
+        `/label_images data ranges fall outside the buffer (${dataShape[0] ?? 0})`,
+      );
+    }
+    reportTableProblems(labelsPath, problems);
   }
 
   // Read score maps if present
   const liScoreMaps = readScoreMaps(
     file,
-    "label_image_score_map_index",
-    "label_image_score_maps",
+    "label_images/score_maps",
+    videoIndices.length,
+    labelsPath,
   );
 
   const labelImages: [LabelImage, number, number][] = [];
@@ -2471,7 +2736,7 @@ function readLabelImages(
       const instIdx = Number(objInstanceIndices[j]);
       let instance: Instance | null = null;
 
-      if (instances && instIdx >= 0 && instIdx < instances.length) {
+      if (instances && instIdx >= 0 && instances[instIdx]) {
         instance = instances[instIdx] as Instance;
       } else if (instIdx >= 0) {
         deferredInstances.set(labelId, instIdx);
@@ -2546,6 +2811,7 @@ function normalizeStructDataset(
   module?: unknown,
 ): Record<string, any[]> {
   if (!dataset) return {};
+  checkDatasetFilters(dataset, String(dataset.path ?? "").replace(/^\//, ""));
 
   // Fast path: read fixed-size compound tables (frames/instances/points/
   // pred_points) column-wise straight from the record blob, skipping h5wasm's
@@ -2675,6 +2941,8 @@ function buildLabeledFrames(options: {
   tracks: Track[];
   videos: Video[];
   formatId: number;
+  /** Filled with each instance at its `/instances` row (unknown types left out). */
+  instancesByRow?: Array<Instance | PredictedInstance>;
 }): LabeledFrame[] {
   const frames: LabeledFrame[] = [];
   const {
@@ -2686,6 +2954,7 @@ function buildLabeledFrames(options: {
     tracks,
     videos,
     formatId,
+    instancesByRow,
   } = options;
   const frameIds = framesData.frame_id ?? [];
   const videoIdToIndex = buildVideoIdMap(framesData, videos);
@@ -2704,6 +2973,8 @@ function buildLabeledFrames(options: {
     const instances: Array<Instance | PredictedInstance> = [];
     for (let instIdx = instStart; instIdx < instEnd; instIdx += 1) {
       const instanceType = Number(instancesData.instance_type?.[instIdx] ?? 0);
+      // Rows of an unknown type are skipped, as in Python.
+      if (instanceType !== 0 && instanceType !== 1) continue;
       const skeletonId = Number(instancesData.skeleton?.[instIdx] ?? 0);
       const trackId = Number(instancesData.track?.[instIdx] ?? -1);
       const pointStart = Number(instancesData.point_id_start?.[instIdx] ?? 0);
@@ -2759,6 +3030,7 @@ function buildLabeledFrames(options: {
       }
 
       instanceById.set(instIdx, instance);
+      if (instancesByRow) instancesByRow[instIdx] = instance;
       instances.push(instance);
     }
 

@@ -103,64 +103,137 @@ export function parseMetadataJson(attr: unknown, labelsPath: string): unknown {
 }
 
 /**
- * A `/metadata` `format_id` at or above this uses a layout this library can't read.
- *
- * Format 3.0 (the default from Python sleap-io 0.10) stores every table as a group
- * of columns. Read with the 2.x code those tables come back empty, so the file would
- * open as 0 frames with no error, and saving it would write the empty project.
- * Mirrors Python's `SLP_FORMAT_ID_LIMIT`. Raise it once the readers handle 3.0
- * (#237), and honor the `/metadata` `required_features` attribute then as Python does.
+ * A `/metadata` `format_id` at or above this uses a layout this library can't read,
+ * so readers refuse the file up front instead of opening it wrong. Mirrors Python's
+ * `SLP_FORMAT_ID_LIMIT`.
  */
-const SLP_FORMAT_ID_LIMIT = 3.0;
+const SLP_FORMAT_ID_LIMIT = 4.0;
 
 /**
- * Thrown when a `.slp` file is newer than this library can read. Nothing has been
- * read from the file, so callers can catch this to word it for their own users.
+ * Features listed in a file's `/metadata` `required_features` attribute that this
+ * library understands. A file that requires anything else is refused, since reading it
+ * without understanding the feature could silently misread it. Mirrors Python's
+ * `SLP_SUPPORTED_FEATURES`.
+ */
+const SLP_SUPPORTED_FEATURES: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Thrown when a `.slp` file is newer than this library can read: its format is too
+ * new, or it requires a feature this library doesn't understand. Nothing but the
+ * metadata has been read from the file, so callers can catch this to word it for
+ * their own users.
  */
 export class UnsupportedSlpFormatError extends Error {
-  /** The file's `format_id`, e.g. `3`. */
+  /** The file's `format_id`, e.g. `4`. */
   readonly formatId: number;
+  /** The features the file requires that this library doesn't understand. */
+  readonly unsupportedFeatures: string[];
 
   /**
    * @param formatId The file's `format_id`.
    * @param labelsPath Path, URL or name of the file, if known (used in the
    *   message; credentials in a URL are masked).
+   * @param unsupportedFeatures The features that are the reason for refusing, if the
+   *   format itself is not.
    */
-  constructor(formatId: number, labelsPath?: string) {
+  constructor(
+    formatId: number,
+    labelsPath?: string,
+    unsupportedFeatures: string[] = [],
+  ) {
     const name =
       labelsPath && isUrl(labelsPath) ? redactUrl(labelsPath) : labelsPath;
     const version = Number.isInteger(formatId)
       ? formatId.toFixed(1)
       : String(formatId);
+    const why =
+      unsupportedFeatures.length > 0
+        ? `requires SLP features this version of sleap-io.js doesn't support ` +
+          `(${unsupportedFeatures.join(", ")})`
+        : `uses SLP format ${version}, which is newer than this version of ` +
+          `sleap-io.js supports (max ${SLP_FORMAT_ID_LIMIT - 1}.x)`;
     super(
-      `${name || "This file"} uses SLP format ${version}, which is newer than ` +
-        `this version of sleap-io.js supports (max ${SLP_FORMAT_ID_LIMIT - 1}.x). ` +
-        "Upgrade sleap-io.js to read it, or re-save the file from Python " +
-        "sleap-io with `legacy_format=True`.",
+      `${name || "This file"} ${why}. Upgrade sleap-io.js to read it, or re-save ` +
+        "the file from Python sleap-io with `legacy_format=True`.",
     );
     this.name = "UnsupportedSlpFormatError";
     this.formatId = formatId;
+    this.unsupportedFeatures = unsupportedFeatures;
     // Restore the prototype chain so `instanceof` holds even under older
     // transpile targets (matches UnsupportedVideoFormatError).
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
+/** The names in a `required_features` attribute, in any of the forms readers return. */
+function requiredFeatures(attr: unknown): string[] {
+  if (attr === undefined || attr === null) return [];
+  const value = (attr as { value?: unknown }).value ?? attr;
+  const names =
+    Array.isArray(value) ||
+    (ArrayBuffer.isView(value) && !(value instanceof Uint8Array))
+      ? Array.from(value as ArrayLike<unknown>)
+      : [value];
+  return names.map((name) =>
+    name instanceof Uint8Array ? textDecoder.decode(name) : String(name),
+  );
+}
+
 /**
- * Refuse a `.slp` file newer than this library can read. Mirrors Python sleap-io's
- * `_check_format_id`: a file without a `format_id` passes, as before.
+ * Read a file's `format_id` from the attributes of `/metadata`, and refuse the file if
+ * it is newer than this library can read. Mirrors Python sleap-io's `_check_format_id`:
+ * a file without a `format_id` passes, as before.
  *
- * Call this before reading anything else from the file, since a newer layout may
- * not hold what the other checks look for.
+ * Call this before reading anything else from the file, since a newer layout may not
+ * hold what the other checks look for.
  *
- * @param formatId The file's `format_id`.
+ * @param metadataAttrs The attributes of `/metadata`, bare or wrapped in `{ value }`.
  * @param labelsPath Path, URL or name of the file, if known.
+ * @returns The file's `format_id`.
  * @throws {UnsupportedSlpFormatError} If the file is too new.
  */
-export function checkFormatId(formatId: number, labelsPath?: string): void {
+export function checkSlpFormat(
+  metadataAttrs: Record<string, unknown>,
+  labelsPath?: string,
+): number {
+  const formatId = Number(
+    (metadataAttrs.format_id as { value?: unknown })?.value ??
+      metadataAttrs.format_id ??
+      1.0,
+  );
   if (formatId >= SLP_FORMAT_ID_LIMIT) {
     throw new UnsupportedSlpFormatError(formatId, labelsPath);
   }
+  const unsupported = requiredFeatures(metadataAttrs.required_features)
+    .filter((name) => !SLP_SUPPORTED_FEATURES.has(name))
+    .sort();
+  if (unsupported.length > 0) {
+    throw new UnsupportedSlpFormatError(formatId, labelsPath, unsupported);
+  }
+  return formatId;
+}
+
+/**
+ * Parse a file's provenance: the top-level `/provenance_json` dataset when it has
+ * one, because Python drops it from the `json` attribute of `/metadata` once it would
+ * not fit there, else the copy in that attribute. Mirrors Python's `read_provenance`.
+ *
+ * @param datasetValue The value of `/provenance_json`, or `undefined` if absent.
+ * @param metadataJson The parsed `json` attribute of `/metadata`.
+ */
+export function parseProvenance(
+  datasetValue: unknown,
+  metadataJson: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const text = datasetValueToString(datasetValue);
+  if (text !== undefined) {
+    try {
+      return JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      /* fall back to the attribute's copy */
+    }
+  }
+  return (metadataJson?.provenance as Record<string, unknown>) ?? {};
 }
 
 /**

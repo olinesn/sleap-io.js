@@ -12,6 +12,8 @@ import {
   stripCrossOriginHeaders,
   withRetries,
   headOrRangeProbe,
+  maskUrlCredentials,
+  maskUrlCredentialsDeep,
   urlBasename,
 } from "../../src/io/remote.js";
 
@@ -343,6 +345,170 @@ describe("urlBasename", () => {
     expect(urlBasename("a#1.slp")).toBe("a#1.slp");
     expect(urlBasename("C:\\me\\y.slp")).toBe("C:\\me\\y.slp");
     expect(urlBasename("")).toBe("");
+  });
+});
+
+describe("maskUrlCredentials", () => {
+  it.each([
+    ["https://h/y.slp?token=SECRET", "https://h/y.slp?token=***"],
+    ["https://h/y.slp?c=12&token=SECRET", "https://h/y.slp?c=12&token=***"],
+    ["https://h/y.slp?TOKEN=SECRET", "https://h/y.slp?TOKEN=***"],
+    ["https://h/y.slp?%74oken=SECRET", "https://h/y.slp?token=***"],
+    ["https://h/y.slp?token=SEC/RET", "https://h/y.slp?token=***"],
+    ["https://h/y.slp?token=SEC%2FRET", "https://h/y.slp?token=***"],
+    ["https://h/y.slp?token=SEC RET", "https://h/y.slp?token=***"],
+    ["https://h/y.slp?token=SEC'RET", "https://h/y.slp?token=***"],
+    ["https://h/y.slp#token=SECRET", "https://h/y.slp#token=***"],
+    ["https://me:SECRET@h/y.slp", "https://***:***@h/y.slp"],
+    ["https://me:SEC RET@h/y.slp", "https://***:***@h/y.slp"],
+    ["https://me:SECRET@h", "https://***:***@h/"],
+    ["gs://me:SECRET@b/y.slp?sig=SECRET", "gs://***:***@b/y.slp?sig=***"],
+    [
+      "s3://b/y.slp?x-amz-security-token=SECRET",
+      "s3://b/y.slp?x-amz-security-token=***",
+    ],
+    ["az://c/y.slp?sas=SECRET", "az://c/y.slp?sas=***"],
+  ])("a URL as a whole: %s", (url, masked) => {
+    expect(maskUrlCredentials(url)).toBe(masked);
+  });
+
+  it.each([
+    ["https://me:SECRET@h:notaport/y.slp", "https://***:***@h:notaport/y.slp"],
+    ["https://me:SEC/RET@h:notaport/y.slp", "https://***:***@h:notaport/y.slp"],
+    [
+      "https://me:SECRET@h:notaport/y.slp?token=SECRET",
+      "https://***:***@h:notaport/y.slp?token=***",
+    ],
+    ["https://h:notaport/a@b.slp", "https://***:***@b.slp"],
+    [
+      "https://me:SECRET@h:notaport/y.slp?email=a@b",
+      "https://***:***@h:notaport/y.slp?email=a@b",
+    ],
+    [
+      "https://h:notaport/y.slp?email=a@b",
+      "https://h:notaport/y.slp?email=a@b",
+    ],
+  ])("a URL nothing can read still says what it says: %s", (url, masked) => {
+    expect(maskUrlCredentials(url)).toBe(masked);
+  });
+
+  it.each([
+    ["y.slp?token=SECRET", "y.slp?token=***"],
+    ["/some/dir/y.slp?a=1&token=SECRET", "/some/dir/y.slp?a=1&token=***"],
+    ["y.slp&token=SECRET", "y.slp&token=***"],
+    ["y.slp#token=SECRET", "y.slp#token=***"],
+    [
+      "track https://h/v.mp4?token=SECRET --flag",
+      "track https://h/v.mp4?token=*** --flag",
+    ],
+    [
+      "track https://me:SECRET@h/v.mp4 --flag",
+      "track https://***:***@h/v.mp4 --flag",
+    ],
+    [
+      "https://h/a.mp4 https://me:SECRET@h/w.mp4",
+      "https://h/a.mp4 https://***:***@h/w.mp4",
+    ],
+    [
+      "https://p/?url=https://h/y.slp?token=SECRET",
+      "https://p/?url=https://h/y.slp?token=***",
+    ],
+  ])("what's left of a URL, and a URL in a line of text: %s", (text, masked) => {
+    expect(maskUrlCredentials(text)).toBe(masked);
+  });
+
+  it.each([
+    "https://h",
+    "HTTP://H/a b.mp4?x=1 2",
+    "https://h/a%20b.mp4?x=é#frag",
+    "https://h/y.slp?token=***",
+    "https://h/y.slp?token",
+    "https://***:***@h/y.slp",
+    "https://h/a@b.mp4",
+    "gs://b/a b.mp4",
+    "/Users/me/a b#1?%.mp4",
+    "/Users/me/me@host/y.mp4",
+    "C:\\Users\\me\\b.mp4",
+    "tests/data/videos/centered_pair_low_quality.mp4",
+    "file:///Users/me/x.mp4",
+    "mailto:me@h",
+    "日本語.slp",
+    ".",
+    "",
+  ])("nothing to mask comes back as it was: %s", (value) => {
+    expect(maskUrlCredentials(value)).toBe(value);
+  });
+
+  it("masking twice changes nothing more", () => {
+    for (const url of [
+      "https://h/y.slp?a=b c&token=SECRET",
+      "https://me:SECRET@h/y.slp#token=SECRET",
+      "https://me:SECRET@h:notaport/y.slp",
+      "y.slp?token=SECRET",
+    ]) {
+      const once = maskUrlCredentials(url);
+      expect(once).not.toContain("SECRET");
+      expect(maskUrlCredentials(once)).toBe(once);
+    }
+  });
+});
+
+describe("maskUrlCredentialsDeep", () => {
+  const url = "https://h/y.slp?token=SECRET";
+  const masked = "https://h/y.slp?token=***";
+
+  it("every string, at any depth, keys too", () => {
+    expect(
+      maskUrlCredentialsDeep({
+        filename: url,
+        list: [url, { deeper: [url] }],
+        [url]: 1,
+      }),
+    ).toEqual({
+      filename: masked,
+      list: [masked, { deeper: [masked] }],
+      [masked]: 1,
+    });
+    expect(maskUrlCredentialsDeep(url)).toBe(masked);
+    expect(maskUrlCredentialsDeep([url])).toEqual([masked]);
+  });
+
+  it("leaves what it was given alone", () => {
+    const given = { filename: url, list: [url] };
+    maskUrlCredentialsDeep(given);
+    expect(given).toEqual({ filename: url, list: [url] });
+  });
+
+  it("reads a value as JSON.stringify would", () => {
+    class Named {
+      filename = url;
+    }
+    const value = {
+      when: new Date(0),
+      custom: { toJSON: () => ({ filename: url }) },
+      named: new Named(),
+      n: 1,
+      nothing: null,
+      missing: undefined,
+      yes: true,
+      numbers: new Float64Array([1, 2]),
+    };
+    const once = JSON.stringify(maskUrlCredentialsDeep(value));
+    expect(once).toBe(JSON.stringify(value).replaceAll(url, masked));
+    expect(once).not.toContain("SECRET");
+  });
+
+  it("a JSON tree with no URL in it writes the same bytes", () => {
+    const value = {
+      "2": "b",
+      "1": "a",
+      shape: [1, 384, 384, 1],
+      fps: null,
+      __proto__x: { é: "日本語" },
+    };
+    expect(JSON.stringify(maskUrlCredentialsDeep(value))).toBe(
+      JSON.stringify(value),
+    );
   });
 });
 

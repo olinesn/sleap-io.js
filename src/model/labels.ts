@@ -20,6 +20,7 @@ import {
 } from "./camera.js";
 import type { Identity } from "./identity.js";
 import { toDict } from "../codecs/dictionary.js";
+import { maskUrlCredentials } from "../io/remote.js";
 import { labelsFromNumpy } from "../codecs/numpy.js";
 import { type LazyDataStore, LazyFrameList } from "./lazy.js";
 import { LabelsSet } from "./labels-set.js";
@@ -136,12 +137,17 @@ function localIsoStringWithoutZ(): string {
   );
 }
 
-/** Python `repr()` of a filename (string) or filename-list (ImageVideo). */
+/**
+ * Python `repr()` of a filename (string) or filename-list (ImageVideo), for a message:
+ * a URL's credentials are masked.
+ */
 function filenameRepr(filename: string | string[]): string {
   const reprStr = (s: string): string => {
     // Mirror Python str repr: prefer single quotes; escape backslashes and the
     // chosen quote.
-    const escaped = s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const escaped = maskUrlCredentials(s)
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "\\'");
     return `'${escaped}'`;
   };
   if (Array.isArray(filename)) {

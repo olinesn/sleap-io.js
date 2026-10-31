@@ -100,6 +100,12 @@ a.download = "labels.slp";
 a.click();
 ```
 
+A saved file doesn't keep a URL's credentials, because files get passed around. A
+password or a sensitive query param (`SENSITIVE_QUERY_PARAMS`, such as `token` or `sig`)
+in a video's URL, or in the URL the labels came from, is saved masked
+(`?token=***`), so a video that needs it won't open from the saved file until it's given
+its link again. The labels in memory keep the whole URL.
+
 ## Browser Usage
 
 In the browser, `sleap-io.js` automatically uses a **Web Worker** for all HDF5 operations. This keeps the main thread responsive and avoids bundler issues with Node.js dependencies.

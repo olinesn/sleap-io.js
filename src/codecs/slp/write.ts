@@ -2,11 +2,12 @@ import { Labels } from "../../model/labels.js";
 import { type Instance, PredictedInstance } from "../../model/instance.js";
 import type { Track } from "../../model/instance.js";
 import { LabeledFrame } from "../../model/labeled-frame.js";
-import type {
-  RecordingSession,
-  Camera,
-  InstanceGroup,
-  FrameGroup,
+import {
+  type RecordingSession,
+  type Camera,
+  type InstanceGroup,
+  type FrameGroup,
+  FramePositions,
 } from "../../model/camera.js";
 import type { Skeleton } from "../../model/skeleton.js";
 import { SuggestionFrame } from "../../model/suggestions.js";
@@ -186,6 +187,7 @@ function writeSlpToFile(
     labels.videos,
     labels.labeledFrames,
     labels.identities,
+    true,
   );
   writeLabeledFrames(file, labels);
   writeNegativeFrames(file, labels);
@@ -2627,6 +2629,32 @@ function hasPerDetectionCategory(labels: Labels): boolean {
   );
 }
 
+/** See {@link OnDiskSidecars.rowReferences}. */
+function findRowReferences(labels: Labels): string[] {
+  const found: string[] = [];
+  if (sessionsHaveFrameGroups(labels.sessions)) {
+    found.push("multi-camera groups");
+  }
+  if (hasPerDetectionIdentity(labels)) found.push("identities");
+  if (hasPerDetectionCategory(labels)) found.push("categories");
+  const linked = (ann: { instance?: unknown }): boolean => ann.instance != null;
+  if (
+    labels.labeledFrames.some(
+      (frame) =>
+        frame.centroids.some(linked) ||
+        frame.bboxes.some(linked) ||
+        frame.masks.some(linked) ||
+        frame.rois.some(linked) ||
+        frame.labelImages.some((image) =>
+          [...image.objects.values()].some(linked),
+        ),
+    )
+  ) {
+    found.push("annotations linked to instances");
+  }
+  return found;
+}
+
 // ---- SLP 2.8 columnar /session_data field names (snake_case, Python-compatible) --
 // h5wasm cannot create HDF5 compound datasets, so these struct tables are written as
 // flat 2-D float64 matrices + a `field_names` attribute (exactly as points/instances/
@@ -2731,41 +2759,42 @@ function sessionCalibrationDict(
 
 /**
  * Resolve an instance group's members to `(cameraIdx, lfIdx, instIdx)` rows — the
- * columnarized `camcorder_to_lf_and_inst_idx_map`. Mirrors the legacy serializer's
- * hybrid derivation: concrete instances resolved via `labeledFrameIndex` first (so
- * edits/reorders are reflected), falling back to the stored index refs so an
- * untouched lazy group serializes with ZERO frame materialization.
+ * columnarized `camcorder_to_lf_and_inst_idx_map`. With frames in memory every member
+ * is written where it is NOW: an edit may have moved it since the file was read, and
+ * a member that is gone with nothing in its place is left out. Without them (the lazy
+ * and stream-writer paths) the stored index refs are written as they are, with ZERO
+ * frame materialization: true for a lazy save, whose frames are the ones read. A stream
+ * writer's caller answers for its own refs matching the order it appends frames in.
  */
 function instanceGroupMemberRows(
   group: InstanceGroup,
   session: RecordingSession,
   frameGroup: FrameGroup,
-  labeledFrameIndex: Map<LabeledFrame, number>,
+  positions: FramePositions | null,
 ): Array<[number, number, number]> {
   const concreteInst = group._instanceByCamera;
   const instRefs = group._instanceRefsByCamera;
   const lfByCamera =
-    concreteInst && labeledFrameIndex.size > 0
-      ? frameGroup.labeledFrameByCamera
-      : undefined;
+    concreteInst && positions ? frameGroup.labeledFrameByCamera : undefined;
   const cameras = session.cameraGroup.cameras;
   const rows: Array<[number, number, number]> = [];
+  // Resolved refs are the map now: a member removed from it stays removed.
+  const refs = positions && group._refsResolved ? undefined : instRefs;
   const seen = new Set<Camera>([
     ...(concreteInst?.keys() ?? []),
-    ...(instRefs?.keys() ?? []),
+    ...(refs?.keys() ?? []),
   ]);
   for (const camera of seen) {
     const camIdx = cameras.indexOf(camera);
     if (camIdx < 0) continue;
     let pair: [number, number] | undefined;
     const instance = concreteInst?.get(camera);
-    if (instance && lfByCamera) {
-      const lf = lfByCamera.get(camera);
-      const lfIdx = lf !== undefined ? labeledFrameIndex.get(lf) : undefined;
-      const instIdx = lf ? lf.instances.indexOf(instance as Instance) : -1;
-      if (lfIdx !== undefined && instIdx >= 0) pair = [lfIdx, instIdx];
+    const lf = lfByCamera?.get(camera);
+    if (instance && lf && positions) {
+      pair = positions.locate(instance as Instance, lf);
     }
-    if (!pair && instRefs?.has(camera)) pair = instRefs.get(camera);
+    const ref = refs?.get(camera);
+    if (!pair && ref) pair = positions ? positions.locateRef(group, ref) : ref;
     if (pair) rows.push([camIdx, pair[0], pair[1]]);
   }
   return rows;
@@ -2812,7 +2841,8 @@ function createGzipFloatMatrix(
  * session-free / single-view files stay byte-identical and below format 2.8).
  *
  * `labeledFrames` may be empty (the lazy / streaming-header paths): member rows then
- * derive from the stored index refs rather than concrete instances.
+ * derive from the stored index refs rather than concrete instances. `framesInMemory`
+ * tells those apart from a project that has had every frame deleted.
  */
 function writeSessions(
   file: any,
@@ -2820,11 +2850,9 @@ function writeSessions(
   videos: Video[],
   labeledFrames: LabeledFrame[],
   identities?: Identity[],
+  framesInMemory = false,
 ): void {
-  const labeledFrameIndex = new Map<LabeledFrame, number>();
-  labeledFrames.forEach((lf, idx) => {
-    labeledFrameIndex.set(lf, idx);
-  });
+  const positions = framesInMemory ? new FramePositions(labeledFrames) : null;
 
   // Columnar accumulators for /session_data (small: fixed-width ints/floats per frame
   // group / instance group / member, plus the 3-D point rows).
@@ -2846,6 +2874,7 @@ function writeSessions(
     const fgStart = fgRows.length;
     for (const frameGroup of session.frameGroups.values()) {
       if (!frameGroup.instanceGroups.length) continue;
+      positions?.startFrameGroup(frameGroup);
 
       const igStart = igRows.length;
       for (const group of frameGroup.instanceGroups) {
@@ -2854,7 +2883,7 @@ function writeSessions(
           group,
           session,
           frameGroup,
-          labeledFrameIndex,
+          positions,
         )) {
           memberRows.push(m);
         }
@@ -3366,6 +3395,11 @@ export interface OnDiskSidecars {
   tracksJson: string[] | null;
   suggestionsJson: string[] | null;
   metadataJson: string | null;
+  /**
+   * What in `labels` points at a detection by its row or position, stored in a table
+   * the in-place writer does not rewrite. Only {@link buildExpectedSidecars} sets it.
+   */
+  rowReferences?: string[];
   /** Per-video signatures (see {@link buildVideoSignatures}). */
   videos: string[] | null;
 }
@@ -3382,6 +3416,7 @@ export function buildExpectedSidecars(labels: Labels): OnDiskSidecars {
     tracksJson: buildTracksJson(labels.tracks),
     suggestionsJson: buildSuggestionsJson(labels.suggestions, labels.videos),
     metadataJson: buildMetadataJson(labels),
+    rowReferences: findRowReferences(labels),
     videos: buildVideoSignatures(labels.videos),
   };
 }
@@ -3414,7 +3449,13 @@ function sameStringArray(a: string[] | null, b: string[] | null): boolean {
  *    video list. Compared semantically via per-video signatures
  *    ({@link buildVideoSignatures}), not a byte-exact `videos_json` diff; OR
  *  - the `/metadata` json changed (e.g. a skeleton or provenance edit) but
- *    `update.metadataJson` was not set to carry that change into the attr.
+ *    `update.metadataJson` was not set to carry that change into the attr; OR
+ *  - anything points at a detection by its row or position ({@link findRowReferences}):
+ *    multi-camera groups, identities, categories and their embeddings, annotations
+ *    linked to instances. The in-place writer does NOT rewrite those tables, so an edit
+ *    that moved one detection would leave the rest on another animal. Whether one moved
+ *    cannot be told from `labels` alone: an earlier full save may have changed what is
+ *    on disk.
  *
  * A pose/point/visibility/score/track-membership-preserving edit still passes.
  *
@@ -3496,6 +3537,12 @@ export function checkInPlaceWritable(
       ok: false,
       reason:
         "the video set changed (a video was added, removed, or repointed); an in-place save cannot update videos_json or the embedded video groups (the frames table would point into a stale video list) — re-save the whole file instead",
+    };
+  }
+  if (sidecars.expected.rowReferences?.length) {
+    return {
+      ok: false,
+      reason: `the project has ${sidecars.expected.rowReferences.join(", ")}, which point at detections by position; an in-place save cannot update those tables (an edit that moved a detection would leave them on another animal) — re-save the whole file instead`,
     };
   }
   if (

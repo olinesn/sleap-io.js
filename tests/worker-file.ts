@@ -10,7 +10,10 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll } from "./bun-test";
 import { ready, File as H5File } from "h5wasm/node";
 import { readFromStreamingFile } from "../src/codecs/slp/read-streaming.js";
-import { StreamingH5File } from "../src/codecs/slp/h5-streaming.js";
+import {
+  type RangeSink,
+  StreamingH5File,
+} from "../src/codecs/slp/h5-streaming.js";
 import { H5_WORKER_CODE } from "../src/codecs/slp/h5-worker.js";
 import { getH5EmscriptenModule } from "../src/codecs/slp/h5.js";
 import type { Labels } from "../src/index.js";
@@ -108,6 +111,91 @@ export async function readRecording(
     close();
   }
 }
+
+/** A file in memory, as a native write handle would be on disk. */
+export function memorySink(initial: Uint8Array) {
+  let data = initial.slice();
+  let failing = false;
+  let failingWrites = false;
+  let failingTruncates = false;
+  let writes = 0;
+  let truncates = 0;
+  const sink: RangeSink = {
+    writeAt: async (offset, bytes) => {
+      writes += 1;
+      if (failingWrites) throw new Error("the disk is full");
+      if (offset + bytes.length > data.length) {
+        const grown = new Uint8Array(offset + bytes.length);
+        grown.set(data);
+        data = grown;
+      }
+      data.set(bytes, offset);
+    },
+    readAt: async (offset, length) => {
+      if (failing) throw new Error("the drive went away");
+      return data.slice(offset, offset + length);
+    },
+    truncate: async (length) => {
+      truncates += 1;
+      if (failingTruncates) throw new Error("the disk is full");
+      const resized = new Uint8Array(length);
+      resized.set(data.subarray(0, length));
+      data = resized;
+    },
+    close: async () => {},
+  };
+  return {
+    sink,
+    bytes: () => data,
+    writes: () => writes,
+    truncates: () => truncates,
+    failReads: (on: boolean) => {
+      failing = on;
+    },
+    failWrites: (on: boolean) => {
+      failingWrites = on;
+    },
+    failTruncates: (on: boolean) => {
+      failingTruncates = on;
+    },
+  };
+}
+
+/** Read one dataset from a file's bytes, on this thread. */
+export async function datasetIn(bytes: Uint8Array, name: string) {
+  const module = await ready;
+  const p = await tmpPath();
+  module.FS.writeFile(p, bytes);
+  const f = new H5File(p, "r");
+  try {
+    const dataset = f.get(name) as any;
+    return dataset ? { value: dataset.value, shape: dataset.shape } : null;
+  } finally {
+    f.close();
+    module.FS.unlink(p);
+  }
+}
+
+export async function emptyFile(): Promise<Uint8Array> {
+  const module = await ready;
+  const p = await tmpPath();
+  const f = new H5File(p, "w");
+  f.create_group("metadata");
+  f.close();
+  const bytes = new Uint8Array(module.FS.readFile(p));
+  module.FS.unlink(p);
+  return bytes;
+}
+
+/**
+ * What a promise that needs a worker thread rejects with. Not `expect().rejects`: that
+ * waits in a way that can keep the worker's answer from ever being delivered.
+ */
+export const rejection = (promise: Promise<unknown>): Promise<string> =>
+  promise.then(
+    () => "it resolved",
+    (error: Error) => error.message,
+  );
 
 /** What the frame tables hold, in a form `toEqual` can compare. */
 export const poses = (labels: Labels) =>

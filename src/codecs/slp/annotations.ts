@@ -75,6 +75,20 @@ export interface AnnotationTuples {
 }
 
 /** A dataset's values as bytes, whether they came back typed or as a plain array. */
+/**
+ * Unpack bytes the file holds already compressed. HDF5 sees plain data, so only this can
+ * tell they're damaged, and pako says so with a bare string, which has no `message`.
+ */
+function inflateStored(compressed: Uint8Array, what: string): Uint8Array {
+  try {
+    return inflate(compressed);
+  } catch (err) {
+    throw new Error(
+      `Could not unpack ${what} from the file (${err}). Part of it may be damaged.`,
+    );
+  }
+}
+
 export function toBytes(value: unknown): Uint8Array {
   return value instanceof Uint8Array
     ? value
@@ -429,7 +443,7 @@ function buildScoreMaps(
     const w = Number(smWidths[i]);
 
     const compressed = dataFlat.slice(start, end);
-    const decompressed = inflate(compressed);
+    const decompressed = inflateStored(compressed, "a score map");
     const expectedBytes = h * w * 4; // Float32 = 4 bytes per element
     if (decompressed.byteLength !== expectedBytes) {
       throw new Error(
@@ -785,7 +799,7 @@ export function buildLabelImages(
       const dataStart = Number(dataStarts[i]);
       const dataEnd = Number(dataEnds[i]);
       const compressed = dataFlat.slice(dataStart, dataEnd);
-      const decompressed = inflate(compressed);
+      const decompressed = inflateStored(compressed, "a label image");
       // Convert bytes back to Int32Array (little-endian, matches native).
       // Use buffer.slice() to guarantee 4-byte alignment for Int32Array.
       pixelData = new Int32Array(

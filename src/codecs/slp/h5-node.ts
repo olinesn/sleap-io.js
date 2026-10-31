@@ -13,6 +13,7 @@ import {
   _registerNodeH5,
   _registerNodeFileOps,
   fetchRemoteSlpBytes,
+  guardH5Status,
   type H5Module,
   type OpenH5Options,
   type SlpSource,
@@ -28,6 +29,7 @@ async function getH5ModuleNode(): Promise<H5Module> {
     modulePromise = (async () => {
       const module = await import("h5wasm/node");
       await module.ready;
+      guardH5Status(module as H5Module);
       return module as H5Module;
     })();
   }

@@ -167,10 +167,57 @@ export async function getH5Module(): Promise<H5Module> {
     modulePromise = (async () => {
       const module = await import("h5wasm");
       await module.ready;
+      guardH5Status(module as H5Module);
       return module as H5Module;
     })();
   }
   return modulePromise;
+}
+
+/** A read that HDF5 says failed, as opposed to data this library can't make sense of. */
+export class FailedH5Read extends Error {}
+
+/**
+ * Make h5wasm's reads throw when HDF5 says they failed. h5wasm drops what they return,
+ * so a read HDF5 gave up on (a damaged compressed chunk, say) hands back whatever was in
+ * the buffer.
+ *
+ * Worker code can't import this; `guardH5StatusWorker` in ./h5-worker.ts is the same
+ * (keep them in lockstep).
+ *
+ * @internal
+ */
+export function guardH5Status(module: H5Module): void {
+  type Call = (...args: unknown[]) => number;
+  const calls = (module as unknown as { Module: Record<string, Call> }).Module;
+
+  // A read that doesn't finish leaves its buffer as malloc did, and h5wasm then goes on to
+  // free the strings it takes to be in there.
+  let unfilled: unknown = null;
+  const guardRead = (name: string, what: (args: unknown[]) => string) => {
+    const read = calls[name];
+    calls[name] = function (this: unknown, ...args) {
+      unfilled = args[args.length - 1];
+      const status = read.apply(this, args);
+      if (status < 0) {
+        throw new FailedH5Read(
+          `Could not read ${what(args)} from the file. Part of it may be damaged.`,
+        );
+      }
+      unfilled = null;
+      return status;
+    };
+  };
+  guardRead("get_dataset_data", (args) => String(args[1]));
+  guardRead(
+    "get_attribute_data",
+    (args) => `the ${args[2]} attribute of ${args[1]}`,
+  );
+  const reclaim = calls.reclaim_vlen_memory;
+  calls.reclaim_vlen_memory = function (this: unknown, ...args) {
+    if (args[3] === unfilled) return 0;
+    return reclaim.apply(this, args);
+  };
 }
 
 /**

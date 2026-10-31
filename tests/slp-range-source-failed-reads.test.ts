@@ -19,21 +19,22 @@ import {
   vi,
 } from "./bun-test";
 import { readFileSync } from "node:fs";
-import { ready, File as H5File } from "h5wasm/node";
 import { readSlp } from "../src/codecs/slp/read.js";
 import { readSlpStreaming } from "../src/codecs/slp/read-streaming.js";
 import {
-  type RangeSink,
   type RangeSource,
   StreamingH5File,
   StreamingH5Writer,
 } from "../src/codecs/slp/h5-streaming.js";
 import { StreamingHdf5VideoBackend } from "../src/video/streaming-hdf5-video.js";
 import {
+  datasetIn,
+  emptyFile,
   H5WASM_ON_THREAD,
+  memorySink,
   onRealWorkerThreads,
   poses,
-  tmpPath,
+  rejection,
 } from "./worker-file";
 
 // A worker thread compiles its own h5wasm, which takes a while when the suite is busy.
@@ -52,16 +53,6 @@ const FAILED_READ = /Could not read \d+ bytes at offset \d+ of the file/;
 afterEach(() => {
   vi.restoreAllMocks();
 });
-
-/**
- * What a promise that needs a worker thread rejects with. Not `expect().rejects`: that
- * waits in a way that can keep the worker's answer from ever being delivered.
- */
-const rejection = (promise: Promise<unknown>): Promise<string> =>
-  promise.then(
-    () => "it resolved",
-    (error: Error) => error.message,
-  );
 
 /** The expected "readRange failed" log, which would otherwise fill the test output. */
 const quietErrors = () =>
@@ -297,68 +288,6 @@ describe("a range source whose read fails", () => {
     await other.close();
   });
 });
-
-/** A file in memory, as a native write handle would be on disk. */
-function memorySink(initial: Uint8Array) {
-  let data = initial.slice();
-  let failing = false;
-  let writes = 0;
-  const sink: RangeSink = {
-    writeAt: async (offset, bytes) => {
-      writes += 1;
-      if (offset + bytes.length > data.length) {
-        const grown = new Uint8Array(offset + bytes.length);
-        grown.set(data);
-        data = grown;
-      }
-      data.set(bytes, offset);
-    },
-    readAt: async (offset, length) => {
-      if (failing) throw new Error("the drive went away");
-      return data.slice(offset, offset + length);
-    },
-    truncate: async (length) => {
-      const resized = new Uint8Array(length);
-      resized.set(data.subarray(0, length));
-      data = resized;
-    },
-    close: async () => {},
-  };
-  return {
-    sink,
-    bytes: () => data,
-    writes: () => writes,
-    failReads: (on: boolean) => {
-      failing = on;
-    },
-  };
-}
-
-/** Read one dataset from a file's bytes, on this thread. */
-async function datasetIn(bytes: Uint8Array, name: string) {
-  const module = await ready;
-  const p = await tmpPath();
-  module.FS.writeFile(p, bytes);
-  const f = new H5File(p, "r");
-  try {
-    const dataset = f.get(name) as any;
-    return dataset ? { value: dataset.value, shape: dataset.shape } : null;
-  } finally {
-    f.close();
-    module.FS.unlink(p);
-  }
-}
-
-async function emptyFile(): Promise<Uint8Array> {
-  const module = await ready;
-  const p = await tmpPath();
-  const f = new H5File(p, "w");
-  f.create_group("metadata");
-  f.close();
-  const bytes = new Uint8Array(module.FS.readFile(p));
-  module.FS.unlink(p);
-  return bytes;
-}
 
 describe("a save reading through the bridge", () => {
   onRealWorkerThreads();

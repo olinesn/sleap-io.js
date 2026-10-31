@@ -1,5 +1,6 @@
 import {
   checkOpenedAsHdf5,
+  FailedH5Read,
   openH5File,
   type OpenH5Options,
   type SlpSource,
@@ -638,7 +639,8 @@ export function readVideoCrops(file: any): Map<number, VideoCropEntry> {
   let json: string | undefined;
   try {
     json = datasetValueToString((ds as { value?: unknown }).value);
-  } catch {
+  } catch (err) {
+    if (err instanceof FailedH5Read) throw err;
     json = undefined;
   }
   if (json === undefined) return out;
@@ -689,16 +691,22 @@ export function readSourceVideoGroupJson(
   // scalar/large datasets, and a throw here would otherwise abort the whole
   // file open (this runs inside readVideos with no surrounding try/catch), so
   // fall back to the `json` attribute rather than failing the load.
+  let failedRead: FailedH5Read | undefined;
   try {
     const ds = file.get(`${groupPath}/source_video/json`);
     if (ds) raw = datasetValueToString((ds as { value?: unknown }).value);
-  } catch {
+  } catch (err) {
+    if (err instanceof FailedH5Read) failedRead = err;
     raw = undefined;
   }
   if (raw === undefined) {
     raw = attrToString((grp.attrs ?? {}).json);
   }
-  if (raw === undefined) return null;
+  if (raw === undefined) {
+    // With no attribute to fall back on, the next save would drop the lineage.
+    if (failedRead) throw failedRead;
+    return null;
+  }
   try {
     return JSON.parse(raw) as Record<string, unknown>;
   } catch {
@@ -2139,7 +2147,8 @@ function readCentroids(
         return ((ds.value as ArrayLike<unknown>) ?? []).length
           ? Array.from(ds.value as ArrayLike<unknown>, decodeStr)
           : [];
-      } catch {
+      } catch (err) {
+        if (err instanceof FailedH5Read) throw err;
         // Python may store these as vlen-str, which h5wasm can't always read;
         // the centroid position/type/link still round-trips without them.
         return [];

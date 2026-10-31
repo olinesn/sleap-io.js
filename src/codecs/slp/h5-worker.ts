@@ -344,6 +344,7 @@ async function initH5Wasm(h5wasmUrl) {
   h5wasmModule = h5wasm;
   // FS is exposed directly on h5wasm module after ready
   FS = h5wasm.FS;
+  guardH5StatusWorker(h5wasm);
   // Every device's reads pass through here. HDF5 and h5wasm can each swallow what a read
   // throws, and h5wasm ignores a failed H5Dread, so a read has to be caught at this end.
   const read = FS.read;
@@ -354,6 +355,32 @@ async function initH5Wasm(h5wasmUrl) {
       failedRead = failedRead || error;
       throw error;
     }
+  };
+}
+
+// Same as guardH5Status in h5.ts, which this worker code can't import (keep them in
+// lockstep): make h5wasm's reads throw when HDF5 says they failed.
+function guardH5StatusWorker(h5) {
+  var calls = h5.Module;
+  var unfilled = null;
+  function guardRead(name, what) {
+    var read = calls[name];
+    calls[name] = function() {
+      unfilled = arguments[arguments.length - 1];
+      var status = read.apply(this, arguments);
+      if (status < 0) {
+        throw new Error('Could not read ' + what(arguments) + ' from the file. Part of it may be damaged.');
+      }
+      unfilled = null;
+      return status;
+    };
+  }
+  guardRead('get_dataset_data', function(args) { return String(args[1]); });
+  guardRead('get_attribute_data', function(args) { return 'the ' + args[2] + ' attribute of ' + args[1]; });
+  var reclaim = calls.reclaim_vlen_memory;
+  calls.reclaim_vlen_memory = function() {
+    if (arguments[3] === unfilled) return 0;
+    return reclaim.apply(this, arguments);
   };
 }
 

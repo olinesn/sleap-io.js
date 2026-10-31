@@ -35,6 +35,7 @@ import {
   normalizeCameraSize,
   reconstructInstance3D,
   resolveIdentity,
+  frameGroupFrameIdx,
 } from "./parsers.js";
 import { buildSourceVideoFromDict } from "./source-video.js";
 import { Labels } from "../../model/labels.js";
@@ -520,6 +521,7 @@ export async function readFromStreamingFile(
     skeletons,
     identities,
     rawSessions,
+    framesData.frame_idx,
   );
 
   onProgress?.(total, total, "Finalizing");
@@ -1300,6 +1302,7 @@ export async function readSessionsStreaming(
   skeletons: Skeleton[],
   identities?: Identity[],
   captureRaw: boolean = false,
+  frameNumbers?: ArrayLike<unknown>,
 ): Promise<RecordingSession[]> {
   try {
     const keys = file.keys();
@@ -1401,10 +1404,7 @@ export async function readSessionsStreaming(
         : [];
       for (const group of frameGroups) {
         const groupRecord = group as Record<string, unknown>;
-        const frameIdx =
-          (groupRecord.frame_idx as number | undefined) ??
-          (groupRecord.frameIdx as number | undefined) ??
-          0;
+        const frameIdx = frameGroupFrameIdx(groupRecord, frameNumbers);
         const instanceGroups: InstanceGroup[] = [];
         const instanceGroupList = Array.isArray(groupRecord.instance_groups)
           ? groupRecord.instance_groups

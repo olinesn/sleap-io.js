@@ -24,6 +24,7 @@ import {
   reconstructInstance3D,
   resolveIdentity,
   resolveVideoFilename,
+  frameGroupFrameIdx,
 } from "./parsers.js";
 import { buildSourceVideoFromDict } from "./source-video.js";
 import { Labels } from "../../model/labels.js";
@@ -81,7 +82,7 @@ import {
   UserBoundingBox,
   PredictedBoundingBox,
 } from "../../model/bbox.js";
-import { type Centroid } from "../../model/centroid.js";
+import type { Centroid } from "../../model/centroid.js";
 import { buildCentroidTuples } from "./centroids.js";
 import {
   type LabelImage,
@@ -251,6 +252,7 @@ export async function readSlp(
       identities,
       options?.rawSessions ?? false,
       readSessionDataEager(file, emscripten),
+      framesData.frame_idx,
     );
     report(7); // Reading annotations
     const allInstances = labeledFrames.flatMap((f) => f.instances);
@@ -556,6 +558,7 @@ export async function readSlpLazy(
       identities,
       options?.rawSessions ?? false,
       readSessionDataEager(file, emscripten),
+      framesData.frame_idx,
     );
     report(7); // Reading annotations
     const { rois: roiTuples, bboxes: bboxTuples } = readRoisAndBboxes(
@@ -1540,6 +1543,7 @@ function readSessions(
   identities?: Identity[],
   captureRaw: boolean = false,
   sessionData?: SessionData | null,
+  frameNumbers?: ArrayLike<unknown>,
 ): RecordingSession[] {
   if (!dataset) return [];
   const values = dataset.value ?? [];
@@ -1626,10 +1630,7 @@ function readSessions(
       : [];
     for (const group of frameGroups) {
       const groupRecord = asRecord(group);
-      const frameIdx =
-        (groupRecord.frame_idx as number | undefined) ??
-        (groupRecord.frameIdx as number | undefined) ??
-        0;
+      const frameIdx = frameGroupFrameIdx(groupRecord, frameNumbers);
       const instanceGroups: InstanceGroup[] = [];
       const instanceGroupList = Array.isArray(groupRecord.instance_groups)
         ? groupRecord.instance_groups

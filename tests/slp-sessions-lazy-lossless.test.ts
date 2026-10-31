@@ -176,6 +176,8 @@ describe("Lossless lazy-native sessions (#197)", () => {
       eager.videos,
       eager.skeletons,
       undefined,
+      false,
+      eager.labeledFrames.map((lf) => lf.frameIdx),
     );
     const streamedLabels = new Labels({
       labeledFrames: eager.labeledFrames,
@@ -415,5 +417,65 @@ describe("Lossless lazy-native sessions (#197)", () => {
     expect(fg.labeledFrameByCamera.size).toBe(1);
     expect(fg.cameras).toHaveLength(1);
     expect(fg.getFrame(cam)).toBe(lf);
+  });
+});
+
+describe("Frame numbers of SLEAP's own multi-view groups", () => {
+  // multiview.slp is a real SLEAP file: its frame groups have no frame_idx. These
+  // numbers are what Python sleap-io reads from it.
+  const PYTHON_GROUPS_BY_FRAME: Record<number, number> = { 0: 2, 1: 2, 2: 2 };
+
+  const groupsByFrame = (labels: Labels): Record<number, number> => {
+    const out: Record<number, number> = {};
+    for (const [f, fg] of labels.sessions[0].frameGroups) {
+      expect(fg.frameIdx).toBe(f);
+      out[f] = fg.instanceGroups.length;
+    }
+    return out;
+  };
+
+  it("come from the members, as in Python, on the eager and lazy readers", async () => {
+    const eager = await readSlp(MULTIVIEW, { openVideos: false });
+    expect(groupsByFrame(eager)).toEqual(PYTHON_GROUPS_BY_FRAME);
+    const lazy = await readSlpLazy(MULTIVIEW, { openVideos: false });
+    expect(groupsByFrame(lazy)).toEqual(PYTHON_GROUPS_BY_FRAME);
+  });
+
+  it("come from the members on the streaming reader", async () => {
+    const eager = await readSlp(MULTIVIEW, { openVideos: false });
+    const rawSessions = await fixtureSessionsJson();
+    const fakeFile = {
+      keys: () => ["sessions_json"],
+      getDatasetValue: async (name: string) =>
+        name === "sessions_json" ? { value: [rawSessions] } : { value: [] },
+    } as unknown as Parameters<typeof readSessionsStreaming>[0];
+    const sessions = await readSessionsStreaming(
+      fakeFile,
+      eager.videos,
+      eager.skeletons,
+      undefined,
+      false,
+      eager.labeledFrames.map((lf) => lf.frameIdx),
+    );
+    const labels = new Labels({ videos: eager.videos, sessions });
+    expect(groupsByFrame(labels)).toEqual(PYTHON_GROUPS_BY_FRAME);
+  });
+
+  it("every member of a group is on that group's frame, and a save keeps them", async () => {
+    const labels = await readSlp(MULTIVIEW, { openVideos: false });
+    const saved = await readSlp(
+      (await saveSlpToBytes(labels)).buffer as ArrayBuffer,
+      { openVideos: false },
+    );
+    expect(groupsByFrame(saved)).toEqual(PYTHON_GROUPS_BY_FRAME);
+    expect(saved.labeledFrames.length).toBe(labels.labeledFrames.length);
+    for (const check of [labels, saved]) {
+      for (const [f, fg] of check.sessions[0].frameGroups) {
+        for (const [camera, frame] of fg.labeledFrameByCamera) {
+          expect(frame.frameIdx).toBe(f);
+          expect(frame.video).toBe(check.sessions[0].getVideo(camera));
+        }
+      }
+    }
   });
 });

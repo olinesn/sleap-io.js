@@ -676,6 +676,32 @@ export function parseSuggestions(values: unknown[]): SuggestionMetadata[] {
 }
 
 /**
+ * The frame number of a frame group in a legacy `frame_group_dicts` entry. SLEAP's own
+ * multi-view files do not store one, so it comes from the labeled frames its members
+ * are on (`frameNumbers`: the `frame_idx` column of `/frames`), as Python's
+ * `make_frame_group` works it out. Without this every group lands on frame 0.
+ */
+export function frameGroupFrameIdx(
+  group: Record<string, unknown>,
+  frameNumbers: ArrayLike<unknown> | undefined,
+): number {
+  const stored = group.frame_idx ?? group.frameIdx;
+  if (stored !== undefined && stored !== null) return Number(stored);
+  const instanceGroups = Array.isArray(group.instance_groups)
+    ? group.instance_groups
+    : [];
+  for (const instanceGroup of instanceGroups) {
+    const members = (instanceGroup as Record<string, unknown> | null)
+      ?.camcorder_to_lf_and_inst_idx_map;
+    for (const pair of Object.values(members ?? {})) {
+      const frameIdx = frameNumbers?.[Number((pair as unknown[])[0])];
+      if (frameIdx !== undefined) return Number(frameIdx);
+    }
+  }
+  return 0;
+}
+
+/**
  * Camera metadata from recording sessions.
  */
 export interface CameraMetadata {

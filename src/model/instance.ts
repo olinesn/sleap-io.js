@@ -150,6 +150,35 @@ export function predictedPointsFromArray(
   return pts;
 }
 
+// Readers build millions of instances at once. Their columns are views of shared
+// chunks: an array buffer per column would be four per instance, tens of millions on a
+// long multi-camera project, for the garbage collector to walk on every collection.
+const POOL_CHUNK_ELEMENTS = 1 << 20;
+let poolFloat64 = new Float64Array(0);
+let poolFloat64Used = 0;
+let poolUint8 = new Uint8Array(0);
+let poolUint8Used = 0;
+
+function pooledFloat64(n: number): Float64Array {
+  if (poolFloat64Used + n > poolFloat64.length) {
+    poolFloat64 = new Float64Array(Math.max(POOL_CHUNK_ELEMENTS, n));
+    poolFloat64Used = 0;
+  }
+  const out = poolFloat64.subarray(poolFloat64Used, poolFloat64Used + n);
+  poolFloat64Used += n;
+  return out;
+}
+
+function pooledUint8(n: number): Uint8Array {
+  if (poolUint8Used + n > poolUint8.length) {
+    poolUint8 = new Uint8Array(Math.max(POOL_CHUNK_ELEMENTS, n));
+    poolUint8Used = 0;
+  }
+  const out = poolUint8.subarray(poolUint8Used, poolUint8Used + n);
+  poolUint8Used += n;
+  return out;
+}
+
 /**
  * A live view of one keypoint over an {@link Instance}'s columnar storage.
  *
@@ -329,10 +358,10 @@ export class Instance {
     predicted: boolean,
   ): void {
     const n = Math.max(0, end - start);
-    const xy = new Float64Array(2 * n);
-    const visible = new Uint8Array(n);
-    const complete = new Uint8Array(n);
-    const score = predicted ? new Float64Array(n) : null;
+    const xy = pooledFloat64(2 * n);
+    const visible = pooledUint8(n);
+    const complete = pooledUint8(n);
+    const score = predicted ? pooledFloat64(n) : null;
     const cx = columns.x;
     const cy = columns.y;
     const cv = columns.visible;

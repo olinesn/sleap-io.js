@@ -18,7 +18,7 @@ import {
   cloneRecordingSession,
   injectSessionFrameResolver,
 } from "./camera.js";
-import type { Identity } from "./identity.js";
+import { Identity } from "./identity.js";
 import { toDict } from "../codecs/dictionary.js";
 import { labelsFromNumpy } from "../codecs/numpy.js";
 import { type LazyDataStore, LazyFrameList } from "./lazy.js";
@@ -154,6 +154,24 @@ function filenameRepr(filename: string | string[]): string {
 interface DeferredInstanceRef {
   _instanceIdx: number | null;
   instance: Instance | null;
+}
+
+/**
+ * Copy what a detection carries besides its pose and track: identity and category,
+ * with their scores and embeddings. They are not constructor options, so a rebuilt
+ * instance loses them without this.
+ */
+function copyDetectionLabels(
+  from: Instance,
+  to: Instance,
+  mapIdentity: (identity: Identity) => Identity,
+): void {
+  to.identity = from.identity ? mapIdentity(from.identity) : null;
+  to.identityScore = from.identityScore;
+  to.identityEmbedding = from.identityEmbedding;
+  to.category = from.category;
+  to.categoryScore = from.categoryScore;
+  to.categoryEmbedding = from.categoryEmbedding;
 }
 
 export class Labels {
@@ -1274,6 +1292,20 @@ export class Labels {
       return nt;
     });
 
+    // Clone the identity catalog as real Identity objects, and remap every reference
+    // onto them: the writer finds an identity in the catalog by object.
+    const identityMap = new Map<Identity, Identity>();
+    const newIdentities = this.identities.map((id) => {
+      const ni = new Identity({
+        name: id.name,
+        color: id.color,
+        metadata: structuredClone(id.metadata),
+      });
+      identityMap.set(id, ni);
+      return ni;
+    });
+    const mapIdentity = (id: Identity): Identity => identityMap.get(id) ?? id;
+
     // Helper: clone an instance with remapped skeleton/track
     const cloneInstance = (
       inst: Instance | PredictedInstance,
@@ -1283,23 +1315,24 @@ export class Labels {
       const newTrack = inst.track
         ? (trackMap.get(inst.track) ?? inst.track)
         : null;
-      if (inst instanceof PredictedInstance) {
-        return new PredictedInstance({
-          points: newPoints as any,
-          skeleton: newSkeleton,
-          track: newTrack,
-          score: inst.score,
-          trackingScore: inst.trackingScore,
-        });
-      }
-      const ni = new Instance({
-        points: newPoints,
-        skeleton: newSkeleton,
-        track: newTrack,
-        trackingScore: inst.trackingScore,
-      });
       // fromPredicted can't be fully remapped (would need global instance identity),
       // so we leave it null on the copy.
+      const ni =
+        inst instanceof PredictedInstance
+          ? new PredictedInstance({
+              points: newPoints as any,
+              skeleton: newSkeleton,
+              track: newTrack,
+              score: inst.score,
+              trackingScore: inst.trackingScore,
+            })
+          : new Instance({
+              points: newPoints,
+              skeleton: newSkeleton,
+              track: newTrack,
+              trackingScore: inst.trackingScore,
+            });
+      copyDetectionLabels(inst, ni, mapIdentity);
       return ni;
     };
 
@@ -1307,7 +1340,7 @@ export class Labels {
     const cloneAncillary = <T extends object>(items: T[]): T[] =>
       items.map((item) => {
         const saved: [string, any][] = [];
-        for (const key of ["video", "track", "instance"] as const) {
+        for (const key of ["video", "track", "instance", "identity"] as const) {
           if (key in item && (item as any)[key] != null) {
             saved.push([key, (item as any)[key]]);
             (item as any)[key] = null;
@@ -1347,6 +1380,8 @@ export class Labels {
           else if (key === "track")
             (clone as any).track = trackMap.get(val) ?? val;
           else if (key === "instance") (clone as any).instance = null;
+          else if (key === "identity")
+            (clone as any).identity = mapIdentity(val);
         }
         if (objectRefs) {
           for (const [id, [track]] of objectRefs) {
@@ -1414,7 +1449,7 @@ export class Labels {
           cloneRecordingSession(s, { videoMap }),
         ),
         provenance: { ...this.provenance },
-        identities: structuredClone(this.identities),
+        identities: newIdentities,
       });
 
       labelsCopy._lazyDataStore = newStore;
@@ -1467,9 +1502,18 @@ export class Labels {
         ),
         provenance: { ...this.provenance },
         rois: cloneAncillary(this._staticRois),
-        identities: structuredClone(this.identities),
+        identities: newIdentities,
       });
       injectSessionFrameResolver(labelsCopy);
+    }
+
+    // Sessions are cloned with the source's identities on their groups.
+    for (const session of labelsCopy.sessions) {
+      for (const frameGroup of session.frameGroupByFrameIdx.values()) {
+        for (const group of frameGroup.instanceGroups) {
+          if (group.identity) group.identity = mapIdentity(group.identity);
+        }
+      }
     }
 
     if (options?.openVideos !== undefined) {
@@ -1760,13 +1804,16 @@ export class Labels {
    *   mutated in place. Used by {@link _relinkFromPredicted} to repair
    *   `fromPredicted` links so a remapped user instance references the remapped
    *   source prediction now in the merged frame (Python #491).
-   * @returns New instance with mapped skeleton and track.
+   * @param identityMap - Map from the source's identities to this catalog's. An
+   *   identity not in it is kept as it is.
+   * @returns New instance with mapped skeleton, track and identity.
    */
   _mapInstance(
     instance: Instance | PredictedInstance,
     skeletonMap: Map<Skeleton, Skeleton>,
     trackMap: Map<Track, Track>,
     memo?: Map<object, object>,
+    identityMap?: Map<Identity, Identity>,
   ): Instance | PredictedInstance {
     const mappedSkeleton =
       skeletonMap.get(instance.skeleton) ?? instance.skeleton;
@@ -1841,6 +1888,11 @@ export class Labels {
         fromPredicted: instance.fromPredicted,
       });
     }
+    copyDetectionLabels(
+      instance,
+      newInstance,
+      (id) => identityMap?.get(id) ?? id,
+    );
     if (memo !== undefined) memo.set(instance, newInstance);
     return newInstance;
   }
@@ -2109,6 +2161,21 @@ export class Labels {
         }
       }
 
+      // ----- STEP 3b: identities ------------------------------------------
+      // One catalog entry per name, as in Python: the same animal across files is one
+      // Identity. Each incoming detection's identity goes through this map.
+      const identityMap = new Map<Identity, Identity>();
+      for (const otherIdentity of other.identities) {
+        let matched = this.identities.find(
+          (id) => id.name === otherIdentity.name,
+        );
+        if (!matched) {
+          matched = otherIdentity;
+          this.identities.push(otherIdentity);
+        }
+        identityMap.set(otherIdentity, matched);
+      }
+
       // Warn (diagnostic only) if any name-matched track pair carries instances
       // that diverge spatially on every shared frame. This does not alter
       // trackMap or any merge result.
@@ -2155,7 +2222,13 @@ export class Labels {
           const instanceMemo = new Map<object, object>();
           for (const inst of otherFrame.instances) {
             newFrame.instances.push(
-              this._mapInstance(inst, skeletonMap, trackMap, instanceMemo),
+              this._mapInstance(
+                inst,
+                skeletonMap,
+                trackMap,
+                instanceMemo,
+                identityMap,
+              ),
             );
             result.instancesAdded += 1; // per instance
           }
@@ -2184,6 +2257,7 @@ export class Labels {
                 skeletonMap,
                 trackMap,
                 instanceMemo,
+                identityMap,
               );
             }
             // "update_tracks" leaves this frame's own instances holding `other`'s
@@ -3073,28 +3147,43 @@ export class Labels {
       return nt;
     };
 
+    const identityMap = new Map<Identity, Identity>();
+    const mapIdentity = (id: Identity): Identity => {
+      let ni = identityMap.get(id);
+      if (!ni) {
+        ni = new Identity({
+          name: id.name,
+          color: id.color,
+          metadata: structuredClone(id.metadata),
+        });
+        identityMap.set(id, ni);
+      }
+      return ni;
+    };
+
     const cloneInstance = (
       inst: Instance | PredictedInstance,
     ): Instance | PredictedInstance => {
       const newPoints = inst.points.map((p) => clonePoint(p));
       const newSkeleton = mapSkeleton(inst.skeleton);
       const newTrack = mapTrack(inst.track);
-      if (inst.constructor === PredictedInstance) {
-        const predicted = inst as PredictedInstance;
-        return new PredictedInstance({
-          points: newPoints as unknown as PredictedPointsArray,
-          skeleton: newSkeleton,
-          track: newTrack,
-          score: predicted.score,
-          trackingScore: predicted.trackingScore,
-        });
-      }
-      return new Instance({
-        points: newPoints,
-        skeleton: newSkeleton,
-        track: newTrack,
-        trackingScore: inst.trackingScore,
-      });
+      const ni =
+        inst.constructor === PredictedInstance
+          ? new PredictedInstance({
+              points: newPoints as unknown as PredictedPointsArray,
+              skeleton: newSkeleton,
+              track: newTrack,
+              score: (inst as PredictedInstance).score,
+              trackingScore: inst.trackingScore,
+            })
+          : new Instance({
+              points: newPoints,
+              skeleton: newSkeleton,
+              track: newTrack,
+              trackingScore: inst.trackingScore,
+            });
+      copyDetectionLabels(inst, ni, mapIdentity);
+      return ni;
     };
 
     // Clone an ancillary annotation: shallow-clone preserving prototype, then

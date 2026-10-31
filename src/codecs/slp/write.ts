@@ -164,16 +164,36 @@ function isRawCopyable(video: Video): boolean {
 }
 
 /**
- * Add any track only its instances know about to `labels.tracks`. The tables store a
- * track as its position in that list, so one missing from it would save as no track.
+ * Add any track or identity only its detections know about to `labels.tracks` and
+ * `labels.identities`. The tables store each as its position in that list, so one
+ * missing from it would save as nothing. Python collects them at save too.
  */
-function registerInstanceTracks(labels: Labels): void {
-  const known = new Set(labels.tracks);
+function registerDetectionCatalogs(labels: Labels): void {
+  const tracks = new Set(labels.tracks);
+  const identities = new Set(labels.identities);
+  const registerIdentity = (identity: Identity | null | undefined): void => {
+    if (identity && !identities.has(identity)) {
+      identities.add(identity);
+      labels.identities.push(identity);
+    }
+  };
   for (const frame of labels.labeledFrames) {
     for (const inst of frame.instances) {
-      if (inst.track && !known.has(inst.track)) {
-        known.add(inst.track);
+      if (inst.track && !tracks.has(inst.track)) {
+        tracks.add(inst.track);
         labels.tracks.push(inst.track);
+      }
+      registerIdentity(inst.identity);
+    }
+  }
+  anyDetection(labels, (detection) => {
+    registerIdentity(detection.identity);
+    return false;
+  });
+  for (const session of labels.sessions) {
+    for (const frameGroup of session.frameGroups.values()) {
+      for (const group of frameGroup.instanceGroups) {
+        registerIdentity(group.identity);
       }
     }
   }
@@ -184,7 +204,6 @@ function writeSlpToFile(
   labels: Labels,
   plan?: EmbedPlan | null,
 ): void {
-  registerInstanceTracks(labels);
   writeMetadata(file, labels);
 
   if (plan && plan.size > 0) {
@@ -1898,6 +1917,7 @@ async function writeSlpBytes(
   const file = new module.File(memPath, "w");
   try {
     try {
+      registerDetectionCatalogs(writeLabels);
       writeSlpToFile(file, writeLabels, plan);
       if (includeEmbeddedData && plan && plan.size > 0) {
         await writeEmbeddedVideoData(file, labels, plan, options?.onProgress);
@@ -3400,7 +3420,7 @@ export interface OnDiskSidecars {
  * byte-exact.
  */
 export function buildExpectedSidecars(labels: Labels): OnDiskSidecars {
-  registerInstanceTracks(labels);
+  registerDetectionCatalogs(labels);
   return {
     tracksJson: buildTracksJson(labels.tracks),
     suggestionsJson: buildSuggestionsJson(labels.suggestions, labels.videos),

@@ -244,6 +244,35 @@ describe("Per-detection identity links + embeddings (SLP 2.5)", () => {
     }
   });
 
+  it("a lazy store from the streaming reader saves its links", async () => {
+    const { labels } = labelsWithInstanceIdentities();
+    const f = await makeStreamingFake(
+      new Uint8Array(await saveSlpToBytes(labels)),
+    );
+    try {
+      const lazy = await readFromStreamingFile(
+        f.fake,
+        "t.slp",
+        "t.slp",
+        false,
+        undefined,
+        false,
+        true,
+      );
+      expect(lazy.isLazy).toBe(true);
+      const bytes = new Uint8Array(await saveSlpToBytes(lazy));
+      const back = await readSlp(bytes.buffer as ArrayBuffer, {
+        openVideos: false,
+      });
+      const all = back.labeledFrames.flatMap((fr) => fr.instances);
+      expect(all.map((i) => i.identity?.name)).toEqual(["A", "B", "A", "B"]);
+      expect(all[0].identityScore).toBe(0.9);
+      expect(all[3].identityEmbedding?.vector).toEqual([1.0, 1.1, 1.2]);
+    } finally {
+      f.close();
+    }
+  });
+
   it("lazy read attaches per-instance identity on materialization", async () => {
     const { readSlpLazy } = await import("../src/codecs/slp/read.js");
     const { labels } = labelsWithInstanceIdentities();

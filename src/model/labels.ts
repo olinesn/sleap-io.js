@@ -1417,6 +1417,8 @@ export class Labels {
         identities: structuredClone(this.identities),
       });
 
+      // The store's links resolve through its catalog, so it must be the copy's.
+      newStore.identities = labelsCopy.identities;
       labelsCopy._lazyDataStore = newStore;
       labelsCopy._lazyFrameList = newLazyFrames;
       injectSessionFrameResolver(labelsCopy);

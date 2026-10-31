@@ -472,8 +472,9 @@ function writeLazyNegativeFrames(file: any, store: LazyDataStore): void {
  * Reuses metadata writers (which only depend on eager `Labels` fields like
  * `videos`/`tracks`/`suggestions`/`identities`/`sessions`/`provenance`) and
  * pulls frames/instances/points/pred_points/negative_frames + per-type
- * annotation maps directly from `LazyDataStore`. No `LabeledFrame` or
- * `Instance` objects are constructed in this path.
+ * annotation maps + instance identity/category links directly from
+ * `LazyDataStore`. No `LabeledFrame` or `Instance` objects are constructed in
+ * this path.
  *
  * Limitations (matching Python):
  *   - `writeSessions` is called with an empty `labeledFrames` list, so any
@@ -589,6 +590,20 @@ function writeSlpToFileLazy(file: any, labels: Labels): void {
     [],
     liCtx,
   );
+
+  // Per-detection identity + category, as in writeSlpToFile. The annotation lists
+  // are in the order their datasets were written just above and `/instances` rows
+  // are copied as they are, so a detection's index in its list is its owner_id.
+  const detections: DetectionCollections = {
+    instance: lazyInstanceDetections(store),
+    centroid: allCentroids,
+    mask: allMasks,
+    bbox: allBboxes,
+    roi: allRois,
+  };
+  writeIdentityLinks(file, labels.identities, detections);
+  writeCategoryLinks(file, detections);
+  writeEmbeddings(file, detections);
 }
 
 /**
@@ -2548,13 +2563,14 @@ function collectCategoryCatalog(c: DetectionCollections): string[] {
   const seen = new Set<string>();
   const catalog: string[] = [];
   for (const [, list] of ownerCollections(c)) {
-    for (const det of list) {
+    // forEach, not for...of: the lazy instance list has holes.
+    list.forEach((det) => {
       const cat = det.category;
       if (cat && !seen.has(cat)) {
         seen.add(cat);
         catalog.push(cat);
       }
-    }
+    });
   }
   return catalog;
 }
@@ -2595,6 +2611,35 @@ function writeCategoryLinks(file: any, c: DetectionCollections): void {
   );
 }
 
+/**
+ * A lazy store's instance identity + category, as detections at their `/instances`
+ * row with holes between them, so that no `Instance` has to be built. A link to no
+ * row or no catalog entry attaches to nothing when read, so it is left out.
+ */
+function lazyInstanceDetections(store: LazyDataStore): IdentityBearing[] {
+  const rowCount = (store.instancesData.instance_type ?? []).length;
+  const detections: IdentityBearing[] = [];
+  const set = (row: number, fields: IdentityBearing): void => {
+    if (row < rowCount) detections[row] = { ...detections[row], ...fields };
+  };
+  for (const [row, [idx, score]] of store._instanceIdentityLinks ?? []) {
+    const identity = store.identities?.[idx];
+    if (identity) set(row, { identity, identityScore: score });
+  }
+  for (const [row, identityEmbedding] of store._instanceEmbeddings ?? []) {
+    set(row, { identityEmbedding });
+  }
+  for (const [row, [idx, score]] of store._instanceCategoryLinks ?? []) {
+    const category = store.categoryCatalog?.[idx];
+    if (category != null) set(row, { category, categoryScore: score });
+  }
+  for (const [row, categoryEmbedding] of store._instanceCategoryEmbeddings ??
+    []) {
+    set(row, { categoryEmbedding });
+  }
+  return detections;
+}
+
 /** Whether any detection satisfies `pred` across all five modalities (used to gate
  * the identity 2.5 / category 2.7 format bumps). */
 function anyDetection(
@@ -2602,7 +2647,9 @@ function anyDetection(
   pred: (d: IdentityBearing) => boolean,
 ): boolean {
   const any = (list: IdentityBearing[]) => list.some(pred);
+  const store = labels._lazyDataStore;
   return (
+    (store != null && any(lazyInstanceDetections(store))) ||
     labels.labeledFrames.some((f) => any(f.instances as IdentityBearing[])) ||
     any(labels.masks as IdentityBearing[]) ||
     any(labels.centroids as IdentityBearing[]) ||

@@ -2112,7 +2112,11 @@ function readCentroids(
   let names: string[];
   let sources: string[];
 
-  if (file.get("centroids/x")) {
+  const centroidsDs = file.get("centroids");
+  if (!centroidsDs) return [];
+  // Go by the node itself: h5wasm returns a truthy Group for a path through a dataset,
+  // so asking for `centroids/x` can't tell the layouts apart.
+  if (isH5Group(centroidsDs)) {
     // Group layout (matches Python sleap-io).
     const col = (name: string): ArrayLike<number> =>
       (file.get(`centroids/${name}`)?.value as ArrayLike<number>) ?? [];
@@ -2145,8 +2149,6 @@ function readCentroids(
     names = strCol("name");
     sources = strCol("source");
   } else {
-    const centroidsDs = file.get("centroids");
-    if (!centroidsDs) return [];
     data = normalizeStructDataset(centroidsDs);
     categories = readStringMetadata(
       file,

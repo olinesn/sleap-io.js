@@ -268,7 +268,7 @@ self.onmessage = async function(e) {
         break;
 
       case 'getDatasetValue':
-        const data = getDatasetValue(payload.path, payload.slice);
+        const data = getDatasetValue(payload.path, payload.slice, payload.skipMembers);
         respond(id, { success: true, data }, data.transferables);
         break;
 
@@ -1287,10 +1287,17 @@ function getDatasetMeta(path) {
   if (!currentFile) throw new Error('No file open');
   const dataset = currentFile.get(path);
   if (!dataset) throw new Error('Dataset not found: ' + path);
+  let filters;
+  try {
+    filters = dataset.filters;
+  } catch (e) {
+    // an h5wasm that can't list filters; nothing to go on
+  }
   return {
     shape: dataset.shape,
     dtype: dataset.dtype,
-    metadata: dataset.metadata
+    metadata: dataset.metadata,
+    filters
   };
 }
 
@@ -1387,12 +1394,14 @@ function checkDatasetFiltersWorker(dataset, path) {
 // reaches the main thread in the same { field: array } shape as a compound table.
 // Subgroups and other shapes aren't columns. 64-bit integers become Float64Array
 // (exact below 2^53, as in readCompoundColumnsWorker); mirrors numberColumn and
-// readH5GroupColumns in ./columnar.ts (keep them in lockstep).
-function readGroupColumnsWorker(group, path) {
+// readH5GroupColumns in ./columnar.ts (keep them in lockstep). skipMembers names the
+// 1-D members that aren't columns (byte buffers), so they aren't read with the rows.
+function readGroupColumnsWorker(group, path, skipMembers) {
   const columns = {};
   const buffers = [];
   const names = group.keys();
   for (let k = 0; k < names.length; k++) {
+    if (skipMembers && skipMembers.indexOf(names[k]) !== -1) continue;
     const child = group.get(names[k]);
     if (!child || !child.shape || child.shape.length !== 1) continue;
     checkDatasetFiltersWorker(child, path + '/' + names[k]);
@@ -1411,13 +1420,13 @@ function readGroupColumnsWorker(group, path) {
   return { columns: columns, buffers: buffers };
 }
 
-function getDatasetValue(path, slice) {
+function getDatasetValue(path, slice, skipMembers) {
   if (!currentFile) throw new Error('No file open');
   const dataset = currentFile.get(path);
   if (!dataset) throw new Error('Dataset not found: ' + path);
 
   if (typeof dataset.keys === 'function' && dataset.shape === undefined) {
-    const res = readGroupColumnsWorker(dataset, path);
+    const res = readGroupColumnsWorker(dataset, path, skipMembers);
     return {
       value: { type: 'columns', columns: res.columns },
       shape: dataset.shape,

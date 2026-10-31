@@ -563,18 +563,21 @@ export class StreamingH5File {
    * reading values. `metadata` carries the layout details the in-place
    * writability gate needs — `compound_type.members` (per-member dtype class,
    * used to detect Python's non-writable enum/bool columns) and `chunks` (⇒
-   * resizable). Pass this straight to `onDiskTableFromMeta`.
+   * resizable). Pass this straight to `onDiskTableFromMeta`. `filters` lists the
+   * dataset's compression, for `checkDatasetFilters`.
    */
   async getDatasetMeta(path: string): Promise<{
     shape: number[];
     dtype: string;
     metadata?: Record<string, unknown>;
+    filters?: unknown;
   }> {
     const result = await this.send("getDatasetMeta", { path });
     const meta = result.meta as {
       shape: number[];
       dtype: string;
       metadata?: Record<string, unknown>;
+      filters?: unknown;
     };
     return meta;
   }
@@ -584,12 +587,19 @@ export class StreamingH5File {
    *
    * @param path - Path to the dataset
    * @param slice - Optional slice specification (array of [start, end] pairs)
+   * @param skipMembers - When `path` is a group of columns (SLP 3.0), the members
+   *   not to read with them, such as the table's byte buffer
    */
   async getDatasetValue(
     path: string,
     slice?: Array<[number, number] | []>,
+    skipMembers?: readonly string[],
   ): Promise<{ value: unknown; shape: number[]; dtype: string }> {
-    const result = await this.send("getDatasetValue", { path, slice });
+    const result = await this.send("getDatasetValue", {
+      path,
+      slice,
+      skipMembers,
+    });
     const data = result.data as {
       value: unknown;
       shape: number[];

@@ -101,7 +101,10 @@ async function makeFakeStreamingFile(bytes: Uint8Array): Promise<{
 
   const fake = {
     keys: () => h5.keys() as string[],
-    getKeys: async () => h5.keys() as string[],
+    getKeys: async (dp: string) => {
+      const item = get(dp) as unknown as { keys?: () => string[] } | null;
+      return item?.keys ? item.keys() : [];
+    },
     getAttrs: async (dp: string) =>
       unwrapAttrs((get(dp)?.attrs as Record<string, unknown>) ?? {}),
     getDatasetMeta: async (dp: string) => {

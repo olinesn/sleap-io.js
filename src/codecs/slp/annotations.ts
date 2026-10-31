@@ -611,6 +611,17 @@ export interface LabelImageObjectsTable {
   names: ArrayLike<string>;
 }
 
+/**
+ * Label image pixel data: a blob (1-D), or frames (3-D, with `shape` `[T, H, W]`). Frames
+ * are one flat typed array or, with `framesPerBlock`, a list of typed arrays holding that
+ * many frames each, because a lot of them fit neither in one read nor in one ArrayBuffer.
+ */
+export interface LabelImagePixels {
+  value: unknown;
+  shape: number[];
+  framesPerBlock?: number;
+}
+
 // Pixel data is eagerly materialized into a standalone Int32Array per
 // LabelImage; the HDF5 file is closed by the reader before Labels is returned.
 // label-image .data therefore has no dependency on the source file lifetime —
@@ -621,8 +632,8 @@ export function buildLabelImages(
     rows: Rows;
     columnar: boolean;
     sources: ArrayLike<string>;
-    /** The pixel data: a blob (1-D) or frames (3-D). `null` if the file has none. */
-    data: { value: unknown; shape: number[] } | null;
+    /** `null` if the file has no pixel data. */
+    data: LabelImagePixels | null;
     objects: LabelImageObjectsTable | null;
     scoreMaps: ScoreMapTable | null;
   },
@@ -741,19 +752,29 @@ export function buildLabelImages(
       // v2.2+: 3D chunked dataset [T, H, W] — frames stored sequentially by the
       // Python writer, so loop index i maps directly to the i-th frame slice.
       const frameSize = height * width;
-      if (dataChunked instanceof Int32Array) {
+      const { framesPerBlock } = data;
+      const block = framesPerBlock
+        ? dataChunked[Math.floor(i / framesPerBlock)]
+        : dataChunked;
+      const frameInBlock = framesPerBlock ? i % framesPerBlock : i;
+      if (framesPerBlock && !block) {
+        reportTableProblems(labelsPath, [
+          `/label_images has ${videoIndices.length} rows but ${dataShape[0]} frames of data`,
+        ]);
+      }
+      if (block instanceof Int32Array) {
         // Flat typed array with shape [T, H, W] — slice by frame index
         pixelData = new Int32Array(
-          dataChunked.buffer,
-          dataChunked.byteOffset + i * frameSize * 4,
+          block.buffer,
+          block.byteOffset + frameInBlock * frameSize * 4,
           frameSize,
         );
-      } else if (ArrayBuffer.isView(dataChunked)) {
+      } else if (ArrayBuffer.isView(block)) {
         // Other typed array — convert to Int32Array
-        const offset = i * frameSize;
+        const offset = frameInBlock * frameSize;
         pixelData = new Int32Array(frameSize);
         for (let p = 0; p < frameSize; p++) {
-          pixelData[p] = (dataChunked as any)[offset + p];
+          pixelData[p] = (block as any)[offset + p];
         }
       } else {
         // Fallback: array of arrays or similar

@@ -9,7 +9,7 @@ import { buildVideoIdMap } from "./video-id-map.js";
  * `video_id` is the HDF5 group id of the video (`video2/video` → 2), the same
  * id the `/frames` table uses, which sleap-io writes sparse once a video has
  * been removed. Keys stay raw here: the lazy store compares them with raw
- * `/frames` ids and copies them through on save unchanged.
+ * `/frames` ids, and a lazy save copies them through as long as those read back.
  */
 export function negativeFrameKeys(
   columns: Record<string, unknown[]>,

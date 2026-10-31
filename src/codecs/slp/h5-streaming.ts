@@ -421,9 +421,11 @@ export class StreamingH5File {
     // Initialize if not already done
     await this.init(options);
 
-    const filename = redactUrlsInText(
-      options?.filenameHint || file.name || "data.h5",
-    );
+    const name = options?.filenameHint || file.name || "data.h5";
+    // The Worker opens the file by this name, so a file's own name must arrive as it
+    // is, whatever it holds. What the Worker says about it is masked on the way back.
+    const filename =
+      name === file.name && !isUrl(name) ? name : redactUrlsInText(name);
     const result = await this.send("openLocal", { file, filename });
     this._keys = (result.keys as string[]) || [];
     this._isOpen = true;

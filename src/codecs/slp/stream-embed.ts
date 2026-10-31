@@ -15,6 +15,7 @@
  */
 import type { Labels } from "../../model/labels.js";
 import type { Video } from "../../model/video.js";
+import { maskUrlCredentials } from "../../io/remote.js";
 import type { VideoBackend, VideoFrame } from "../../video/backend.js";
 import { GrayscaleVideoBackend } from "../../video/grayscale-backend.js";
 import {
@@ -91,9 +92,9 @@ const READ_ATTEMPTS = 3;
 const READ_OPTS = { pinned: true, prefetch: false } as const;
 
 function videoName(video: Video): string {
-  return Array.isArray(video.filename)
-    ? (video.filename[0] ?? "")
-    : video.filename;
+  return maskUrlCredentials(
+    Array.isArray(video.filename) ? (video.filename[0] ?? "") : video.filename,
+  );
 }
 
 /**

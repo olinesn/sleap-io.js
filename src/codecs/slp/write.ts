@@ -33,6 +33,7 @@ import type {
   PredictedLabelImage,
 } from "../../model/label-image.js";
 import { deflate } from "pako";
+import { maskUrlCredentials, maskUrlCredentialsDeep } from "../../io/remote.js";
 import type { Identity } from "../../model/identity.js";
 import { PredictedInstance3D } from "../../model/instance3d.js";
 import type { LazyDataStore } from "../../model/lazy.js";
@@ -1928,7 +1929,9 @@ export function buildMetadataJson(labels: Labels): string {
     tracks: [],
     suggestions: [],
     negative_anchors: {},
-    provenance: labels.provenance ?? {},
+    // A reader records where the labels came from here (`filename`, a merge's
+    // `source_filename`), and a file's own provenance can quote any path.
+    provenance: maskUrlCredentialsDeep(labels.provenance ?? {}),
   };
   return JSON.stringify(metadata);
 }
@@ -2187,10 +2190,13 @@ function serializeVideo(video: Video): Record<string, unknown> {
   delete backend.crop_fill;
   delete backend.source_shape;
 
-  const entry: Record<string, unknown> = {
+  // A video's filename can be the URL it or its labels were opened from, credentials
+  // and all, because `Video.exists()` and whoever else goes back to it needs them. A
+  // file gets passed around, so they stop here. A URL saved like this no longer opens.
+  const entry: Record<string, unknown> = maskUrlCredentialsDeep({
     filename: video.filename,
     backend,
-  };
+  });
 
   // Serialize the full source_video lineage (filename + backend incl. shape +
   // any deeper chain), not just its filename, so a reload can recover the
@@ -3408,6 +3414,8 @@ function sameStringArray(a: string[] | null, b: string[] | null): boolean {
  *    NOT rewrite `tracks_json` / `suggestions_json`, so the (rewritten) instances
  *    table's `track` indices would point into a STALE `tracks_json` → silent
  *    track/suggestion corruption on reload (the HIGH bug this guards); OR
+ *  - a video's filename on disk holds a URL's credentials, from a file written
+ *    before saves masked them: only a re-save takes them out of `videos_json`; OR
  *  - the VIDEO SET changed (a video was added/removed/repointed) — the in-place
  *    writer does NOT rewrite `videos_json` or the embedded `video{i}` groups, so
  *    the (rewritten) frames table's `video` indices would point into a stale
@@ -3464,6 +3472,14 @@ export function checkInPlaceWritable(
         reason: `table "${name}" row count changed (${od.rows} → ${table.rows.length}) but the on-disk dataset is contiguous (not resizable) — re-save the whole file instead`,
       };
     }
+  }
+
+  if (sidecars.onDisk.videos?.some((v) => maskUrlCredentials(v) !== v)) {
+    return {
+      ok: false,
+      reason:
+        "videos_json holds a URL's credentials, which an in-place save would leave in the file — re-save the whole file instead",
+    };
   }
 
   // Confinement: the label tables index into tracks_json / suggestions_json /
@@ -3701,7 +3717,7 @@ async function planEmbedding(
     for (const [video] of embedMode) {
       if (!labels.videos.includes(video)) {
         throw new Error(
-          `embed lists a frame of a video that isn't in these labels: ${video.filename}`,
+          `embed lists a frame of a video that isn't in these labels: ${maskUrlCredentialsDeep(video.filename)}`,
         );
       }
     }
@@ -4135,7 +4151,7 @@ async function collectEncodedFrames(
       unreadable.slice(0, 10).join(", ") +
       (unreadable.length > 10 ? ", …" : "");
     throw new Error(
-      `Couldn't read ${unreadable.length} frame image(s) from "${name}" to embed ` +
+      `Couldn't read ${unreadable.length} frame image(s) from "${maskUrlCredentials(name)}" to embed ` +
         `(frame ${list}). The package was not written.`,
     );
   }

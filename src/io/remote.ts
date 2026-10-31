@@ -6,7 +6,9 @@
  * This is the browser+Node-portable subset of Python sleap-io's `_remote.py`
  * (PRs #439/#445). It threads auth headers end-to-end and guarantees that no
  * thrown error or log line leaks credentials (userinfo / sensitive query
- * params). See {@link redactUrl} and {@link RemoteIOError}.
+ * params). See {@link redactUrl} and {@link RemoteIOError}. Nor does a saved file
+ * (see {@link maskUrlCredentials}), which is why a URL with credentials doesn't
+ * open from one.
  *
  * @module
  */
@@ -147,6 +149,58 @@ export function redactUrlsInText(text: string): string {
   return text
     .replace(SENSITIVE_PARAM_PATTERN, "$1***")
     .replace(URL_IN_TEXT_PATTERN, (m) => redactUrl(m));
+}
+
+/** `url` as {@link redactUrl} masks it, or exactly as given if that finds nothing. */
+function maskIfCredentialed(url: string): string {
+  let asParsed: string;
+  try {
+    asParsed = new URL(url).href;
+  } catch {
+    // `redactUrl` can't read it either, and what comes before an `@` is still a password.
+    return url.replace(/^([^:]+:\/\/)[^?#]*@/, "$1***:***@");
+  }
+  const masked = redactUrl(url);
+  return masked === asParsed ? url : masked;
+}
+
+/**
+ * `value`, a path, a URL or a line of text holding one, fit to go in a file: a URL's
+ * credentials are masked and every other character stays as it was. That's the
+ * difference from {@link redactUrl}, which writes any URL back as it parses it, so a
+ * public URL or a local path saved through this comes back byte for byte.
+ *
+ * A value that is a URL as a whole is read as one, so a space or a quote can't end it
+ * early, which is what the text patterns of {@link redactUrlsInText} can't see past.
+ */
+export function maskUrlCredentials(value: string): string {
+  // Neither a param nor a password without these, and an image sequence is many names.
+  if (!value.includes("=") && !value.includes("@")) return value;
+  const whole = isUrl(value) ? maskIfCredentialed(value) : value;
+  return whole
+    .replace(SENSITIVE_PARAM_PATTERN, "$1***")
+    .replace(URL_IN_TEXT_PATTERN, maskIfCredentialed);
+}
+
+/**
+ * {@link maskUrlCredentials} on every string in what is about to be written as JSON,
+ * object keys included, reading `value` as `JSON.stringify` would. Returns a copy.
+ */
+export function maskUrlCredentialsDeep<T>(value: T): T;
+export function maskUrlCredentialsDeep(value: unknown): unknown {
+  if (typeof value === "string") return maskUrlCredentials(value);
+  if (value === null || typeof value !== "object") return value;
+  const { toJSON } = value as { toJSON?: unknown };
+  if (typeof toJSON === "function") {
+    return maskUrlCredentialsDeep(toJSON.call(value));
+  }
+  if (Array.isArray(value)) return value.map((v) => maskUrlCredentialsDeep(v));
+  return Object.fromEntries(
+    Object.entries(value).map(([key, v]) => [
+      maskUrlCredentials(key),
+      maskUrlCredentialsDeep(v),
+    ]),
+  );
 }
 
 /**

@@ -19,7 +19,8 @@ see ``gen_format_30_twins_fixture.py``) in dtype, chunking and compression.
 Also written: ``handbuilt_30_gzip.slp`` (columns compressed as with Python's
 ``compression="gzip"``, and videos that aren't embedded), ``handbuilt_30_lzf.slp``
 (the same with ``"lzf"``, which sleap-io.js refuses because its HDF5 build can't
-decompress it) and
+decompress it), ``handbuilt_30_2x_lzf.slp`` (the 2.x file with its pose tables in
+``"lzf"``) and
 ``handbuilt_30_mixed.slp`` (columnar ``/points``, the other tables in the 2.x layout).
 
 Run from this folder:
@@ -590,8 +591,8 @@ def write_session_matrices(sd):
     sd.create_dataset("instance_group_meta", data=IG_META, dtype=STR, maxshape=(None,))
 
 
-def table(f, name, rows, dtype):
-    f.create_dataset(name, data=np.array(rows, dtype=dtype))
+def table(f, name, rows, dtype, compression=None):
+    f.create_dataset(name, data=np.array(rows, dtype=dtype), compression=compression)
 
 
 LEGACY_POINT = np.dtype([("x", "f8"), ("y", "f8"), ("visible", "?"), ("complete", "?")])
@@ -625,20 +626,39 @@ def strings(f, name, values):
     f.create_dataset(name, data=list(values), dtype=h5py.special_dtype(vlen=str))
 
 
-def write_legacy(path):
+def write_legacy(path, *, compression=None):
     with h5py.File(path, "w") as f:
         common(f, format_id=2.8)
-        table(f, "points", [r[:4] for r in POINTS], LEGACY_POINT)
-        table(f, "pred_points", [r[:4] + (r[5],) for r in PRED_POINTS], LEGACY_PRED)
-        table(f, "instances", [(i,) + r for i, r in enumerate(INSTANCES)], LEGACY_INSTANCE)
+        table(f, "points", [r[:4] for r in POINTS], LEGACY_POINT, compression)
+        table(
+            f,
+            "pred_points",
+            [r[:4] + (r[5],) for r in PRED_POINTS],
+            LEGACY_PRED,
+            compression,
+        )
+        table(
+            f,
+            "instances",
+            [(i,) + r for i, r in enumerate(INSTANCES)],
+            LEGACY_INSTANCE,
+            compression,
+        )
         table(
             f,
             "frames",
             [(i, RAW_VIDEO_ID[r[0]], r[1], r[2], r[3]) for i, r in enumerate(FRAMES)],
             LEGACY_FRAME,
+            compression,
         )
         negative = [(RAW_VIDEO_ID[r[0]], r[1]) for r in FRAMES if r[4]]
-        table(f, "negative_frames", negative, [("video_id", "u4"), ("frame_idx", "u8")])
+        table(
+            f,
+            "negative_frames",
+            negative,
+            [("video_id", "u4"), ("frame_idx", "u8")],
+            compression,
+        )
 
         table(
             f,
@@ -841,5 +861,6 @@ write_30(OUT / "handbuilt_30.slp")
 write_30(OUT / "handbuilt_30_gzip.slp", compression="gzip", unknown=False, embedded=False)
 write_30(OUT / "handbuilt_30_lzf.slp", compression="lzf", unknown=False, embedded=False)
 write_legacy(OUT / "handbuilt_30_2x.slp")
+write_legacy(OUT / "handbuilt_30_2x_lzf.slp", compression="lzf")
 write_mixed(OUT / "handbuilt_30_mixed.slp")
 print("wrote", sorted(p.name for p in OUT.glob("handbuilt_30*.slp")))

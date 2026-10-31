@@ -1,5 +1,5 @@
 import type { VideoBackend, VideoFrame } from "./backend.js";
-import type { StreamingH5File } from "../codecs/slp/h5-streaming.js";
+import { hasPath, type StreamingH5File } from "../codecs/slp/h5-streaming.js";
 import {
   type EmbeddedFrameReader,
   type Hdf5Slice,
@@ -98,6 +98,10 @@ export class StreamingHdf5VideoBackend implements VideoBackend {
    * dataset attrs. Idempotent — the first getFrame() triggers it. Afterwards
    * `shape[0]` reflects the real source frame count, so the seekbar spans the
    * whole video (not just the embedded/labeled frames). No-op when not deferred.
+   *
+   * A failed read is thrown, and the next call reads again. Going on without
+   * frame_numbers would address frames by the wrong index, and a save would find no
+   * stored frames to copy.
    */
   async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
@@ -106,26 +110,26 @@ export class StreamingHdf5VideoBackend implements VideoBackend {
       const groupPath = this.datasetPath.endsWith("/video")
         ? this.datasetPath.slice(0, -6)
         : this.datasetPath;
-      try {
-        const keys = await this.h5file.getKeys(groupPath);
-        if (keys.includes("frame_numbers")) {
-          const fn = await this.h5file.getDatasetValue(
-            `${groupPath}/frame_numbers`,
-          );
-          const nums = toNumberArray(fn.value);
-          this.frameNumbers = nums;
-          this.frameNumberToIndex = new Map(nums.map((num, idx) => [num, idx]));
-        }
-        if (keys.includes("frame_sizes")) {
-          const fs = await this.h5file.getDatasetValue(
-            `${groupPath}/frame_sizes`,
-          );
-          this.frameSizes = toNumberArray(fs.value);
-        }
-      } catch {
-        /* leave frame maps empty; getFrame falls back to a direct index */
+      // Without these, frame maps stay empty and getFrame uses a direct index.
+      const keys = (await hasPath(this.h5file, groupPath))
+        ? await this.h5file.getKeys(groupPath)
+        : [];
+      if (keys.includes("frame_numbers")) {
+        const fn = await this.h5file.getDatasetValue(
+          `${groupPath}/frame_numbers`,
+        );
+        const nums = toNumberArray(fn.value);
+        this.frameNumbers = nums;
+        this.frameNumberToIndex = new Map(nums.map((num, idx) => [num, idx]));
       }
-      try {
+      if (keys.includes("frame_sizes")) {
+        const fs = await this.h5file.getDatasetValue(
+          `${groupPath}/frame_sizes`,
+        );
+        this.frameSizes = toNumberArray(fs.value);
+      }
+      // Without a dataset, keep the JSON-seeded shape.
+      if (await hasPath(this.h5file, this.datasetPath)) {
         const attrs = await this.h5file.getAttrs(this.datasetPath);
         const fmt = attrToStr(attrs.format);
         if (fmt) this.format = fmt;
@@ -149,16 +153,21 @@ export class StreamingHdf5VideoBackend implements VideoBackend {
         if (count > 0 && h > 0 && w > 0) {
           this.shape = [count, h, w, c];
         }
-      } catch {
-        /* keep the JSON-seeded shape */
       }
       this.loaded = true;
-    })();
+    })().catch((err) => {
+      this.loadPromise = null;
+      throw err;
+    });
     return this.loadPromise;
   }
 
   async getFrame(frameIndex: number): Promise<VideoFrame | null> {
-    if (!this.loaded) await this.ensureLoaded();
+    try {
+      await this.ensureLoaded();
+    } catch {
+      return null;
+    }
     // Use O(1) Map lookup; if no frame numbers provided, use frameIndex directly
     const index =
       this.frameNumberToIndex.size > 0
@@ -195,7 +204,11 @@ export class StreamingHdf5VideoBackend implements VideoBackend {
   }
 
   async getFrameBuffer(frameNumber: number): Promise<Uint8Array | null> {
-    if (!this.loaded) await this.ensureLoaded();
+    try {
+      await this.ensureLoaded();
+    } catch {
+      return null;
+    }
     const index =
       this.frameNumberToIndex.size > 0
         ? this.frameNumberToIndex.get(frameNumber)

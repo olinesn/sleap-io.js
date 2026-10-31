@@ -62,29 +62,57 @@ export async function workerFile(
 export async function readRecording(
   bytes: ArrayBuffer,
   intercept?: (type: string, path: string) => Error | undefined,
-  lazy = false,
-): Promise<{ labels: Labels; requests: Array<[string, string]> }> {
+  options: {
+    lazy?: boolean;
+    openVideos?: boolean;
+    lazyVideoMetadata?: boolean;
+  } = {},
+): Promise<{
+  labels: Labels;
+  requests: Array<[string, string]>;
+  /** The requests the worker answered with an error. */
+  refused: Array<[string, string, string]>;
+}> {
   const { file, close } = await workerFile(bytes);
   const requests: Array<[string, string]> = [];
+  const refused: Array<[string, string, string]> = [];
   const send = (file as any).send.bind(file);
-  (file as any).send = (type: string, payload: any) => {
+  (file as any).send = async (type: string, payload: any) => {
     const path = String(payload?.path ?? "");
     requests.push([type, path]);
     const failure = intercept?.(type, path);
-    return failure ? Promise.reject(failure) : send(type, payload);
+    if (failure) throw failure;
+    try {
+      return await send(type, payload);
+    } catch (err) {
+      refused.push([type, path, String((err as Error).message)]);
+      throw err;
+    }
   };
   try {
     const labels = await readFromStreamingFile(
       file,
       "mice.slp",
       undefined,
-      false,
+      options.openVideos ?? false,
       undefined,
       false,
-      lazy,
+      options.lazy ?? false,
+      options.lazyVideoMetadata ?? false,
     );
-    return { labels, requests };
+    return { labels, requests, refused };
   } finally {
     close();
   }
 }
+
+/** What the frame tables hold, in a form `toEqual` can compare. */
+export const poses = (labels: Labels) =>
+  Array.from(labels.labeledFrames).map((frame) => ({
+    frameIdx: frame.frameIdx,
+    isNegative: frame.isNegative,
+    instances: frame.instances.map((instance) => ({
+      type: instance.constructor.name,
+      points: instance.points.map((point) => point.xy),
+    })),
+  }));

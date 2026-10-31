@@ -17,7 +17,9 @@
 import { describe, it, expect } from "./bun-test";
 import { readSlpLazy } from "../src/codecs/slp/read.js";
 import { readFromStreamingFile } from "../src/codecs/slp/read-streaming.js";
+import { saveSlpToBytes } from "../src/codecs/slp/write.js";
 import type { StreamingH5File } from "../src/codecs/slp/h5-streaming.js";
+import { StreamingHdf5VideoBackend } from "../src/video/streaming-hdf5-video.js";
 import { ready, File as H5File } from "h5wasm/node";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -210,6 +212,97 @@ describe("readSlpStreaming lazyVideoMetadata option", () => {
     } finally {
       close();
     }
+  });
+
+  describe("when a per-video read fails", () => {
+    /** Fail this request of the fake until `heal` is called. */
+    function failing(fake: StreamingH5File, method: string, path: string) {
+      const real = (fake as any)[method];
+      let broken = true;
+      (fake as any)[method] = async (p: string, ...rest: unknown[]) => {
+        if (broken && p === path) throw new Error("could not read");
+        return real(p, ...rest);
+      };
+      return () => {
+        broken = false;
+      };
+    }
+
+    for (const [method, path] of [
+      ["getDatasetValue", "video0/frame_numbers"],
+      ["getKeys", "video0"],
+      ["getAttrs", "video0/video"],
+    ]) {
+      it(`${method} ${path}: not loaded, and the next call reads again`, async () => {
+        const { fake, close } = await makeCountingFake();
+        try {
+          const labels = await read(fake, { lazyVideoMetadata: true });
+          const backend = labels.videos[0]
+            .backend as unknown as DeferredBackend;
+          const heal = failing(fake, method, path);
+          await expect(backend.ensureLoaded()).rejects.toThrow(
+            "could not read",
+          );
+          expect(backend.isLoaded).toBe(false);
+
+          heal();
+          await backend.ensureLoaded();
+          expect(backend.isLoaded).toBe(true);
+          expect(backend.shape).toEqual(EXPECTED_SHAPE);
+        } finally {
+          close();
+        }
+      });
+    }
+
+    it("a frame reads as nothing, not as the frame at that index", async () => {
+      const { fake, close } = await makeCountingFake({
+        frameNumbersOverride: [100, 200],
+      });
+      try {
+        const labels = await read(fake, { lazyVideoMetadata: true });
+        const backend = labels.videos[0].backend as any;
+        failing(fake, "getDatasetValue", "video0/frame_numbers");
+        expect(await backend.getFrameBuffer(0)).toBeNull();
+        expect(await backend.getFrame(0)).toBeNull();
+      } finally {
+        close();
+      }
+    });
+
+    it("a save fails, instead of leaving the video's images out", async () => {
+      const { fake, close } = await makeCountingFake();
+      try {
+        const labels = await read(fake, { lazyVideoMetadata: true });
+        const backend = labels.videos[0].backend as any;
+        // What a save does first, to find which frames it has to copy.
+        failing(fake, "getDatasetValue", "video0/frame_numbers");
+        await expect(saveSlpToBytes(labels)).rejects.toThrow("could not read");
+        expect(backend.isLoaded).toBe(false);
+      } finally {
+        close();
+      }
+    });
+
+    it("a video with no group in the file isn't a failure", async () => {
+      const { fake, close } = await makeCountingFake();
+      try {
+        (fake as any).keys = () => [];
+        const backend = new StreamingHdf5VideoBackend({
+          filename: "test.slp",
+          h5file: fake,
+          datasetPath: "video0/video",
+          shape: [5, 10, 20, 1],
+          deferred: true,
+        });
+        await backend.ensureLoaded();
+        expect(backend.isLoaded).toBe(true);
+        expect(backend.frameNumbers).toEqual([]);
+        expect(backend.shape).toEqual([5, 10, 20, 1]);
+      } finally {
+        close();
+      }
+    });
   });
 
   it("eager path (openVideos) still reads per-video metadata at load", async () => {

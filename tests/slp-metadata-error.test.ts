@@ -258,6 +258,15 @@ describe("the streaming reader funnels through the same helpful error", () => {
     ).rejects.toThrow("stream.slp");
   });
 
+  it("doesn't call a file corrupt when reading /metadata failed", async () => {
+    const file = stubFile(async () => {
+      throw new Error("Could not read 512 bytes at offset 800 of the file.");
+    });
+    await expect(
+      readFromStreamingFile(file, "https://example.com/stream.slp"),
+    ).rejects.toThrow("Could not read 512 bytes at offset 800 of the file.");
+  });
+
   it("throws when the /metadata group is present but `json` is missing", async () => {
     // Group present (only an unrelated attr), json attr deleted — the corrupt
     // fixture scenario, but driven through the streaming code path.

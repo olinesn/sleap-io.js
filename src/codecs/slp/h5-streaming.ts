@@ -101,6 +101,27 @@ export async function serviceRangeBridge(
 }
 
 /**
+ * Whether a path exists. Each level is looked up in a listing of its parent, so a failed
+ * read is thrown, not taken for a path that isn't there. `file.keys()` lists only the
+ * root, so a root-level name costs nothing, and a nested one costs a listing per level,
+ * without reading any data.
+ * @internal
+ */
+export async function hasPath(
+  file: Pick<StreamingH5File, "keys" | "getKeys">,
+  path: string,
+): Promise<boolean> {
+  const [root, ...rest] = path.split("/").filter(Boolean);
+  if (!file.keys().includes(root)) return false;
+  let parent = root;
+  for (const part of rest) {
+    if (!(await file.getKeys(parent)).includes(part)) return false;
+    parent = `${parent}/${part}`;
+  }
+  return true;
+}
+
+/**
  * A random-access, disk-backed write target (e.g. a Tauri native file handle).
  * The write counterpart to {@link RangeSource}: a Worker's writable Emscripten
  * device pushes bytes through a SharedArrayBuffer + `Atomics` bridge (the

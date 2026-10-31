@@ -19,6 +19,8 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inflateSync } from "node:zlib";
+import { guardH5Status } from "../src/codecs/slp/h5.js";
+import { H5_WORKER_CODE } from "../src/codecs/slp/h5-worker.js";
 import { readSlp } from "../src/codecs/slp/read.js";
 import { readSlpStreaming } from "../src/codecs/slp/read-streaming.js";
 import {
@@ -105,6 +107,24 @@ const rangeSource = (bytes: Uint8Array) => ({
   size: bytes.length,
   readRange: async (offset: number, length: number) =>
     bytes.slice(offset, offset + length),
+});
+
+describe("a build of h5wasm that doesn't expose its Module or File", () => {
+  it("still starts, on this thread and in the worker", async () => {
+    expect(() => guardH5Status({} as any)).not.toThrow();
+
+    const scope: {
+      postMessage: (data: unknown) => void;
+      onmessage?: (e: { data: unknown }) => Promise<void>;
+    } = { postMessage: vi.fn() };
+    new Function("self", "importScripts", "h5wasm", H5_WORKER_CODE)(
+      scope,
+      () => {},
+      { ready: Promise.resolve(), FS: {} },
+    );
+    await scope.onmessage?.({ data: { type: "init", id: 1, payload: {} } });
+    expect(scope.postMessage).toHaveBeenCalledWith({ id: 1, success: true });
+  });
 });
 
 describe("a damaged compressed chunk, read on this thread", () => {

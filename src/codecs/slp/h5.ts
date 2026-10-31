@@ -192,7 +192,9 @@ export class FailedH5Read extends Error {}
  */
 export function guardH5Status(module: H5Module): void {
   type Call = (...args: unknown[]) => number;
-  const calls = (module as unknown as { Module: Record<string, Call> }).Module;
+  const calls = (module as unknown as { Module?: Record<string, Call> }).Module;
+  // A build that doesn't expose these has nothing here to guard.
+  if (!calls || !module.File) return;
 
   // A read that doesn't finish leaves its buffer as malloc did, and h5wasm then goes on to
   // free the strings it takes to be in there.

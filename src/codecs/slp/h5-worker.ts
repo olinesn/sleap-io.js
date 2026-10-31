@@ -363,11 +363,13 @@ async function initH5Wasm(h5wasmUrl) {
   FS.close = watchingIo(FS.close);
   // A flush is meant to put everything on its way to the file, so that a write that can't
   // be done is reported by the step that asked for it, not only when the file closes.
-  const flush = h5wasm.File.prototype.flush;
-  h5wasm.File.prototype.flush = function() {
-    flush.call(this);
-    if (flushWriteBehind) flushWriteBehind();
-  };
+  if (h5wasm.File) {
+    const flush = h5wasm.File.prototype.flush;
+    h5wasm.File.prototype.flush = function() {
+      flush.call(this);
+      if (flushWriteBehind) flushWriteBehind();
+    };
+  }
 }
 
 function watchingIo(op) {
@@ -385,6 +387,8 @@ function watchingIo(op) {
 // lockstep): make h5wasm's calls throw when HDF5 says they failed.
 function guardH5StatusWorker(h5) {
   var calls = h5.Module;
+  // A build that doesn't expose these has nothing here to guard.
+  if (!calls || !h5.File) return;
   var unfilled = null;
   function guardRead(name, what) {
     var read = calls[name];

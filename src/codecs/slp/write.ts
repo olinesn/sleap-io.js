@@ -163,11 +163,28 @@ function isRawCopyable(video: Video): boolean {
   return !!(video.hasEmbeddedImages && video.backend?.getFrameBuffer);
 }
 
+/**
+ * Add any track only its instances know about to `labels.tracks`. The tables store a
+ * track as its position in that list, so one missing from it would save as no track.
+ */
+function registerInstanceTracks(labels: Labels): void {
+  const known = new Set(labels.tracks);
+  for (const frame of labels.labeledFrames) {
+    for (const inst of frame.instances) {
+      if (inst.track && !known.has(inst.track)) {
+        known.add(inst.track);
+        labels.tracks.push(inst.track);
+      }
+    }
+  }
+}
+
 function writeSlpToFile(
   file: any,
   labels: Labels,
   plan?: EmbedPlan | null,
 ): void {
+  registerInstanceTracks(labels);
   writeMetadata(file, labels);
 
   if (plan && plan.size > 0) {
@@ -1109,6 +1126,11 @@ export class SlpStreamWriter {
           localId.set(inst as Instance, localInstId);
           const skeletonId = Math.max(0, this.skeletons.indexOf(inst.skeleton));
           const trackId = inst.track ? this.tracks.indexOf(inst.track) : -1;
+          if (inst.track && trackId < 0) {
+            throw new Error(
+              `Track "${inst.track.name}" was not in the tracks given to openSlpWriter, so it cannot be written: the track list is already in the file.`,
+            );
+          }
           const trackingScore = inst.trackingScore ?? 0;
           let type = 0;
           let score = 0;
@@ -3378,6 +3400,7 @@ export interface OnDiskSidecars {
  * byte-exact.
  */
 export function buildExpectedSidecars(labels: Labels): OnDiskSidecars {
+  registerInstanceTracks(labels);
   return {
     tracksJson: buildTracksJson(labels.tracks),
     suggestionsJson: buildSuggestionsJson(labels.suggestions, labels.videos),

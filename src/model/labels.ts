@@ -2177,11 +2177,20 @@ export class Labels {
 
           // Remap skeleton/track of instances that came from `other`.
           const instanceMemo = new Map<object, object>();
-          const mergedInstances = rawMerged.map((inst) =>
-            skeletonMap.has(inst.skeleton)
-              ? this._mapInstance(inst, skeletonMap, trackMap, instanceMemo)
-              : inst,
-          );
+          const mergedInstances = rawMerged.map((inst) => {
+            if (skeletonMap.has(inst.skeleton)) {
+              return this._mapInstance(
+                inst,
+                skeletonMap,
+                trackMap,
+                instanceMemo,
+              );
+            }
+            // "update_tracks" leaves this frame's own instances holding `other`'s
+            // Track objects, which a name match keeps out of `this.tracks`.
+            if (inst.track) inst.track = trackMap.get(inst.track) ?? inst.track;
+            return inst;
+          });
           // Repair `fromPredicted` links so a remapped user instance references
           // the remapped source prediction in this frame.
           _relinkFromPredicted(mergedInstances, instanceMemo);

@@ -11,6 +11,7 @@ import { Skeleton } from "../src/model/skeleton.js";
 import { Video } from "../src/model/video.js";
 import { Identity } from "../src/model/identity.js";
 import { Embedding } from "../src/model/embedding.js";
+import { UserCentroid } from "../src/model/centroid.js";
 import {
   Camera,
   CameraGroup,
@@ -64,6 +65,17 @@ function identityModelOutput(names = ["female", "male"], n = 3): Labels {
     skeletons: [skeleton],
     identities,
   });
+}
+
+function catalogOf(names: string[]): Identity[] {
+  return names.map((name) => new Identity({ name }));
+}
+
+function centroidOf(identity: Identity): UserCentroid {
+  const centroid = new UserCentroid({ x: 1, y: 2 });
+  centroid.identity = identity;
+  centroid.identityScore = 0.6;
+  return centroid;
 }
 
 function project(n = 3): Labels {
@@ -333,6 +345,124 @@ describe("The stream writer", () => {
     plainWriter.appendStore(plain.store);
     expect(formatOf(plainWriter.close())).toBeLessThan(0);
     unlinkSync(path);
+  });
+});
+
+describe("The stream writer, on frames and annotations", () => {
+  it("keeps them on frames appended directly", async () => {
+    const labels = identityModelOutput();
+    const writer = await openSlpWriter({
+      skeletons: labels.skeletons,
+      videos: labels.videos,
+      tracks: [],
+      identities: labels.identities,
+    });
+    writer.appendFrames(labels.labeledFrames);
+    const back = await readSlp(new Uint8Array(writer.close()).buffer, {
+      openVideos: false,
+    });
+    expectLabelled(back, 1);
+  });
+
+  it("finds a frame's identity in its catalog by name", async () => {
+    const labels = identityModelOutput();
+    const header = catalogOf(["female", "male"]);
+    const writer = await openSlpWriter({
+      skeletons: labels.skeletons,
+      videos: labels.videos,
+      tracks: [],
+      identities: header,
+    });
+    writer.appendFrames(labels.labeledFrames);
+    const back = await readSlp(new Uint8Array(writer.close()).buffer, {
+      openVideos: false,
+    });
+    expect(back.identities.map((i) => i.name)).toEqual(["female", "male"]);
+    expect(back.labeledFrames[0].instances[1].identity).toBe(
+      back.identities[1],
+    );
+  });
+
+  it("keeps an annotation's identity and category from a store", async () => {
+    const labels = identityModelOutput();
+    labels.labeledFrames[1].centroids.push(centroidOf(labels.identities[1]));
+    const lazy = await readSlpLazy(
+      (await saveSlpToBytes(labels)).buffer as ArrayBuffer,
+      { openVideos: false },
+    );
+    const writer = await openSlpWriter({
+      skeletons: lazy.skeletons,
+      videos: lazy.videos,
+      tracks: lazy.tracks,
+      identities: catalogOf(["female", "male"]),
+    });
+    writer.appendStore(lazy._lazyDataStore!);
+    const back = await readSlp(new Uint8Array(writer.close()).buffer, {
+      openVideos: false,
+    });
+    const centroid = back.labeledFrames[1].centroids[0];
+    expect(centroid.identity?.name).toBe("male");
+    expect(centroid.identityScore).toBeCloseTo(0.6);
+    expect(back.labeledFrames[0].instances[0].identity?.name).toBe("female");
+  });
+});
+
+describe("One catalog entry per identity", () => {
+  it("after copying a lazy project, opening it and saving", async () => {
+    const lazy = await readSlpLazy(
+      (await saveSlpToBytes(identityModelOutput())).buffer as ArrayBuffer,
+      { openVideos: false },
+    );
+    const copy = lazy.copy();
+    copy.materialize();
+    expect(copy.labeledFrames[0].instances[0].identity).toBe(
+      copy.identities[0],
+    );
+    const back = await reopen(copy);
+    expect(back.identities.map((i) => i.name)).toEqual(["female", "male"]);
+  });
+
+  it("after merging annotations that carry one", async () => {
+    const labels = project();
+    labels.identities.push(...catalogOf(["female"]));
+    const model = identityModelOutput();
+    model.labeledFrames[0].centroids.push(centroidOf(model.identities[0]));
+    await labels.merge(model, { video: "basename", frame: "keep_both" });
+    expect(labels.identities.map((i) => i.name)).toEqual(["female", "male"]);
+    const centroid = labels.labeledFrames[0].centroids[0];
+    expect(centroid.identity).toBe(labels.identities[0]);
+    const back = await reopen(labels);
+    expect(back.identities.map((i) => i.name)).toEqual(["female", "male"]);
+    expect(back.labeledFrames[0].centroids[0].identity?.name).toBe("female");
+  });
+
+  it("after extract, which lists them in the source's order before any save", async () => {
+    const labels = identityModelOutput();
+    labels.labeledFrames[1].centroids.push(centroidOf(labels.identities[1]));
+    labels.labeledFrames[1].instances.reverse();
+    const inds = [[labels.videos[0], 1]] as Array<[Video, number]>;
+    const extracted = labels.extract(inds, true);
+    expect(extracted.identities.map((i) => i.name)).toEqual(["female", "male"]);
+    expect(extracted.labeledFrames[0].centroids[0].identity).toBe(
+      extracted.identities[1],
+    );
+    const back = await reopen(extracted);
+    expect(back.identities.map((i) => i.name)).toEqual(["female", "male"]);
+  });
+
+  it("an instance's identity reaches the catalog when frames are given", () => {
+    const female = new Identity({ name: "female" });
+    const video = new Video({ filename: "v.mp4" });
+    const labels = new Labels({
+      labeledFrames: [
+        new LabeledFrame({
+          video,
+          frameIdx: 0,
+          instances: [detection(10, female), detection(20, female)],
+        }),
+      ],
+    });
+    expect(labels.identities).toEqual([female]);
   });
 });
 

@@ -759,6 +759,16 @@ export interface SlpWriteHeader {
   provenance?: Record<string, unknown>;
 }
 
+/** Whether a detection carries an identity, category or embedding. */
+function hasDetectionLabels(d: IdentityBearing): boolean {
+  return !!(
+    d.identity ||
+    d.identityEmbedding ||
+    d.category ||
+    d.categoryEmbedding
+  );
+}
+
 /** Per-store id offsets applied while appending (see {@link SlpStreamWriter.appendStore}). */
 export interface AppendStoreOptions {
   /** Added to each frame's (remapped) video index. */
@@ -1171,31 +1181,47 @@ export class SlpStreamWriter {
     }
   }
 
-  /** Write them, and raise `format_id` as a full save would for what they hold. */
+  /**
+   * Write them, with the identities and categories on the annotations, and raise
+   * `format_id` as a full save would for what they hold. The writer's catalog was written
+   * when it opened, so an identity is found there by name; one not there is left out.
+   */
   private writeDetectionLabels(): void {
-    if (!this.detectionLabels.length) return;
+    const onCatalog = (d: IdentityBearing): IdentityBearing =>
+      d.identity && !this.identities.includes(d.identity)
+        ? {
+            ...d,
+            identity: this.identities.find(
+              (id) => id.name === d.identity?.name,
+            ),
+          }
+        : d;
+    const owners = (list: IdentityBearing[]): IdentityBearing[] =>
+      list.some(hasDetectionLabels) ? list.map(onCatalog) : [];
     const none: IdentityBearing = {};
-    const instance = Array.from(
-      { length: this.instRows },
-      (_, i) => this.detectionLabels[i] ?? none,
-    );
     const detections: DetectionCollections = {
-      instance,
-      centroid: [],
-      mask: [],
-      bbox: [],
-      roi: [],
+      instance: this.detectionLabels.length
+        ? Array.from({ length: this.instRows }, (_, i) =>
+            onCatalog(this.detectionLabels[i] ?? none),
+          )
+        : [],
+      centroid: owners(this.pendingCentroids.anns as IdentityBearing[]),
+      mask: owners(this.pendingMasks.anns as IdentityBearing[]),
+      bbox: owners(this.pendingBboxes.anns as IdentityBearing[]),
+      roi: owners(this.pendingRois.anns as IdentityBearing[]),
     };
+    const all = ownerCollections(detections).flatMap(([, list]) => list);
+    if (!all.length) return;
     writeIdentityLinks(this.file, this.identities, detections);
     writeCategoryLinks(this.file, detections);
     writeEmbeddings(this.file, detections);
     const metadata = this.file.get("metadata");
     const was = Number(metadata.attrs.format_id?.value ?? 0);
     let formatId = was;
-    if (instance.some((d) => d.identity || d.identityEmbedding)) {
+    if (all.some((d) => d.identity || d.identityEmbedding)) {
       formatId = Math.max(formatId, 2.5);
     }
-    if (instance.some((d) => d.category || d.categoryEmbedding)) {
+    if (all.some((d) => d.category || d.categoryEmbedding)) {
       formatId = Math.max(formatId, 2.7);
     }
     if (formatId !== was) {
@@ -1247,6 +1273,9 @@ export class SlpStreamWriter {
             );
           }
           const trackingScore = inst.trackingScore ?? 0;
+          if (hasDetectionLabels(inst)) {
+            this.detectionLabels[instBase + localInstId] = inst;
+          }
           let type = 0;
           let score = 0;
           let ptStart = 0;

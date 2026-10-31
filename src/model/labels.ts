@@ -258,6 +258,12 @@ export class Labels {
             existingTracks.add(instance.track);
             this.tracks.push(instance.track);
           }
+          if (
+            instance.identity &&
+            !this.identities.includes(instance.identity)
+          ) {
+            this.identities.push(instance.identity);
+          }
         }
       }
       // Collect tracks from annotations already on frames (reuse the set).
@@ -1405,6 +1411,7 @@ export class Labels {
       newStore.videos = newVideos;
       newStore.skeletons = newSkeletons;
       newStore.tracks = newTracks;
+      newStore.identities = newIdentities;
 
       const newLazyFrames = new LazyFrameList(newStore);
 
@@ -1723,6 +1730,9 @@ export class Labels {
           seenTracks.add(inst.track);
           this.tracks.push(inst.track);
         }
+        if (inst.identity && !this.identities.includes(inst.identity)) {
+          this.identities.push(inst.identity);
+        }
       }
       // Collect tracks from nested annotations (reuse the set).
       this._collectAnnotationTracks(lf, seenTracks);
@@ -1747,12 +1757,19 @@ export class Labels {
    * @param frame - LabeledFrame whose annotations should be remapped.
    * @param videoMap - Map from old videos to new videos.
    * @param trackMap - Map from old tracks to new tracks.
+   * @param identityMap - Map from old identities to new identities.
    */
   static _remapFrameAnnotations(
     frame: LabeledFrame,
     videoMap: Map<Video, Video>,
     trackMap: Map<Track, Track>,
+    identityMap?: Map<Identity, Identity>,
   ): void {
+    const remapIdentity = (ann: { identity?: Identity | null }): void => {
+      if (ann.identity != null && identityMap?.has(ann.identity)) {
+        ann.identity = identityMap.get(ann.identity)!;
+      }
+    };
     for (const ann of [
       ...frame.centroids,
       ...frame.bboxes,
@@ -1761,6 +1778,7 @@ export class Labels {
       if (ann.track != null && trackMap.has(ann.track)) {
         ann.track = trackMap.get(ann.track)!;
       }
+      remapIdentity(ann);
     }
     for (const r of frame.rois) {
       if (r.video != null && videoMap.has(r.video)) {
@@ -1769,6 +1787,7 @@ export class Labels {
       if (r.track != null && trackMap.has(r.track)) {
         r.track = trackMap.get(r.track)!;
       }
+      remapIdentity(r);
     }
     for (const li of frame.labelImages) {
       for (const info of li.objects.values()) {
@@ -2235,7 +2254,12 @@ export class Labels {
           // Repair `fromPredicted` links to the remapped source.
           _relinkFromPredicted(newFrame.instances, instanceMemo);
           newFrame.mergeAnnotations(otherFrame); // default "keep_both"
-          Labels._remapFrameAnnotations(newFrame, videoMap, trackMap);
+          Labels._remapFrameAnnotations(
+            newFrame,
+            videoMap,
+            trackMap,
+            identityMap,
+          );
           this.append(newFrame);
           result.framesMerged += 1;
         } else {
@@ -2303,7 +2327,12 @@ export class Labels {
           }
 
           selfFrame.instances = mergedInstances;
-          Labels._remapFrameAnnotations(selfFrame, videoMap, trackMap);
+          Labels._remapFrameAnnotations(
+            selfFrame,
+            videoMap,
+            trackMap,
+            identityMap,
+          );
           result.framesMerged += 1;
         }
       }
@@ -2958,6 +2987,12 @@ export class Labels {
       })
       .map(([t]) => t);
 
+    // Keep the identity list in the same order too, as only those in use came along.
+    const identityOrder = this.identities.map((id) => id.name);
+    labels.identities.sort(
+      (a, b) => identityOrder.indexOf(a.name) - identityOrder.indexOf(b.name),
+    );
+
     // Keep the skeleton list in source order by NAME.
     const skelToInd = new Map<string, number>();
     this.skeletons.forEach((s, i) => {
@@ -3201,6 +3236,9 @@ export class Labels {
         }
         if ("track" in anyClone && anyClone.track != null) {
           anyClone.track = mapTrack(anyClone.track as Track);
+        }
+        if ("identity" in anyClone && anyClone.identity != null) {
+          anyClone.identity = mapIdentity(anyClone.identity as Identity);
         }
         // Drop instance back-refs (cannot be remapped without global identity).
         if ("instance" in anyClone) {

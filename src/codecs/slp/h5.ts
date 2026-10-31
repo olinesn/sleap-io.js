@@ -257,11 +257,11 @@ async function openH5FileBrowser(
 
   if (isFileHandle(source)) {
     const file = await source.getFile();
-    return openFromFile(module, fs, file, options);
+    return openFromFile(module, fs, file);
   }
 
   if (typeof File !== "undefined" && source instanceof File) {
-    return openFromFile(module, fs, source, options);
+    return openFromFile(module, fs, source);
   }
 
   if (source instanceof Uint8Array || source instanceof ArrayBuffer) {
@@ -359,10 +359,7 @@ async function openFromFile(
   module: H5Module,
   fs: H5FileSystem,
   file: File,
-  options?: OpenH5Options,
 ): Promise<{ file: H5File; close: () => void }> {
-  const filename = options?.filenameHint ?? file.name ?? "local.slp";
-
   // WORKERFS reads a File through FileReaderSync, which only Workers have. On the
   // main thread it mounts fine and then aborts h5wasm on the first read.
   if (
@@ -373,9 +370,15 @@ async function openFromFile(
   ) {
     const mountPath = `/slp-local-${Date.now()}`;
     fs.mkdir?.(mountPath);
-    fs.mount(fs.filesystems.WORKERFS, { files: [file] }, mountPath);
-    const filePath = `${mountPath}/${filename}`;
-    const h5file = new module.File(filePath, "r");
+    // Under a name of our own, so the path can't disagree with the mount. A hint is
+    // only for showing, and file.name needn't work as a path. The worker does the
+    // same: mountWorkerfsFile in h5-worker.ts.
+    fs.mount(
+      fs.filesystems.WORKERFS,
+      { blobs: [{ name: "local.slp", data: file }] },
+      mountPath,
+    );
+    const h5file = new module.File(`${mountPath}/local.slp`, "r");
     return {
       file: h5file,
       close: () => {

@@ -145,6 +145,24 @@ export class InstanceGroup {
    */
   declare _frameResolver?: (globalLfIdx: number) => LabeledFrame | undefined;
 
+  /**
+   * Injected resolver for one as-read ref: the instance that was at that position
+   * when the frames were read, wherever it has moved since. Non-enumerable, like
+   * {@link InstanceGroup._frameResolver}.
+   * @internal
+   */
+  declare _instanceResolver?: (
+    globalLfIdx: number,
+    instanceIdx: number,
+  ) => Instance | undefined;
+
+  /**
+   * Set once {@link instanceByCamera} has resolved the refs. From then on that map is
+   * the group, as its doc says: a member `.delete()`d or `.set()` there stays so.
+   * @internal
+   */
+  declare _refsResolved?: boolean;
+
   constructor(options: {
     instanceByCamera?: Map<Camera, Instance> | Record<string, Instance>;
     instanceRefsByCamera?: Map<Camera, [number, number]>;
@@ -196,15 +214,15 @@ export class InstanceGroup {
   get instanceByCamera(): Map<Camera, Instance> {
     if (this._instanceByCamera) return this._instanceByCamera;
     const refs = this._instanceRefsByCamera;
-    const resolver = this._frameResolver;
+    const resolver = this._instanceResolver;
     if (refs && resolver) {
       const map = new Map<Camera, Instance>();
       for (const [camera, [lfIdx, instIdx]] of refs) {
-        const lf = resolver(lfIdx);
-        const inst = lf?.instances[instIdx];
-        if (inst) map.set(camera, inst as Instance);
+        const inst = resolver(lfIdx, instIdx);
+        if (inst) map.set(camera, inst);
       }
       this._instanceByCamera = map;
+      this._refsResolved = true;
       return map;
     }
     return new Map();
@@ -406,23 +424,89 @@ export class RecordingSession {
 }
 
 /**
- * Install a lazy frame resolver onto every FrameGroup and InstanceGroup reachable
- * from `labels.sessions`. Session grouping is read BEFORE the frame store exists
- * in all readers, so this is called AFTER the `Labels` is constructed (and, for
- * the lazy reader, after `_lazyFrameList` is attached). The resolver routes
- * through `labels.frameAt(i)`, which materializes only frame `i` under the lazy
- * reader — so ref-backed groups resolve their instances/frames on first access
- * without forcing a full-table materialization.
+ * What a file's group refs mean: each frame and instance at the position it had
+ * when read. An edit moves things (deleting a detection shifts the rest of its
+ * frame, emptying a frame shifts every later frame), so a ref read later against
+ * the current lists would name a different animal. One flat array rather than one
+ * per frame, since a large multi-camera project has millions of instances.
+ */
+class ReadPositions {
+  readonly frames: LabeledFrame[];
+  private readonly instances: Instance[];
+  private readonly starts: Int32Array;
+
+  constructor(frames: LabeledFrame[]) {
+    this.frames = frames.slice();
+    this.starts = new Int32Array(frames.length + 1);
+    let n = 0;
+    for (let i = 0; i < frames.length; i++) {
+      this.starts[i] = n;
+      n += frames[i].instances.length;
+    }
+    this.starts[frames.length] = n;
+    this.instances = new Array(n);
+    let at = 0;
+    for (const frame of frames) {
+      for (const inst of frame.instances)
+        this.instances[at++] = inst as Instance;
+    }
+  }
+
+  instanceAt(lfIdx: number, instIdx: number): Instance | undefined {
+    if (lfIdx < 0 || lfIdx >= this.frames.length || instIdx < 0)
+      return undefined;
+    const at = this.starts[lfIdx] + instIdx;
+    return at < this.starts[lfIdx + 1] ? this.instances[at] : undefined;
+  }
+}
+
+function hasRefBackedGroups(sessions: RecordingSession[]): boolean {
+  for (const session of sessions) {
+    for (const frameGroup of session.frameGroupByFrameIdx.values()) {
+      for (const group of frameGroup.instanceGroups) {
+        if (group._instanceRefsByCamera) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Install lazy resolvers onto every FrameGroup and InstanceGroup reachable from
+ * `labels.sessions`. Session grouping is read BEFORE the frame store exists in all
+ * readers, so this is called AFTER the `Labels` is constructed (and, for the lazy
+ * reader, after `_lazyFrameList` is attached), and again by `materialize()`.
  *
- * The resolver is installed NON-ENUMERABLE via `Object.defineProperty`: an
+ * Under the lazy reader the resolver routes through `labels.frameAt(i)`, which
+ * materializes only frame `i`, so ref-backed groups resolve their instances/frames
+ * on first access without forcing a full-table materialization. Nothing can move a
+ * lazy frame, so its refs stay true. Once the frames are in `labels.labeledFrames`
+ * anyone can edit them, so the positions are captured here, before they can move.
+ *
+ * The resolvers are installed NON-ENUMERABLE via `Object.defineProperty`: an
  * enumerable function property would make `structuredClone(labels.sessions)` in
  * `Labels.copy()` throw `DataCloneError`.
  */
 export function injectSessionFrameResolver(labels: Labels): void {
-  const resolver = (i: number): LabeledFrame | undefined => labels.frameAt(i);
-  const install = (target: FrameGroup | InstanceGroup): void => {
-    Object.defineProperty(target, "_frameResolver", {
-      value: resolver,
+  const asRead =
+    !labels._lazyFrameList && hasRefBackedGroups(labels.sessions)
+      ? new ReadPositions(labels.labeledFrames)
+      : null;
+  const resolver = asRead
+    ? (i: number): LabeledFrame | undefined => asRead.frames[i]
+    : (i: number): LabeledFrame | undefined => labels.frameAt(i);
+  const instanceResolver = asRead
+    ? (lfIdx: number, instIdx: number): Instance | undefined =>
+        asRead.instanceAt(lfIdx, instIdx)
+    : (lfIdx: number, instIdx: number): Instance | undefined =>
+        labels.frameAt(lfIdx)?.instances[instIdx] as Instance | undefined;
+  const install = (
+    target: FrameGroup | InstanceGroup,
+    name: "_frameResolver" | "_instanceResolver",
+    value: unknown,
+  ): void => {
+    Object.defineProperty(target, name, {
+      value,
       writable: true,
       enumerable: false,
       configurable: true,
@@ -430,11 +514,186 @@ export function injectSessionFrameResolver(labels: Labels): void {
   };
   for (const session of labels.sessions) {
     for (const frameGroup of session.frameGroupByFrameIdx.values()) {
-      install(frameGroup);
+      install(frameGroup, "_frameResolver", resolver);
       for (const instanceGroup of frameGroup.instanceGroups) {
-        install(instanceGroup);
+        install(instanceGroup, "_frameResolver", resolver);
+        install(instanceGroup, "_instanceResolver", instanceResolver);
       }
     }
+  }
+}
+
+/**
+ * Whether `inst` took over from `origin`: is it, or was it copied or accepted from it,
+ * however many steps back.
+ */
+function descendsFrom(inst: Instance, origin: Instance, steps = 8): boolean {
+  if (inst === origin) return true;
+  if (steps === 0) return false;
+  return (
+    (!!inst.copyOf && descendsFrom(inst.copyOf, origin, steps - 1)) ||
+    (!!inst.fromPredicted &&
+      descendsFrom(inst.fromPredicted as Instance, origin, steps - 1))
+  );
+}
+
+/**
+ * Where group members are in the frames as they stand now. Built once for a save
+ * or a copy; call {@link startFrameGroup} before locating that frame group's members.
+ */
+export class FramePositions {
+  private readonly frames: LabeledFrame[];
+  private readonly index = new Map<LabeledFrame, number>();
+  private byFrameIdx: Map<Video, Map<number, LabeledFrame>> | null = null;
+  private byInstance: Map<Instance, [number, number]> | null = null;
+  private frameGroup: FrameGroup | null = null;
+  private taken: Set<Instance> | null = null;
+
+  constructor(frames: LabeledFrame[]) {
+    this.frames = frames;
+    for (let i = 0; i < frames.length; i++) this.index.set(frames[i], i);
+  }
+
+  startFrameGroup(frameGroup: FrameGroup): void {
+    this.frameGroup = frameGroup;
+    this.taken = null;
+  }
+
+  /** `asRead` itself, or the frame rebuilt for the same video and frame number. */
+  currentFrame(asRead: LabeledFrame): LabeledFrame | undefined {
+    if (this.index.has(asRead)) return asRead;
+    if (!this.byFrameIdx) {
+      this.byFrameIdx = new Map();
+      for (const frame of this.frames) {
+        let inner = this.byFrameIdx.get(frame.video);
+        if (!inner) {
+          inner = new Map();
+          this.byFrameIdx.set(frame.video, inner);
+        }
+        if (!inner.has(frame.frameIdx)) inner.set(frame.frameIdx, frame);
+      }
+    }
+    return this.byFrameIdx.get(asRead.video)?.get(asRead.frameIdx);
+  }
+
+  frameIndex(asRead: LabeledFrame): number | undefined {
+    const frame = this.currentFrame(asRead);
+    return frame ? this.index.get(frame) : undefined;
+  }
+
+  /**
+   * The `[frame, instance]` position of a member now, or undefined if it is gone
+   * from its frame and nothing took over from it.
+   */
+  locate(member: Instance, frame: LabeledFrame): [number, number] | undefined {
+    const current = this.currentFrame(frame);
+    if (!current) return this.anywhere(member);
+    let instIdx = current.instances.indexOf(member);
+    if (instIdx < 0) instIdx = this.findReplacement(member, current);
+    return instIdx < 0 ? undefined : [this.index.get(current)!, instIdx];
+  }
+
+  /**
+   * A member whose frame cannot be found, in whichever frame holds it now: frames
+   * rebuilt onto another video (`embed: "source"`) keep their instances.
+   */
+  private anywhere(member: Instance): [number, number] | undefined {
+    if (!this.byInstance) {
+      this.byInstance = new Map();
+      this.frames.forEach((frame, lfIdx) => {
+        frame.instances.forEach((inst, instIdx) => {
+          this.byInstance!.set(inst as Instance, [lfIdx, instIdx]);
+        });
+      });
+    }
+    return this.byInstance.get(member);
+  }
+
+  /**
+   * Where an as-read ref's instance is now. A group built by hand, with no resolver
+   * to say what its refs meant, keeps them as they are.
+   */
+  locateRef(
+    group: InstanceGroup,
+    ref: [number, number],
+  ): [number, number] | undefined {
+    if (!group._instanceResolver || !group._frameResolver) return ref;
+    const member = group._instanceResolver(ref[0], ref[1]);
+    const frame = group._frameResolver(ref[0]);
+    return member && frame ? this.locate(member, frame) : undefined;
+  }
+
+  /**
+   * The instance that took over from a member no longer in its frame. One linked to it
+   * says so outright: accepted from it (`fromPredicted`) or a copy (`copyOf`). A copy
+   * from an app that sets no link (crash recovery, say) is known by its coordinates: at
+   * least half of the member's placed nodes, exactly equal, and the most of any instance
+   * here. Only a visible node away from (0, 0) counts as placed, since files also store
+   * a missing node as (0, 0). The member is compared as it is now, so a copy from before
+   * more than half of it moved is not found, and the member is dropped: safe, unlike
+   * guessing. Only instances no other member of this frame group holds are candidates,
+   * so two members never end up on one detection.
+   */
+  private findReplacement(member: Instance, frame: LabeledFrame): number {
+    const taken = this.takenInstances();
+    const origin = member.copyOf ?? member;
+    const claim = (i: number): number => {
+      taken.add(frame.instances[i] as Instance);
+      return i;
+    };
+    for (let i = 0; i < frame.instances.length; i++) {
+      const candidate = frame.instances[i] as Instance;
+      if (!taken.has(candidate) && descendsFrom(candidate, origin)) {
+        return claim(i);
+      }
+    }
+    const placedNodes: number[] = [];
+    for (let n = 0; n < member._n; n++) {
+      const x = member._xy[2 * n];
+      const y = member._xy[2 * n + 1];
+      if (member._visible[n] && !Number.isNaN(x) && (x !== 0 || y !== 0)) {
+        placedNodes.push(n);
+      }
+    }
+    let best = -1;
+    let bestShared = 0;
+    for (let i = 0; i < frame.instances.length; i++) {
+      const candidate = frame.instances[i] as Instance;
+      if (taken.has(candidate) || candidate.skeleton !== member.skeleton) {
+        continue;
+      }
+      const xy = candidate._xy;
+      let shared = 0;
+      for (const n of placedNodes) {
+        if (
+          member._xy[2 * n] === xy[2 * n] &&
+          member._xy[2 * n + 1] === xy[2 * n + 1]
+        ) {
+          shared++;
+        }
+      }
+      if (shared > bestShared && 2 * shared >= placedNodes.length) {
+        best = i;
+        bestShared = shared;
+      }
+    }
+    return best < 0 ? -1 : claim(best);
+  }
+
+  private takenInstances(): Set<Instance> {
+    if (this.taken) return this.taken;
+    const taken = new Set<Instance>();
+    for (const group of this.frameGroup?.instanceGroups ?? []) {
+      for (const inst of group._instanceByCamera?.values() ?? [])
+        taken.add(inst);
+      for (const [lfIdx, instIdx] of group._instanceRefsByCamera?.values() ??
+        []) {
+        const inst = group._instanceResolver?.(lfIdx, instIdx);
+        if (inst) taken.add(inst);
+      }
+    }
+    this.taken = taken;
+    return taken;
   }
 }
 
@@ -442,19 +701,24 @@ function cloneInstanceGroup(
   ig: InstanceGroup,
   remapCam: (c: Camera) => Camera,
   instanceMap?: Map<Instance, Instance>,
+  positions?: FramePositions,
 ): InstanceGroup {
   let instanceByCamera: Map<Camera, Instance> | undefined;
   let instanceRefsByCamera: Map<Camera, [number, number]> | undefined;
-  if (ig._instanceRefsByCamera) {
-    // Ref-backed (disk-read): carry the index refs (remapping only the Camera
-    // keys). The concrete cache is intentionally dropped so the getter
-    // re-resolves against the COPY's frames via the re-injected resolver.
+  if (ig._instanceRefsByCamera && !(positions && ig._refsResolved)) {
+    // Ref-backed (disk-read): carry the index refs (remapping the Camera keys).
+    // The concrete cache is intentionally dropped so the getter re-resolves
+    // against the COPY's frames via the re-injected resolver. The copy's frames
+    // are the source's as they stand now, so an eager copy takes each member's
+    // current position (`positions`), not the one it was read at.
     instanceRefsByCamera = new Map();
-    for (const [c, pair] of ig._instanceRefsByCamera)
-      instanceRefsByCamera.set(remapCam(c), [pair[0], pair[1]]);
+    for (const [c, pair] of ig._instanceRefsByCamera) {
+      const now = positions ? positions.locateRef(ig, pair) : pair;
+      if (now) instanceRefsByCamera.set(remapCam(c), [now[0], now[1]]);
+    }
   } else if (ig._instanceByCamera) {
-    // Concrete in-memory group: remap Camera keys and (when available) Instance
-    // values onto the copied objects.
+    // Concrete (in-memory, or its refs resolved and perhaps since edited): remap
+    // Camera keys and (when available) Instance values onto the copied objects.
     instanceByCamera = new Map();
     for (const [c, inst] of ig._instanceByCamera)
       instanceByCamera.set(remapCam(c), instanceMap?.get(inst) ?? inst);
@@ -484,7 +748,8 @@ function cloneInstanceGroup(
  * remapped via `videoMap`. Ref-backed (disk-read) grouping is carried as refs
  * and re-resolves against the COPY once {@link injectSessionFrameResolver} runs
  * on it — the copied `labeledFrames` preserve the original's global ordering, so
- * the same indices resolve correctly. Concrete in-memory maps are carried with
+ * an eager copy passes `positions` to carry each ref at the member's current
+ * position. Concrete in-memory maps are carried with
  * Camera keys remapped and Instance/LabeledFrame values remapped via
  * `frameMap`/`instanceMap` when supplied (eager copy).
  *
@@ -498,9 +763,10 @@ export function cloneRecordingSession(
     videoMap?: Map<Video, Video>;
     frameMap?: Map<LabeledFrame, LabeledFrame>;
     instanceMap?: Map<Instance, Instance>;
+    positions?: FramePositions;
   } = {},
 ): RecordingSession {
-  const { videoMap, frameMap, instanceMap } = opts;
+  const { videoMap, frameMap, instanceMap, positions } = opts;
   const cameraMap = new Map<Camera, Camera>();
   const newCameras = session.cameraGroup.cameras.map((cam) => {
     const nc = new Camera({
@@ -532,15 +798,19 @@ export function cloneRecordingSession(
 
   const frameGroupByFrameIdx = new Map<number, FrameGroup>();
   for (const [fidx, fg] of session.frameGroupByFrameIdx) {
+    positions?.startFrameGroup(fg);
     const instanceGroups = fg.instanceGroups.map((ig) =>
-      cloneInstanceGroup(ig, remapCam, instanceMap),
+      cloneInstanceGroup(ig, remapCam, instanceMap, positions),
     );
     let labeledFrameByCamera: Map<Camera, LabeledFrame> | undefined;
     let labeledFrameRefsByCamera: Map<Camera, number> | undefined;
     if (fg._labeledFrameRefsByCamera) {
       labeledFrameRefsByCamera = new Map();
-      for (const [c, i] of fg._labeledFrameRefsByCamera)
-        labeledFrameRefsByCamera.set(remapCam(c), i);
+      for (const [c, i] of fg._labeledFrameRefsByCamera) {
+        const asRead = positions ? fg._frameResolver?.(i) : undefined;
+        const now = asRead && positions ? positions.frameIndex(asRead) : i;
+        if (now !== undefined) labeledFrameRefsByCamera.set(remapCam(c), now);
+      }
     } else if (fg._labeledFrameByCamera) {
       labeledFrameByCamera = new Map();
       for (const [c, lf] of fg._labeledFrameByCamera)

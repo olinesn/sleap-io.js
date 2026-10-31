@@ -469,6 +469,16 @@ async function openBufferFile(buffer, filename = 'data.h5') {
   };
 }
 
+// BLOCK until the main thread has answered the request in STATE. In a loop, because a
+// wake-up can belong to the last request: the main thread sets READY, then notifies, and
+// this thread may not have needed that notify, and be waiting on its next request by the
+// time it comes. Taking that for an answer would read the last request's bytes.
+function waitForBridge(state) {
+  while (Atomics.load(rangeControl, 0) === state) {
+    Atomics.wait(rangeControl, 0, state);
+  }
+}
+
 // B-seam: request [offset, offset+want) from the main thread and BLOCK the worker
 // until it writes the bytes back into the shared data area and wakes us. Returns a
 // view over the shared data area (valid only until the next bridgeRead) — callers
@@ -481,7 +491,7 @@ function bridgeRead(offset, length, target) {
   var want = length < rangeMaxChunk ? length : rangeMaxChunk;
   Atomics.store(rangeControl, 0, 1);                                  // STATE = REQUEST
   self.postMessage({ type: 'rangeRequest', target: target, offset: offset, length: want });
-  Atomics.wait(rangeControl, 0, 1);                                  // block until STATE != REQUEST
+  waitForBridge(1);
   var got = Atomics.load(rangeControl, 1);                           // RETLEN (acquire)
   return rangeData.subarray(0, got);
 }
@@ -595,7 +605,7 @@ function bridgeWrite(fileOffset, buffer, bufOffset, length, target) {
     rangeData.set(buffer.subarray(bufOffset + written, bufOffset + written + want), 0);
     Atomics.store(rangeControl, 0, 3);                                   // STATE = WRITE_REQUEST
     self.postMessage({ type: 'writeRequest', target: target, offset: fileOffset + written, length: want });
-    Atomics.wait(rangeControl, 0, 3);                                    // block until != WRITE_REQUEST
+    waitForBridge(3);
     if (Atomics.load(rangeControl, 1) !== 0) {
       throw new Error('bridgeWrite failed at offset ' + (fileOffset + written));
     }
@@ -608,7 +618,7 @@ function bridgeWrite(fileOffset, buffer, bufOffset, length, target) {
 function bridgeTruncate(len, target) {
   Atomics.store(rangeControl, 0, 4);                                     // STATE = TRUNCATE_REQUEST
   self.postMessage({ type: 'truncateRequest', target: target, length: len });
-  Atomics.wait(rangeControl, 0, 4);
+  waitForBridge(4);
   if (Atomics.load(rangeControl, 1) !== 0) throw new Error('bridgeTruncate failed at len ' + len);
 }
 

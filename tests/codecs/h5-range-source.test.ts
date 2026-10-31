@@ -15,6 +15,7 @@ import {
   serviceRangeBridge,
   type RangeSource,
 } from "../../src/codecs/slp/h5-streaming.js";
+import { H5_WORKER_CODE } from "../../src/codecs/slp/h5-worker.js";
 
 describe("RangeSource (#193 B-seam range reader)", () => {
   describe("isRangeSource", () => {
@@ -37,6 +38,48 @@ describe("RangeSource (#193 B-seam range reader)", () => {
         false,
       ); // no size
       expect(isRangeSource({ size: "10", readRange: () => {} })).toBe(false); // wrong types
+    });
+  });
+
+  describe("the worker's wait", () => {
+    // The main thread sets READY, then notifies. A worker that didn't need that notify
+    // can be waiting on its next request when it comes, and read the last answer as this
+    // one: 8 of 300 healthy reads of a 3.0 file failed that way, some with made-up
+    // errors such as "/frames video is not one of the 0 videos".
+    it("isn't fooled by a wake-up from the last request", () => {
+      const sab = new SharedArrayBuffer(32 + 64);
+      const control = new Int32Array(sab, 0, 8);
+      const data = new Uint8Array(sab, 32);
+      data.set([1, 1, 1, 1]);
+      control[0] = 2; // the last request's answer: 4 bytes of ones
+      control[1] = 4;
+
+      let waits = 0;
+      const atomics = {
+        load: Atomics.load,
+        store: Atomics.store,
+        wait: () => {
+          waits += 1;
+          if (waits === 1) return "ok"; // the last request's notify, late
+          data.set([9, 9]); // this request's answer
+          control[1] = 2;
+          control[0] = 2;
+          return "ok";
+        },
+      };
+      const self: any = { postMessage: () => {} };
+      const bridgeRead = new Function(
+        "self",
+        "Atomics",
+        `${H5_WORKER_CODE}
+        rangeControl = arguments[2];
+        rangeData = arguments[3];
+        rangeMaxChunk = rangeData.length;
+        return bridgeRead;`,
+      )(self, atomics, control, data);
+
+      expect(Array.from(bridgeRead(0, 8))).toEqual([9, 9]);
+      expect(waits).toBe(2);
     });
   });
 

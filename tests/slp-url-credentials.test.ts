@@ -32,6 +32,7 @@ import {
 import { H5_WORKER_CODE } from "../src/codecs/slp/h5-worker.js";
 import { cannotOpenAsHdf5Message } from "../src/codecs/slp/h5.js";
 import { redactUrl } from "../src/io/remote.js";
+import { SIGNED_QUERIES, shownPart, signedQuery } from "./signed-url-fixtures";
 
 const fixture = (name: string) =>
   new Uint8Array(
@@ -71,8 +72,11 @@ const server = {
   unreachable: false,
   /** Range reads from here on fail, which the file's first read doesn't reach. */
   failsFrom: Number.POSITIVE_INFINITY,
+  /** Every URL asked for, as it was asked for. */
+  asked: [] as string[],
 
   answer({ method, url, range }: Request) {
+    server.asked.push(url);
     const nothing = new Uint8Array(0);
     const bytes = FILES[new URL(url).pathname.replace(/\/$/, "")];
     if (!bytes) return { status: 404, headers: {}, body: nothing };
@@ -294,6 +298,7 @@ beforeEach(() => {
   server.refusesHead = false;
   server.unreachable = false;
   server.failsFrom = Number.POSITIVE_INFINITY;
+  server.asked = [];
   ScriptedWorker.answer = () => ({ success: true });
   vi.stubGlobal("XMLHttpRequest", XhrStandIn);
   vi.stubGlobal("fetch", fetchStandIn);
@@ -586,6 +591,114 @@ describe("what a Worker reports", () => {
   });
 });
 
+describe("masking changes what's said, not what's asked for", () => {
+  it("a signed URL opens, and every request carries it as it was given", async () => {
+    for (const { query } of SIGNED_QUERIES) {
+      const url = `${GOOD}?${query}`;
+      for (const read of [
+        async () =>
+          (await readSlpStreaming(url, { openVideos: false })).labeledFrames
+            .length,
+        async () => (await loadSlp(url, { openVideos: false })).length,
+      ]) {
+        server.asked = [];
+        expect(await read()).toBe(1);
+        expect(server.asked.length).toBeGreaterThan(0);
+        for (const asked of server.asked) expect(asked).toBe(url);
+      }
+    }
+  });
+
+  it("nor does a name that's only sometimes a secret change what's asked for", async () => {
+    const url = `${GOOD}?key=a/b.slp&v=2`;
+    const labels = await readSlpStreaming(url, { openVideos: false });
+    expect(labels.labeledFrames.length).toBe(1);
+    expect(new Set(server.asked)).toEqual(new Set([url]));
+  });
+
+  // What the Worker opens a picked file by has to be the file's own name.
+  const OWN_NAMES = [
+    "labels.slp?token=abc",
+    "labels.slp?X-Amz-Signature=abc",
+    "labels.slp?key=abc",
+    "labels.slp&key=abc",
+    "a#sig=b.slp",
+    "a#key=b.slp",
+    // What wget calls what it fetched from a signed URL.
+    "labels.slp?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=abc%2F20261031&X-Amz-Date=20261031T092209Z",
+  ];
+  const GOOD_BYTES = FILES["/good.slp"];
+
+  it("a picked file opens whatever its own name holds", async () => {
+    for (const name of OWN_NAMES) {
+      for (const read of [
+        async () =>
+          (
+            await readSlpStreaming(new PickedFile(GOOD_BYTES, name), {
+              openVideos: false,
+            })
+          ).labeledFrames.length,
+        async () =>
+          (
+            await readSlpStreaming(new PickedFile(GOOD_BYTES, name), {
+              openVideos: false,
+              filenameHint: name,
+            })
+          ).labeledFrames.length,
+        async () =>
+          (
+            await loadSlp(new PickedFile(GOOD_BYTES, name), {
+              openVideos: false,
+            })
+          ).length,
+      ]) {
+        expect(await read()).toBe(1);
+      }
+    }
+  });
+
+  it("and what's said about it is masked", async () => {
+    quietConsole();
+    for (const name of OWN_NAMES) {
+      const message = await messageOf(
+        readSlpStreaming(new PickedFile(JUNK_BYTES, name), {
+          openVideos: false,
+        }),
+      );
+      expect(message).toContain("Could not open");
+      expect(message).toContain("***");
+      expect(message).not.toContain("abc");
+    }
+  });
+
+  it("the Worker is sent a file's own name, and only that as it is", async () => {
+    vi.stubGlobal("Worker", ScriptedWorker);
+    const sent = async (file: File, filenameHint?: string) => {
+      await new StreamingH5File().openLocal(file, { filenameHint });
+      return ScriptedWorker.last.sent.find((m) => m.type === "openLocal")
+        ?.payload?.filename;
+    };
+    for (const name of OWN_NAMES) {
+      const file = new PickedFile(JUNK_BYTES, name);
+      expect(await sent(file)).toBe(name);
+      expect(await sent(file, name)).toBe(name);
+      expect(await sent(new PickedFile(JUNK_BYTES, "a.slp"), name)).not.toBe(
+        name,
+      );
+    }
+  });
+
+  it("a buffer goes by its hint, masked, and opens", async () => {
+    for (const filenameHint of OWN_NAMES) {
+      const labels = await readSlpStreaming(GOOD_BYTES.slice(), {
+        openVideos: false,
+        filenameHint,
+      });
+      expect(labels.labeledFrames.length).toBe(1);
+    }
+  });
+});
+
 // These abort h5wasm in the middle of an open, as the browser does. It goes on working,
 // but they come last.
 describe("a URL that fails", () => {
@@ -755,6 +868,100 @@ describe("a URL that fails", () => {
     );
     await scope.onmessage?.({ data: { type: "init", id: 1, payload: {} } });
     expect(scope.postMessage).toHaveBeenCalledWith({ id: 1, success: true });
+  });
+
+  describe("a signed URL or an API key", () => {
+    const LONG_PATH = `${ORIGIN}/${"a".repeat(600)}/missing.slp`;
+
+    it("doesn't show when the file isn't there, and the rest of the URL does", async () => {
+      quietConsole();
+      for (const { query, secrets, kept } of SIGNED_QUERIES) {
+        const message = await failureOf(`${MISSING}?${query}`);
+        expect(message).toContain(`Couldn't load ${MISSING}?`);
+        expect(message).toContain("Status: 404");
+        expect(shownPart(message, secrets)).toBeNull();
+        for (const param of kept) expect(message).toContain(param);
+      }
+    });
+
+    it("from a server that refuses HEAD", async () => {
+      quietConsole();
+      server.refusesHead = true;
+      for (const { query, secrets } of SIGNED_QUERIES) {
+        const message = await failureOf(`${GOOD}?${query}`);
+        expect(message).toContain("Status: 403");
+        expect(shownPart(message, secrets)).toBeNull();
+      }
+    });
+
+    it("whichever reader was asked", async () => {
+      quietConsole();
+      for (const { query, secrets } of SIGNED_QUERIES) {
+        const url = `${MISSING}?${query}`;
+        for (const read of [
+          () => loadSlp(url, { openVideos: false }),
+          () => loadSlp(url, { openVideos: false, h5: { stream: "range" } }),
+          () => openH5Worker(url),
+        ]) {
+          const message = await messageOf(read());
+          expect(message).toContain("404");
+          expect(shownPart(message, secrets)).toBeNull();
+        }
+      }
+    });
+
+    it("when a read fails after the file opened", async () => {
+      quietConsole();
+      for (const name of ["S3", "Cloud Storage"]) {
+        const { query, secrets } = signedQuery(name);
+        server.failsFrom = Number.POSITIVE_INFINITY;
+        const file = await openH5Worker(`${BIG}?${query}`);
+        server.failsFrom = 1024 * 1024;
+        const message = await messageOf(file.getDatasetValue("pred_points"));
+        await file.close();
+        expect(message).toContain("Status: 500");
+        expect(shownPart(message, secrets)).toBeNull();
+      }
+    });
+
+    it("when the server goes away, in the browser's words", async () => {
+      quietConsole();
+      server.unreachable = true;
+      for (const { query, secrets } of SIGNED_QUERIES) {
+        for (const path of [MISSING, LONG_PATH]) {
+          const message = await failureOf(`${path}?${query}`);
+          expect(message).toContain("Failed to load");
+          expect(shownPart(message, secrets)).toBeNull();
+        }
+      }
+    });
+
+    it("when the browser's cut takes a long value's name with it", async () => {
+      quietConsole();
+      server.unreachable = true;
+      for (const [name, lost] of [
+        ["Cloud Storage", "X-Goog-Signature="],
+        ["S3 with a session token", "X-Amz-Security-Token="],
+        ["S3's older form with a session token", "x-amz-security-token="],
+      ]) {
+        const { query, secrets } = signedQuery(name);
+        const url = `${LONG_PATH}?${query}`;
+        // Going by the names alone would leave what follows the cut.
+        expect(asChromiumQuotes(url)).not.toContain(lost);
+        expect(shownPart(asChromiumQuotes(url), secrets)).not.toBeNull();
+
+        const message = await failureOf(url);
+        expect(message).toContain(`Failed to load '${ORIGIN}/aaa`);
+        expect(message).toEndWith("...***'.");
+        expect(shownPart(message, secrets)).toBeNull();
+      }
+    });
+
+    it("what an ordinary key costs: its value in a message", async () => {
+      quietConsole();
+      const message = await failureOf(`${MISSING}?key=a/b.slp&v=2`);
+      expect(message).toContain(`Couldn't load ${MISSING}?key=***&v=2.`);
+    });
   });
 
   it("the Worker can still read the next URL", async () => {

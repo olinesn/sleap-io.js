@@ -1,13 +1,11 @@
 /**
  * RangeSource / B-seam range bridge (#193).
  *
- * The full lazy `RangeSource` path (Emscripten custom device + Worker +
- * `Atomics.wait`) is browser/Worker-gated and unreachable in the headless test
- * runner — it is verified end-to-end in the app. These tests cover the two
- * pieces that ARE reachable without a Worker: the `isRangeSource` type guard
- * and the main-thread `serviceRangeBridge` protocol (byte copy, RETLEN/READY
- * publication order, data-area clamping, EOF short reads, and error → 0 bytes),
- * driven over a real `SharedArrayBuffer`.
+ * These tests cover the two pieces that need no Worker: the `isRangeSource` type
+ * guard and the main-thread `serviceRangeBridge` protocol (byte copy, RETLEN/READY
+ * publication order, data-area clamping, EOF short reads, and error → a length of
+ * -1), driven over a real `SharedArrayBuffer`. The full path (Emscripten custom
+ * device + Worker + `Atomics.wait`) is in `slp-range-source-failed-reads.test.ts`.
  */
 import { describe, it, expect } from "../bun-test";
 import {
@@ -152,7 +150,7 @@ describe("RangeSource (#193 B-seam range reader)", () => {
       expect(control[1]).toBe(2); // actual bytes returned, not the requested 16
     });
 
-    it("signals 0 bytes + READY on reader error (worker unblocks, no hang)", async () => {
+    it("signals -1 + READY on reader error (worker unblocks, no hang)", async () => {
       const { control, dataArea } = makeBridge();
       control[0] = 1;
       const origError = console.error;
@@ -171,7 +169,7 @@ describe("RangeSource (#193 B-seam range reader)", () => {
         console.error = origError;
       }
       expect(control[0]).toBe(2); // READY — the blocked Worker is woken
-      expect(control[1]).toBe(0); // 0 bytes -> clean EOF / short read
+      expect(control[1]).toBe(-1); // not 0: that would read as the end of the file
     });
   });
 });

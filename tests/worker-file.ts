@@ -1,10 +1,13 @@
 /**
  * The streaming reader's real worker code and real `StreamingH5File`, for tests.
  *
- * `readSlpStreaming` needs a browser Worker, so these run the worker over h5wasm/node
- * with only the message channel replaced. What a browser adds is the `postMessage`
- * boundary and the byte source.
+ * `readSlpStreaming` needs a browser Worker, so `workerFile` and `readRecording` run the
+ * worker over h5wasm/node with only the message channel replaced. What a browser adds is
+ * the `postMessage` boundary and the byte source. `onRealWorkerThreads` adds the boundary
+ * back, which the range bridge needs: its worker blocks until the main thread answers.
  */
+import { fileURLToPath } from "node:url";
+import { afterAll, beforeAll } from "./bun-test";
 import { ready, File as H5File } from "h5wasm/node";
 import { readFromStreamingFile } from "../src/codecs/slp/read-streaming.js";
 import { StreamingH5File } from "../src/codecs/slp/h5-streaming.js";
@@ -116,3 +119,30 @@ export const poses = (labels: Labels) =>
       points: instance.points.map((point) => point.xy),
     })),
   }));
+
+/** What `h5wasmUrl` is for a worker on a real thread: a path, read by the preload. */
+export const H5WASM_ON_THREAD = fileURLToPath(
+  new URL("../node_modules/h5wasm/dist/iife/h5wasm.js", import.meta.url),
+);
+
+/**
+ * Give the tests in a `describe` real worker threads, so `readSlpStreaming`,
+ * `StreamingH5File` and `StreamingH5Writer` run as they do in a browser, blocking on the
+ * real shared-memory bridge. Pass `h5wasmUrl: H5WASM_ON_THREAD`.
+ */
+export function onRealWorkerThreads(): void {
+  const original = globalThis.Worker;
+  const preload = fileURLToPath(
+    new URL("./worker-thread-preload.ts", import.meta.url),
+  );
+  beforeAll(() => {
+    globalThis.Worker = class extends original {
+      constructor(url: string | URL, options?: WorkerOptions) {
+        super(url, { ...options, preload: [preload] } as WorkerOptions);
+      }
+    } as typeof Worker;
+  });
+  afterAll(() => {
+    globalThis.Worker = original;
+  });
+}

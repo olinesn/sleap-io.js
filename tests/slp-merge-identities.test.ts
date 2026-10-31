@@ -18,8 +18,8 @@ import {
   InstanceGroup,
   RecordingSession,
 } from "../src/model/camera.js";
-import { readSlp } from "../src/codecs/slp/read.js";
-import { saveSlpToBytes } from "../src/codecs/slp/write.js";
+import { readSlp, readSlpLazy } from "../src/codecs/slp/read.js";
+import { openSlpWriter, saveSlpToBytes } from "../src/codecs/slp/write.js";
 
 const skeleton = new Skeleton({ nodes: ["a", "b"], edges: [["a", "b"]] });
 
@@ -234,6 +234,105 @@ describe("Labels.copy() and extract()", () => {
       expect(back.labeledFrames[0].instances[1].identity?.name).toBe("male");
       expect(back.identities.map((i) => i.name)).toEqual(["female", "male"]);
     }
+  });
+});
+
+describe("The stream writer", () => {
+  const storeOf = async (labels: Labels) => {
+    const bytes = await saveSlpToBytes(labels);
+    const lazy = await readSlpLazy(bytes.buffer as ArrayBuffer, {
+      openVideos: false,
+    });
+    return { lazy, store: lazy._lazyDataStore! };
+  };
+
+  it("keeps a store's identities, categories, scores and embeddings", async () => {
+    const { lazy, store } = await storeOf(identityModelOutput());
+    const writer = await openSlpWriter({
+      skeletons: lazy.skeletons,
+      videos: lazy.videos,
+      tracks: lazy.tracks,
+      identities: lazy.identities,
+    });
+    writer.appendStore(store);
+    const bytes = writer.close();
+    expectLabelled(
+      await readSlp(new Uint8Array(bytes).buffer, { openVideos: false }),
+      2,
+    );
+  });
+
+  it("puts them on the right rows after an earlier store and a skipped frame", async () => {
+    const first = await storeOf(identityModelOutput(["female", "male"], 2));
+    const second = await storeOf(identityModelOutput(["female", "male"], 3));
+    const writer = await openSlpWriter({
+      skeletons: first.lazy.skeletons,
+      videos: first.lazy.videos,
+      tracks: [],
+      identities: first.lazy.identities,
+    });
+    writer.appendStore(first.store);
+    writer.appendStore(second.store);
+    const back = await readSlp(new Uint8Array(writer.close()).buffer, {
+      openVideos: false,
+    });
+    expect(back.labeledFrames).toHaveLength(3);
+    for (let f = 0; f < 3; f++) expectLabelled(back, f);
+  });
+
+  it("follows identityMap, and leaves out what its catalog lacks", async () => {
+    const { lazy, store } = await storeOf(identityModelOutput());
+    const renamed = new Identity({ name: "renamed" });
+    const writer = await openSlpWriter({
+      skeletons: lazy.skeletons,
+      videos: lazy.videos,
+      tracks: lazy.tracks,
+      identities: [renamed],
+    });
+    writer.appendStore(store, {
+      identityMap: new Map([[lazy.identities[0], renamed]]),
+    });
+    const back = await readSlp(new Uint8Array(writer.close()).buffer, {
+      openVideos: false,
+    });
+    const [a, b] = back.labeledFrames[0].instances;
+    expect(a.identity?.name).toBe("renamed");
+    expect(b.identity ?? null).toBeNull();
+  });
+
+  it("raises the format for what it wrote, and writes nothing for a store with none", async () => {
+    const { lazy, store } = await storeOf(identityModelOutput());
+    const writer = await openSlpWriter({
+      skeletons: lazy.skeletons,
+      videos: lazy.videos,
+      tracks: lazy.tracks,
+      identities: lazy.identities,
+    });
+    writer.appendStore(store);
+    const { ready, File: H5File } = await import("h5wasm/node");
+    const { writeFileSync, unlinkSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    await ready;
+    const path = `${tmpdir()}/stream-labels-${process.pid}.slp`;
+    const formatOf = (b: Uint8Array): number => {
+      writeFileSync(path, b);
+      const f = new H5File(path, "r");
+      const id = Number(f.get("metadata").attrs.format_id.value);
+      const links = !!f.get("identity/links");
+      f.close();
+      return links ? id : -id;
+    };
+    expect(formatOf(writer.close())).toBeGreaterThanOrEqual(2.7);
+
+    const plain = await storeOf(project());
+    const plainWriter = await openSlpWriter({
+      skeletons: plain.lazy.skeletons,
+      videos: plain.lazy.videos,
+      tracks: plain.lazy.tracks,
+    });
+    plainWriter.appendStore(plain.store);
+    expect(formatOf(plainWriter.close())).toBeLessThan(0);
+    unlinkSync(path);
   });
 });
 

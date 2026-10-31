@@ -769,6 +769,12 @@ export interface AppendStoreOptions {
   skeletonOffset?: number;
   /** Frames per append window (defaults to {@link DEFAULT_WRITE_WINDOW_FRAMES}). */
   windowFrames?: number;
+  /**
+   * The store's identities on the writer's catalog. An identity not in it is found in
+   * the catalog by name; one not there either cannot be written (the catalog is written
+   * when the writer opens), so its links are left out.
+   */
+  identityMap?: Map<Identity, Identity>;
 }
 
 /**
@@ -852,12 +858,22 @@ export class SlpStreamWriter {
     ctx: [number, number][];
   } = { anns: [], ctx: [] };
 
+  // Identity, category and embeddings of each written instance row that has any, by
+  // row. Kept from the stores and written at finalize, like the annotations above.
+  private detectionLabels: IdentityBearing[] = [];
+  private identities: Identity[];
+
   /** @internal — use {@link openSlpWriter}. */
   constructor(
     module: any,
     file: any,
     memPath: string,
-    header: { videos: Video[]; skeletons: Skeleton[]; tracks: Track[] },
+    header: {
+      videos: Video[];
+      skeletons: Skeleton[];
+      tracks: Track[];
+      identities?: Identity[];
+    },
   ) {
     this.module = module;
     this.file = file;
@@ -865,6 +881,7 @@ export class SlpStreamWriter {
     this.videos = header.videos;
     this.skeletons = header.skeletons;
     this.tracks = header.tracks;
+    this.identities = header.identities ?? [];
   }
 
   /**
@@ -1101,10 +1118,89 @@ export class SlpStreamWriter {
         outIdxOf,
         skippedKeys,
       );
+      this.collectDetectionLabels(store, instBase, outIdxOf, opts);
     } catch (e) {
       // A mid-write failure leaves a partial file — release it rather than leak.
       this.dispose();
       throw e;
+    }
+  }
+
+  /** Keep what `store`'s instances carry beyond their poses, by written row. */
+  private collectDetectionLabels(
+    store: LazyDataStore,
+    instBase: number,
+    outIdxOf: (idx: number) => number | null,
+    opts?: AppendStoreOptions,
+  ): void {
+    const row = (idx: number): IdentityBearing | null => {
+      const out = outIdxOf(idx);
+      if (out === null) return null;
+      this.detectionLabels[instBase + out] ??= {};
+      return this.detectionLabels[instBase + out];
+    };
+    for (const [idx, [identityIdx, score]] of store._instanceIdentityLinks ??
+      []) {
+      const source = store.identities?.[identityIdx];
+      if (!source) continue;
+      const identity =
+        opts?.identityMap?.get(source) ??
+        this.identities.find((id) => id.name === source.name);
+      const detection = identity ? row(idx) : null;
+      if (detection) {
+        detection.identity = identity;
+        detection.identityScore = score;
+      }
+    }
+    for (const [idx, embedding] of store._instanceEmbeddings ?? []) {
+      const detection = row(idx);
+      if (detection) detection.identityEmbedding = embedding;
+    }
+    for (const [idx, [categoryIdx, score]] of store._instanceCategoryLinks ??
+      []) {
+      const category = store.categoryCatalog?.[categoryIdx];
+      const detection = category ? row(idx) : null;
+      if (detection) {
+        detection.category = category;
+        detection.categoryScore = score;
+      }
+    }
+    for (const [idx, embedding] of store._instanceCategoryEmbeddings ?? []) {
+      const detection = row(idx);
+      if (detection) detection.categoryEmbedding = embedding;
+    }
+  }
+
+  /** Write them, and raise `format_id` as a full save would for what they hold. */
+  private writeDetectionLabels(): void {
+    if (!this.detectionLabels.length) return;
+    const none: IdentityBearing = {};
+    const instance = Array.from(
+      { length: this.instRows },
+      (_, i) => this.detectionLabels[i] ?? none,
+    );
+    const detections: DetectionCollections = {
+      instance,
+      centroid: [],
+      mask: [],
+      bbox: [],
+      roi: [],
+    };
+    writeIdentityLinks(this.file, this.identities, detections);
+    writeCategoryLinks(this.file, detections);
+    writeEmbeddings(this.file, detections);
+    const metadata = this.file.get("metadata");
+    const was = Number(metadata.attrs.format_id?.value ?? 0);
+    let formatId = was;
+    if (instance.some((d) => d.identity || d.identityEmbedding)) {
+      formatId = Math.max(formatId, 2.5);
+    }
+    if (instance.some((d) => d.category || d.categoryEmbedding)) {
+      formatId = Math.max(formatId, 2.7);
+    }
+    if (formatId !== was) {
+      metadata.delete_attribute("format_id");
+      metadata.create_attribute("format_id", formatId);
     }
   }
 
@@ -1437,6 +1533,7 @@ export class SlpStreamWriter {
   /** Write pending `negative_frames` and close the HDF5 file (shared finalize). */
   private finalizeFile(): void {
     this.writePendingAnnotations();
+    this.writeDetectionLabels();
     if (this.negativeFrames.size > 0) {
       const rows: number[][] = [];
       for (const key of this.negativeFrames) {
@@ -1634,6 +1731,7 @@ export async function openSlpWriter(
     videos: header.videos,
     skeletons: header.skeletons,
     tracks: header.tracks ?? [],
+    identities: header.identities ?? [],
   });
 }
 

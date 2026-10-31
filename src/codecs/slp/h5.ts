@@ -178,9 +178,12 @@ export async function getH5Module(): Promise<H5Module> {
 export class FailedH5Read extends Error {}
 
 /**
- * Make h5wasm's reads throw when HDF5 says they failed. h5wasm drops what they return,
+ * Make h5wasm's calls throw when HDF5 says they failed. h5wasm drops what they return,
  * so a read HDF5 gave up on (a damaged compressed chunk, say) hands back whatever was in
- * the buffer.
+ * the buffer, and a write it couldn't finish looks done. `create_dataset` and
+ * `create_attribute` can't be covered: what they return is their last cleanup's status.
+ * `resize_dataset` is left alone, because its callers read the shape back and say what to
+ * do about a table that can't grow.
  *
  * Worker code can't import this; `guardH5StatusWorker` in ./h5-worker.ts is the same
  * (keep them in lockstep).
@@ -218,7 +221,28 @@ export function guardH5Status(module: H5Module): void {
     if (args[3] === unfilled) return 0;
     return reclaim.apply(this, args);
   };
+
+  for (const name of ["set_dataset_data", "flush"]) {
+    const write = calls[name];
+    calls[name] = function (this: unknown, ...args) {
+      const status = write.apply(this, args);
+      if (status < 0) throw new Error(FAILED_WRITE_MESSAGE);
+      return status;
+    };
+  }
+
+  const prototype = module.File.prototype;
+  const close = prototype.close;
+  prototype.close = function (this: H5File) {
+    const status = close.call(this);
+    // Nothing is at stake on a file opened for reading.
+    if (status < 0 && this.mode !== "r") throw new Error(FAILED_WRITE_MESSAGE);
+    return status;
+  };
 }
+
+const FAILED_WRITE_MESSAGE =
+  "Could not finish writing the file: HDF5 reported a failed write, so it may be incomplete.";
 
 /**
  * The underlying Emscripten `Module` from h5wasm — its low-level

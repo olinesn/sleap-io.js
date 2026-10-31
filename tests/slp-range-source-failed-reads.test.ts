@@ -343,7 +343,7 @@ describe("a save reading through the bridge", () => {
     expect(await rejection(writer.appendEmbeddedVideos([copy]))).toMatch(
       FAILED_READ,
     );
-    await writer.close();
+    expect(await rejection(writer.close())).toMatch(FAILED_READ);
   });
 
   it("a failed read of the file being saved in place rejects, and stops writing to it", async () => {
@@ -367,7 +367,7 @@ describe("a save reading through the bridge", () => {
       ),
     ).toMatch(FAILED_READ);
     dest.failReads(false);
-    await writer.close();
+    expect(await rejection(writer.close())).toMatch(FAILED_READ);
 
     expect(dest.writes()).toBe(writesAtOpen);
     expect(await datasetIn(dest.bytes(), "frames")).toEqual(frames);

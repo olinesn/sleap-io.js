@@ -1147,6 +1147,7 @@ export async function writeLabelsToBytes(
     module as unknown as { File: new (p: string, m: string) => H5WriteFile }
   ).File(memPath, "w");
 
+  let failedClose: unknown;
   try {
     // Numeric dataset writer with a JSON-array-string `dims` attribute.
     const writeNumeric = (
@@ -1265,10 +1266,18 @@ export async function writeLabelsToBytes(
       );
     }
   } finally {
-    f.close();
+    try {
+      f.close();
+    } catch (err) {
+      failedClose = err;
+    }
   }
 
   const fsModule = getH5FileSystem(module);
+  if (failedClose) {
+    fsModule.unlink!(memPath);
+    throw failedClose;
+  }
   const bytes = fsModule.readFile!(memPath);
   fsModule.unlink!(memPath);
   return bytes;

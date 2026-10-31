@@ -1083,16 +1083,17 @@ export class StreamingH5Writer {
   }
 
   /**
-   * Close the file and terminate the worker. Best-effort: if the worker-side
-   * close fails, the worker is still terminated so no handle is leaked.
+   * Close the file and terminate the worker. Rejects if the file isn't whole, because
+   * something failed now or earlier: the last of a file is written here, so a save has to
+   * look at this before it trusts what it wrote. The worker is terminated either way, so
+   * no handle is leaked.
    */
   async close(): Promise<void> {
     try {
       await this.send("close");
-    } catch (err) {
-      console.error("[StreamingH5Writer] close failed:", err);
+    } finally {
+      this.worker.terminate();
     }
-    this.worker.terminate();
   }
 }
 

@@ -139,12 +139,17 @@ let rangeMaxChunk = 0;
 // sees the real size of the already-written bytes instead of an empty file.
 let writeFileSize = 0;
 
-// The first read of a file that failed, on any device. It leaves HDF5 stopped mid-call,
-// holding state for bytes that never came (its buffers read as zeros afterwards, so the
-// same read tried again would succeed with the wrong data) and h5wasm freeing pointers
-// from a buffer that was never filled. So nothing more comes out of this worker: every
-// answer from here on is this error, whatever became of the request. See initH5Wasm.
-let failedRead = null;
+// The first read or write of a file that failed, on any device. It leaves HDF5 stopped
+// mid-call, holding state for bytes that never came or never went (its buffers read as
+// zeros afterwards, so the same read tried again would succeed with the wrong data) and
+// h5wasm freeing pointers from a buffer that was never filled. So nothing more comes out
+// of this worker: every answer from here on is this error, whatever became of the
+// request. See initH5Wasm.
+let failedIo = null;
+
+// Sends what createWriteRangeFile's device is holding back, for a flush. Null when no
+// such file is open.
+let flushWriteBehind = null;
 
 function errorText(error) {
   // Robustly extract error message from various error types
@@ -161,7 +166,7 @@ self.onmessage = async function(e) {
   const { type, payload, id } = e.data;
 
   try {
-    if (failedRead && type !== 'close') throw failedRead;
+    if (failedIo && type !== 'close') throw failedIo;
     switch (type) {
       case 'init':
         await initH5Wasm(payload?.h5wasmUrl);
@@ -292,9 +297,14 @@ self.onmessage = async function(e) {
         break;
 
       case 'close':
-        // Not after a failed read: closing would have HDF5 flush what it holds over the
-        // file. The caller ends this worker next, which releases everything.
-        if (!failedRead) closeFile();
+        if (failedIo) {
+          // Don't close: that would have HDF5 flush what it holds over the file. The caller
+          // ends this worker next, which releases everything. A file being written isn't
+          // whole, and closing it is the last chance to say so.
+          if (currentDestFile) throw failedIo;
+        } else {
+          closeFile();
+        }
         self.postMessage({ id, success: true });
         break;
 
@@ -321,8 +331,8 @@ function queueEncode(id, fn) {
 }
 
 function respond(id, data, transferables) {
-  if (failedRead) {
-    self.postMessage({ id, success: false, error: errorText(failedRead) });
+  if (failedIo) {
+    self.postMessage({ id, success: false, error: errorText(failedIo) });
   } else if (transferables) {
     self.postMessage({ id, ...data }, transferables);
   } else {
@@ -345,21 +355,34 @@ async function initH5Wasm(h5wasmUrl) {
   // FS is exposed directly on h5wasm module after ready
   FS = h5wasm.FS;
   guardH5StatusWorker(h5wasm);
-  // Every device's reads pass through here. HDF5 and h5wasm can each swallow what a read
-  // throws, and h5wasm ignores a failed H5Dread, so a read has to be caught at this end.
-  const read = FS.read;
-  FS.read = function() {
+  // Every device's reads and writes pass through these. HDF5 and h5wasm can each swallow
+  // what one throws, so a failure has to be caught at this end.
+  FS.read = watchingIo(FS.read);
+  FS.write = watchingIo(FS.write);
+  FS.ftruncate = watchingIo(FS.ftruncate);
+  FS.close = watchingIo(FS.close);
+  // A flush is meant to put everything on its way to the file, so that a write that can't
+  // be done is reported by the step that asked for it, not only when the file closes.
+  const flush = h5wasm.File.prototype.flush;
+  h5wasm.File.prototype.flush = function() {
+    flush.call(this);
+    if (flushWriteBehind) flushWriteBehind();
+  };
+}
+
+function watchingIo(op) {
+  return function() {
     try {
-      return read.apply(this, arguments);
+      return op.apply(this, arguments);
     } catch (error) {
-      failedRead = failedRead || error;
+      failedIo = failedIo || error;
       throw error;
     }
   };
 }
 
 // Same as guardH5Status in h5.ts, which this worker code can't import (keep them in
-// lockstep): make h5wasm's reads throw when HDF5 says they failed.
+// lockstep): make h5wasm's calls throw when HDF5 says they failed.
 function guardH5StatusWorker(h5) {
   var calls = h5.Module;
   var unfilled = null;
@@ -381,6 +404,24 @@ function guardH5StatusWorker(h5) {
   calls.reclaim_vlen_memory = function() {
     if (arguments[3] === unfilled) return 0;
     return reclaim.apply(this, arguments);
+  };
+
+  var failedWrite = 'Could not finish writing the file: HDF5 reported a failed write, so it may be incomplete.';
+  ['set_dataset_data', 'flush'].forEach(function(name) {
+    var write = calls[name];
+    calls[name] = function() {
+      var status = write.apply(this, arguments);
+      if (status < 0) throw new Error(failedWrite);
+      return status;
+    };
+  });
+
+  var close = h5.File.prototype.close;
+  h5.File.prototype.close = function() {
+    var status = close.call(this);
+    // Nothing is at stake on a file opened for reading.
+    if (status < 0 && this.mode !== 'r') throw new Error(failedWrite);
+    return status;
   };
 }
 
@@ -663,7 +704,7 @@ function bridgeWrite(fileOffset, buffer, bufOffset, length, target) {
     self.postMessage({ type: 'writeRequest', target: target, offset: fileOffset + written, length: want });
     waitForBridge(3);
     if (Atomics.load(rangeControl, 1) !== 0) {
-      throw new Error('bridgeWrite failed at offset ' + (fileOffset + written));
+      throw new Error('Could not write ' + want + ' bytes at offset ' + (fileOffset + written) + ' of the file.');
     }
     written += want;
   }
@@ -675,7 +716,7 @@ function bridgeTruncate(len, target) {
   Atomics.store(rangeControl, 0, 4);                                     // STATE = TRUNCATE_REQUEST
   self.postMessage({ type: 'truncateRequest', target: target, length: len });
   waitForBridge(4);
-  if (Atomics.load(rangeControl, 1) !== 0) throw new Error('bridgeTruncate failed at len ' + len);
+  if (Atomics.load(rangeControl, 1) !== 0) throw new Error('Could not change the length of the file to ' + len + ' bytes.');
 }
 
 // A WRITABLE Emscripten file node whose read/write/llseek/truncate are serviced
@@ -755,7 +796,7 @@ function createWriteRangeFile(parent, name, initialSize) {
   };
   // llseek: rely on the wrapped default (SEEK_END uses node.usedBytes -> writeFileSize).
   node.stream_ops = stream_ops;
-  node.flushPendingWrites = flushPending;
+  flushWriteBehind = watchingIo(flushPending);
 
   // node_ops: override setattr so ftruncate is bridged (NOT written into MEMFS contents).
   var node_ops = {};
@@ -860,6 +901,17 @@ async function openOpfsSyncHandle(opfsPath, create) {
   return await fh.createSyncAccessHandle();
 }
 
+// Write to an OPFS sync handle. Out of storage quota, Chromium's write doesn't throw: it
+// returns -8 as an unsigned number. HDF5 would take that for how much was written, and go
+// on writing forever.
+function writeOpfs(handle, bytes, position) {
+  var wrote = handle.write(bytes, { at: position });
+  if (bytes.length > 0 && !(wrote > 0 && wrote <= bytes.length)) {
+    throw new Error('Could not write ' + bytes.length + ' bytes at offset ' + position + ' of the file. The browser may be out of storage for this site.');
+  }
+  return wrote;
+}
+
 // A WRITABLE Emscripten file node whose read/write/truncate are serviced by an
 // OPFS sync access handle IN THIS WORKER -- the direct, synchronous analogue of
 // createWriteRangeFile with NO bridge, NO Atomics, NO SharedArrayBuffer.
@@ -889,7 +941,7 @@ function createWriteOpfsFile(parent, name, initialSize, handle) {
     return handle.read(buffer.subarray(offset, offset + toRead), { at: position });
   };
   stream_ops.write = function(stream, buffer, offset, length, position) {
-    var wrote = handle.write(buffer.subarray(offset, offset + length), { at: position });
+    var wrote = writeOpfs(handle, buffer.subarray(offset, offset + length), position);
     if (position + wrote > writeFileSize) writeFileSize = position + wrote;
     return wrote;
   };
@@ -966,7 +1018,10 @@ async function openAppendOpfs(destOpfsPath, sourceFile, structureBytes, sourceFi
   var u8 = structureBytes instanceof Uint8Array
     ? structureBytes
     : new Uint8Array(structureBytes || 0);
-  if (u8.length > 0) handle.write(u8, { at: 0 });
+  // All of it or nothing: nothing else here would notice a partly written start.
+  if (writeOpfs(handle, u8, 0) !== u8.length) {
+    throw new Error('Could not write the start of the file. The browser may be out of storage for this site.');
+  }
   handle.flush();
   var size = u8.length;
 
@@ -1617,19 +1672,22 @@ function warnCleanup(op, path, e) {
 // MEMFS mounts.
 function closeAppendFiles() {
   encodeState = null;
+  // Whatever kept the last of the file from being written, thrown once all this is released.
+  var failedClose = null;
   if (currentSourceFile) {
     try { currentSourceFile.close(); } catch (e) {}
     currentSourceFile = null;
   }
   if (currentDestFile) {
-    try { currentDestFile.close(); } catch (e) {}
+    try { currentDestFile.close(); } catch (e) { failedClose = e; }
     currentDestFile = null;
   }
+  flushWriteBehind = null;
   // Flush + close the OPFS sync handle AFTER the h5wasm File close above (that
   // close flushes h5wasm's buffered writes through the device into the handle).
   if (currentOpfsHandle) {
-    try { currentOpfsHandle.flush(); } catch (e) {}
-    try { currentOpfsHandle.close(); } catch (e) {}
+    try { currentOpfsHandle.flush(); } catch (e) { failedClose = failedClose || e; }
+    try { currentOpfsHandle.close(); } catch (e) { failedClose = failedClose || e; }
     currentOpfsHandle = null;
   }
   if (sourceMountPath && FS) {
@@ -1653,6 +1711,7 @@ function closeAppendFiles() {
     destMountPath = null;
     destMountFilename = null;
   }
+  if (failedClose) throw failedClose;
 }
 
 function closeFile() {

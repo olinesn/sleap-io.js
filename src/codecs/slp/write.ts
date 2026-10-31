@@ -1419,11 +1419,13 @@ export class SlpStreamWriter {
   close(): Uint8Array {
     if (this.closed) throw new Error("SlpStreamWriter is already closed");
     this.closed = true;
-    this.finalizeFile();
     const fs = getH5FileSystem(this.module);
-    const bytes = fs.readFile!(this.memPath);
-    fs.unlink!(this.memPath);
-    return bytes;
+    try {
+      this.finalizeFile();
+      return fs.readFile!(this.memPath);
+    } finally {
+      fs.unlink!(this.memPath);
+    }
   }
 
   /**
@@ -1441,7 +1443,6 @@ export class SlpStreamWriter {
   ): Promise<void> {
     if (this.closed) throw new Error("SlpStreamWriter is already closed");
     this.closed = true;
-    this.finalizeFile();
 
     const fs = getH5FileSystem(this.module);
     const cfs = fs as unknown as ChunkedFs;
@@ -1450,6 +1451,7 @@ export class SlpStreamWriter {
       Math.trunc(opts?.chunkBytes ?? 8 * 1024 * 1024),
     );
     try {
+      this.finalizeFile();
       if (cfs.open && cfs.read && cfs.close && cfs.stat) {
         const size = Number(cfs.stat(this.memPath).size);
         const stream = cfs.open(this.memPath, "r");
@@ -1806,16 +1808,22 @@ async function writeSlpBytes(
         const module = await getH5Module();
         ensureH5StagingDir(module);
         const memPath = `/tmp/sleap_output_${Date.now()}_${Math.random().toString(16).slice(2)}.slp`;
+        const fs = getH5FileSystem(module);
         const file = new module.File(memPath, "w");
         try {
-          writeSlpToFileLazy(file, lazyWriteLabels);
+          try {
+            writeSlpToFileLazy(file, lazyWriteLabels);
+          } finally {
+            file.close();
+          }
+          return fs.readFile!(memPath);
         } finally {
-          file.close();
+          try {
+            fs.unlink!(memPath);
+          } catch {
+            // best-effort cleanup
+          }
         }
-        const fs = getH5FileSystem(module);
-        const bytes = fs.readFile!(memPath);
-        fs.unlink!(memPath);
-        return bytes;
       }
     }
   }

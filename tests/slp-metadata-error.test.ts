@@ -356,4 +356,10 @@ describe("parseMetadataJson helper (shared by all readers)", () => {
     expect(err.message).toContain("/data/foo.slp");
     expect(err.message).toContain("likely corrupt");
   });
+
+  it("missingMetadataJsonError masks a token in a URL", () => {
+    const err = missingMetadataJsonError("https://x.test/foo.slp?token=SECRET");
+    expect(err.message).toContain("https://x.test/foo.slp?token=");
+    expect(err.message).not.toContain("SECRET");
+  });
 });

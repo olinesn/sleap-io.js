@@ -83,7 +83,7 @@ const labels = await loadSlp("/data/session.slp", {
 - `source`: string path/URL, `File`, `FileSystemFileHandle`, `Uint8Array`, or `ArrayBuffer`.
 - `options.openVideos` (default `true`): set `false` to skip opening video backends.
 - `options.h5.stream`: `"auto" | "range" | "download"` (browser URL streaming). `"auto"` retries a failed Worker read on the main thread, except for a `File` or `FileSystemFileHandle`, where you get the Worker's error. `"download"` reads on the main thread, holding the whole file in memory.
-- `options.h5.filenameHint`: helps name temporary files.
+- `options.h5.filenameHint`: what messages and embedded video paths call the file. With a URL it can be anything, including a full path or another URL.
 - `options.lazy` (default `false`): use lazy loading for on-demand frame materialization.
 
 Throws `UnsupportedSlpFormatError` for a file in a format newer than this library can read (see [Files newer than this library](#files-newer-than-this-library)).

@@ -13,7 +13,12 @@ import {
   type H5WorkerMessage,
   type H5WorkerResponse,
 } from "./h5-worker.js";
-import { RemoteIOError, isUrl, resolveUrl } from "../../io/remote.js";
+import {
+  RemoteIOError,
+  isUrl,
+  redactUrl,
+  resolveUrl,
+} from "../../io/remote.js";
 import type {
   SerializableEmbedEntry,
   SerializableEncodeEntry,
@@ -396,7 +401,8 @@ export class StreamingH5File {
       "data.h5";
     const result = await this.send("openUrl", {
       url: resolvedUrl,
-      filename,
+      // Only for showing, so a hint that's a URL mustn't bring its token along.
+      filename: isUrl(filename) ? redactUrl(filename) : filename,
       headers: options?.headers,
     });
     this._keys = (result.keys as string[]) || [];

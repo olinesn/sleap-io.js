@@ -64,8 +64,9 @@ function hasMetadataJsonAttr(attr: unknown): boolean {
  * Python sleap-io PR #446 (`read_metadata` raising `ValueError`).
  */
 export function missingMetadataJsonError(labelsPath: string): Error {
+  const name = isUrl(labelsPath) ? redactUrl(labelsPath) : labelsPath;
   return new Error(
-    `The SLEAP labels file '${labelsPath}' is missing its required ` +
+    `The SLEAP labels file '${name}' is missing its required ` +
       "metadata JSON blob (the 'metadata' HDF5 group has no readable 'json' " +
       "attribute) and is likely corrupt. If you have a working .slp file " +
       "with the same skeleton, you can copy the attribute into a BACKUP " +

@@ -95,6 +95,11 @@ async function fetchRetryingWorker(url, init, retries) {
 let mountType = null;
 let currentFilename = null;
 
+// What a URL's file is called in the filesystem. A name of our own, so the path can't
+// fail: what the caller calls the file can be a full path or a URL, and is only for
+// showing.
+const REMOTE_FILE_NAME = 'remote.h5';
+
 // Dual-bridge (write B-seam, append mode — openAppend/appendEmbeddedVideos): TWO
 // h5wasm files open at once, a read-only SOURCE and a read+write DEST, both routed
 // through the SAME rangeControl/rangeData/rangeMaxChunk below (the worker only ever
@@ -354,10 +359,9 @@ async function openRemoteFile(url, filename = 'data.h5', headers) {
       throw new Error('Failed to fetch remote HDF5 file: ' + response.status);
     }
     const data = new Uint8Array(await response.arrayBuffer());
-    const basename = (filename.split('/').pop() || '').split('\\\\').pop() || 'data.h5';
-    mountPath = '/remote-buffer-' + Date.now() + '/' + basename;
+    mountPath = '/remote-buffer-' + Date.now() + '/' + REMOTE_FILE_NAME;
     mountType = 'buffer';
-    currentFilename = basename;
+    currentFilename = filename;
     const dir = mountPath.substring(0, mountPath.lastIndexOf('/'));
     FS.mkdir(dir);
     FS.writeFile(mountPath, data);
@@ -377,10 +381,10 @@ async function openRemoteFile(url, filename = 'data.h5', headers) {
   FS.mkdir(mountPath);
 
   // Create lazy file - this enables range request streaming!
-  FS.createLazyFile(mountPath, filename, url, true, false);
+  FS.createLazyFile(mountPath, REMOTE_FILE_NAME, url, true, false);
 
   // Open with h5wasm
-  const filePath = mountPath + '/' + filename;
+  const filePath = mountPath + '/' + REMOTE_FILE_NAME;
   currentFile = new h5wasm.File(filePath, 'r');
 
   return {
@@ -1539,7 +1543,7 @@ function closeFile() {
       try { FS.rmdir(parent); } catch (e) { warnCleanup('rmdir', parent, e); }
     } else if (mountType === 'remote' || mountType === 'range' || mountType === 'writerange') {
       // mountPath is the dir containing the lazy / range-backed file.
-      var lazyPath = mountPath + '/' + currentFilename;
+      var lazyPath = mountPath + '/' + (mountType === 'remote' ? REMOTE_FILE_NAME : currentFilename);
       try { FS.unlink(lazyPath); } catch (e) { warnCleanup('unlink', lazyPath, e); }
       try { FS.rmdir(mountPath); } catch (e) { warnCleanup('rmdir', mountPath, e); }
     } else if (mountType === 'local') {

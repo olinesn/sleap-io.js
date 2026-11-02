@@ -4,6 +4,7 @@ import {
   isGdriveUrl,
   resolveUrl,
   redactUrl,
+  redactUrlsInText,
   redactedCauseSummary,
   RemoteIOError,
   statusToMessage,
@@ -11,6 +12,7 @@ import {
   stripCrossOriginHeaders,
   withRetries,
   headOrRangeProbe,
+  urlBasename,
 } from "../../src/io/remote.js";
 
 describe("isUrl", () => {
@@ -140,6 +142,23 @@ describe("redactUrl", () => {
   it("leaves non-sensitive params untouched", () => {
     expect(redactUrl("https://h/x?a=1&b=2")).toBe("https://h/x?a=1&b=2");
   });
+
+  it("masks a sensitive param in a fragment", () => {
+    expect(redactUrl("https://h/x#token=abc")).toBe("https://h/x#token=***");
+    expect(redactUrl("https://h/x#a=1&SIG=abc&b=2")).toBe(
+      "https://h/x#a=1&SIG=***&b=2",
+    );
+  });
+
+  it("leaves any other fragment alone", () => {
+    for (const url of [
+      "https://h/x#t=1/2",
+      "https://h/x?a=1#b",
+      "https://h/x",
+    ]) {
+      expect(redactUrl(url)).toBe(url);
+    }
+  });
 });
 
 describe("redactedCauseSummary", () => {
@@ -152,6 +171,178 @@ describe("redactedCauseSummary", () => {
       true,
     );
     expect(out).not.toContain("abc");
+  });
+});
+
+describe("redactUrlsInText", () => {
+  const masked = (url: string) => redactUrl(url);
+
+  it("masks every URL in the text and leaves the rest", () => {
+    const a = "https://h/x?token=abc";
+    const b = "gs://b/y?sig=def&keep=1";
+    const out = redactUrlsInText(`first ${a} then '${b}' and "${a}"`);
+    expect(out).toBe(
+      `first ${masked(a)} then '${masked(b)}' and "${masked(a)}"`,
+    );
+    expect(out).not.toContain("abc");
+    expect(out).not.toContain("def");
+  });
+
+  it("masks a password", () => {
+    const url = "https://u:abc@h/x";
+    expect(redactUrlsInText(`at ${url}.`)).toBe(`at ${masked(url)}.`);
+  });
+
+  it("leaves a sentence's punctuation where it was", () => {
+    for (const end of [".", ",", ";", ":", "!", "?", ")", "..."]) {
+      const url = "https://h/x?token=abc";
+      expect(redactUrlsInText(`(see ${url}${end} next`)).toBe(
+        `(see ${masked(url)}${end} next`,
+      );
+    }
+  });
+
+  it("masks what's after the punctuation inside a URL", () => {
+    const url = "https://h/x?a=1.&token=abc";
+    expect(redactUrlsInText(`at ${url}.`)).toBe(`at ${masked(url)}.`);
+  });
+
+  it("leaves text with nothing sensitive alone", () => {
+    for (const text of [
+      "",
+      "no url here",
+      "token=abc",
+      "C:\\a\\b",
+      "x://y",
+      "a b#1?%.slp",
+      "/Users/me/y.slp",
+      "?mytoken=abc",
+      "?tokens=abc",
+      "?a=token",
+    ]) {
+      expect(redactUrlsInText(text)).toBe(text);
+    }
+  });
+
+  it("masks a token after a space or a quote ends the URL", () => {
+    for (const url of [
+      "https://h/x?name=a b&token=abc",
+      "https://h/x?name=o'b&token=abc",
+      'https://h/x?name=a"b&token=abc',
+      "https://h/x?name=a<b&token=abc",
+      "https://h/o'b/x?token=abc",
+      "https://h/a b/x?token=abc",
+    ]) {
+      const out = redactUrlsInText(`at ${url}. Done`);
+      expect(out).not.toContain("abc");
+      expect(out).toEndWith(". Done");
+    }
+  });
+
+  it("masks what's left of a URL", () => {
+    for (const [text, kept] of [
+      ["y.slp?token=abc", "y.slp?token=***"],
+      ["y.slp&token=abc", "y.slp&token=***"],
+      ["'y.slp?token=abc'", "'y.slp?token=***'"],
+      ["http://h/aaa...bbb&token=abc", "token="],
+    ]) {
+      const out = redactUrlsInText(text);
+      expect(out).toContain(kept);
+      expect(out).not.toContain("abc");
+    }
+  });
+
+  it("masks each sensitive name, in any case", () => {
+    for (const name of [
+      "token",
+      "TOKEN",
+      "Access_Token",
+      "x-amz-security-token",
+      "SAS",
+      "sig",
+    ]) {
+      const out = redactUrlsInText(`y.slp?${name}=abc&keep=1`);
+      expect(out).toBe(`y.slp?${name}=***&keep=1`);
+    }
+  });
+
+  it("masks a value holding what a URL can hold", () => {
+    for (const value of ["a/b", "a.b.c", "a+b==", "a:b", "a%2Fb", "a,b;c"]) {
+      expect(redactUrlsInText(`y.slp?token=${value} next`)).toBe(
+        "y.slp?token=*** next",
+      );
+    }
+  });
+
+  it("masks a token in a fragment", () => {
+    const out = redactUrlsInText("at https://h/x#a=1&token=abc. Done");
+    expect(out).toBe("at https://h/x#a=1&token=***. Done");
+  });
+});
+
+describe("urlBasename", () => {
+  it("is the last part of a URL's path", () => {
+    expect(urlBasename("https://x.test/y.slp")).toBe("y.slp");
+    expect(urlBasename("https://x.test/a/b/y.slp")).toBe("y.slp");
+    expect(urlBasename("HTTPS://X.TEST/A/Y.SLP")).toBe("Y.SLP");
+    expect(urlBasename("gs://bucket/a/y.slp")).toBe("y.slp");
+  });
+
+  it("isn't decoded or rewritten", () => {
+    expect(urlBasename("https://x.test/a%20b.slp")).toBe("a%20b.slp");
+    expect(urlBasename("https://x.test/a b.slp")).toBe("a b.slp");
+    expect(urlBasename("https://x.test/日本語.slp")).toBe("日本語.slp");
+  });
+
+  it("leaves out the query and fragment, slashes and all", () => {
+    for (const url of [
+      "https://x.test/y.slp?token=abc",
+      "https://x.test/y.slp?f=a/b.slp&token=abc",
+      "https://x.test/y.slp?token=a/bc",
+      "https://x.test/y.slp#a/bc",
+      "https://x.test/y.slp?a=1#b/c",
+      "https://x.test/y.slp#a?b=1/c",
+    ]) {
+      expect(urlBasename(url)).toBe("y.slp");
+    }
+  });
+
+  it("is empty for a URL with no name of its own", () => {
+    for (const url of [
+      "https://x.test",
+      "https://x.test/",
+      "https://x.test/a/",
+      "https://x.test/a/?c=1",
+      "https://x.test?c=1/2",
+      "https://x.test#a/b",
+    ]) {
+      expect(urlBasename(url)).toBe("");
+    }
+  });
+
+  it("never takes what's before the path", () => {
+    for (const url of [
+      "https://me:abc@x.test",
+      "https://me:abc@x.test/",
+      "https://me:abc@x.test?c=1",
+      "https://me:abc@x.test#c",
+      "https:/me:abc@x.test",
+      "https:me:abc@x.test",
+      "https:\\\\me:abc@x.test",
+    ]) {
+      expect(urlBasename(url)).toBe("");
+    }
+    expect(urlBasename("https://me:abc@x.test/y.slp")).toBe("y.slp");
+  });
+
+  it("cuts anything else at its first ?", () => {
+    expect(urlBasename("y.slp")).toBe("y.slp");
+    expect(urlBasename("/Users/me/y.slp")).toBe("y.slp");
+    expect(urlBasename("y.slp?token=abc")).toBe("y.slp");
+    expect(urlBasename("/api/get?f=a/y.slp&token=abc")).toBe("get");
+    expect(urlBasename("a#1.slp")).toBe("a#1.slp");
+    expect(urlBasename("C:\\me\\y.slp")).toBe("C:\\me\\y.slp");
+    expect(urlBasename("")).toBe("");
   });
 });
 

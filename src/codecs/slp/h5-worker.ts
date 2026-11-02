@@ -53,10 +53,9 @@ function parseRetryAfterMsWorker(value) {
 // fetch wrapped in retry/backoff: retries transient network errors and
 // retryable statuses (429/5xx), honoring Retry-After. Returns the Response for
 // any non-retryable status so the caller handles it. Mirrors fetchRetrying in
-// ../../io/remote.ts. Errors are NOT redacted here because the worker only ever
-// sees URLs the main thread already resolved; the main thread re-wraps worker
-// failures, and no token-bearing URL reaches this transport in the streaming
-// path (Drive/headers route through the buffer download, not createLazyFile).
+// ../../io/remote.ts. Errors are NOT redacted here because this worker can't import
+// redactUrl: StreamingH5File masks any URL in a failure it reports, including what
+// h5wasm and the browser say themselves ("Couldn't load https://...").
 async function fetchRetryingWorker(url, init, retries) {
   const max = retries == null ? 3 : retries;
   let attempt = 0;
@@ -353,6 +352,14 @@ async function initH5Wasm(h5wasmUrl) {
   h5wasmModule = h5wasm;
   // FS is exposed directly on h5wasm module after ready
   FS = h5wasm.FS;
+  // h5wasm prints what it aborts with, and that can quote a URL with its token
+  // ("Couldn't load https://..."). It calls this first, and throwing skips the print.
+  // The failure still reaches StreamingH5File, which masks it.
+  if (h5wasm.Module) {
+    h5wasm.Module.onAbort = function(what) {
+      if (String(what).includes('://')) throw new Error('Aborted(' + what + ')');
+    };
+  }
   // Every device's reads pass through here. HDF5 and h5wasm can each swallow what a read
   // throws, and h5wasm ignores a failed H5Dread, so a read has to be caught at this end.
   const read = FS.read;

@@ -53,8 +53,23 @@ export const SENSITIVE_QUERY_PARAMS = new Set([
 /** HTTP status codes that {@link withRetries} treats as retryable. */
 export const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
-/** Matches URL tokens embedded in arbitrary error text for scrubbing. */
-const URL_IN_TEXT_PATTERN = /(?:http|https|s3|gs|gcs|az|abfs):\/\/[^\s"'<>]+/gi;
+/**
+ * Matches URL tokens embedded in arbitrary error text for scrubbing. Punctuation at
+ * the end belongs to the sentence, not the URL.
+ */
+const URL_IN_TEXT_PATTERN =
+  /(?:http|https|s3|gs|gcs|az|abfs):\/\/[^\s"'<>]*[^\s"'<>.,;:!?)]/gi;
+
+/**
+ * Matches a sensitive query param and its value anywhere in text, URL or no URL: a
+ * space or quote ends what {@link URL_IN_TEXT_PATTERN} can see of a URL, a browser
+ * shortens a long one, and a name cut from one (`y.slp?token=...`) no longer looks
+ * like one. The `#` is for the same param in a fragment.
+ */
+const SENSITIVE_PARAM_PATTERN = new RegExp(
+  `([?&#](?:${[...SENSITIVE_QUERY_PARAMS].join("|")})=)[^\\s"'<>&#]*[^\\s"'<>&#.,;:!?)]`,
+  "gi",
+);
 
 /**
  * Whether `value` looks like a remote URL (one of {@link URL_SCHEMES}).
@@ -84,12 +99,25 @@ export function isGdriveUrl(value: unknown): boolean {
 }
 
 /**
+ * The name at the end of a URL's path, undecoded, or `""` if the path has none. Only
+ * the path counts: a slash in the query doesn't start a new name, and what comes
+ * before the path can hold a password. A plain path or file name is cut at its first
+ * `?` the same way.
+ */
+export function urlBasename(url: string): string {
+  const path = isUrl(url)
+    ? url.replace(/^[^:]+:[/\\]*[^/\\?#]*/, "").split(/[?#]/, 1)[0]
+    : url.split("?", 1)[0];
+  return path.split("/").pop() ?? "";
+}
+
+/**
  * Mask credentials in a URL: userinfo becomes `***:***@host`, and the VALUES of
  * sensitive query params ({@link SENSITIVE_QUERY_PARAMS}) become `***`
- * (serialized percent-encoded as `%2A%2A%2A`, matching Python). Other params are
- * left intact. On parse failure the input is returned unchanged.
+ * (serialized percent-encoded as `%2A%2A%2A`, matching Python), in a fragment too.
+ * Other params are left intact. On parse failure the input is returned unchanged.
  *
- * Port of Python `_redact_url`.
+ * Port of Python `_redact_url`, which leaves the fragment alone.
  */
 export function redactUrl(url: string): string {
   let parsed: URL;
@@ -107,7 +135,18 @@ export function redactUrl(url: string): string {
       parsed.searchParams.set(key, "***");
     }
   }
+  parsed.hash = parsed.hash.replace(SENSITIVE_PARAM_PATTERN, "$1***");
   return parsed.toString();
+}
+
+/**
+ * `text` with credentials masked in every URL it quotes (see {@link redactUrl}), and
+ * in whatever is left of a URL it can't recognize as one.
+ */
+export function redactUrlsInText(text: string): string {
+  return text
+    .replace(SENSITIVE_PARAM_PATTERN, "$1***")
+    .replace(URL_IN_TEXT_PATTERN, (m) => redactUrl(m));
 }
 
 /**
@@ -124,8 +163,7 @@ export function redactedCauseSummary(e: unknown): string {
   const rawMsg = String(
     (e as { message?: unknown } | null)?.message ?? (e as unknown),
   );
-  const redactedMsg = rawMsg
-    .replace(URL_IN_TEXT_PATTERN, (m) => redactUrl(m))
+  const redactedMsg = redactUrlsInText(rawMsg)
     .replace(/\s*\n\s*/g, " ")
     .trim();
   return `${typeName}: ${redactedMsg}`;

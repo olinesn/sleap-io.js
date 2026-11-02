@@ -9,16 +9,57 @@
  */
 
 import {
+  hasPath,
   openH5Worker,
   type StreamingH5File,
   isStreamingSupported,
   type StreamingH5Source,
 } from "./h5-streaming.js";
 import {
+  addAnnotationsToStore,
+  type AnnotationTuples,
+  attachAnnotationOwners,
+  attachOwnerType,
+  bboxRowCount,
+  buildBboxes,
+  buildLabelImages,
+  buildMasks,
+  buildRois,
+  distributeAnnotations,
+  groupEmbeddings,
+  groupLinks,
+  type LabelImageObjectsTable,
+  type LabelImagePixels,
+  parseStringListAttr,
+  type PerDetectionMaps,
+  type Routed,
+  type Rows,
+  type ScoreMapTable,
+  stringsFromDataset,
+  type TableContext,
+  toBytes,
+} from "./annotations.js";
+import {
+  checkDatasetFilters,
+  type ColumnarTableName,
+  type Columns,
+  indexOutOfRange,
+  legacyTablePath,
+  normalizeColumnarTable,
+  normalizePoseTables,
+  type RawTable,
+  reportTableProblems,
+  sessionProblems,
+  tableBufferPath,
+  tableMembers,
+} from "./columnar.js";
+import {
   attrToNumber,
   attrToString,
+  checkSlpFormat,
   datasetValueToString,
   parseMetadataJson,
+  parseProvenance,
   missingMetadataJsonError,
   parseJsonEntry,
   decodeEntryText,
@@ -38,7 +79,11 @@ import {
 import { buildSourceVideoFromDict } from "./source-video.js";
 import { Labels } from "../../model/labels.js";
 import { LabeledFrame } from "../../model/labeled-frame.js";
+import type { BoundingBox } from "../../model/bbox.js";
 import type { Centroid } from "../../model/centroid.js";
+import type { LabelImage } from "../../model/label-image.js";
+import type { SegmentationMask } from "../../model/mask.js";
+import type { ROI } from "../../model/roi.js";
 import { buildCentroidTuples } from "./centroids.js";
 import { LazyDataStore, LazyFrameList } from "../../model/lazy.js";
 import { buildVideoIdMap } from "../../model/video-id-map.js";
@@ -72,7 +117,7 @@ import {
   buildEvents,
   eventSignatures,
 } from "./events.js";
-import { Embedding } from "../../model/embedding.js";
+import type { Embedding } from "../../model/embedding.js";
 import { StreamingHdf5VideoBackend } from "../../video/streaming-hdf5-video.js";
 import { CropVideoBackend } from "../../video/crop-backend.js";
 import { resolveSourceFrameCount } from "./frame-count.js";
@@ -164,62 +209,6 @@ export interface StreamingSlpOptions {
  * });
  * ```
  */
-/**
- * Read the `/centroids` group (SLP first-class centroid annotations) via the
- * streaming file API. Mirrors the eager `readCentroids`, but each column is an
- * async range read. Returns `[centroid, videoIdx, frameIdx]` routing tuples;
- * `[]` when the group is absent. Without this, a browser/Tauri load (which uses
- * the streaming reader) silently drops centroids that the eager/lazy readers keep.
- */
-async function readCentroidsStreaming(
-  file: StreamingH5File,
-  tracks: Track[],
-): Promise<[Centroid, number, number][]> {
-  try {
-    if (!file.keys().includes("centroids")) return [];
-    const numCol = async (name: string): Promise<ArrayLike<number>> => {
-      try {
-        const d = await file.getDatasetValue(`centroids/${name}`);
-        return normalizeDatasetArray(d.value) as ArrayLike<number>;
-      } catch {
-        return [];
-      }
-    };
-    const data: Record<string, ArrayLike<number>> = {
-      x: await numCol("x"),
-      y: await numCol("y"),
-      z: await numCol("z"),
-      video: await numCol("video"),
-      frame_idx: await numCol("frame_idx"),
-      track: await numCol("track"),
-      instance: await numCol("instance"),
-      is_predicted: await numCol("is_predicted"),
-      score: await numCol("score"),
-      tracking_score: await numCol("tracking_score"),
-    };
-    const strCol = async (name: string): Promise<string[]> => {
-      try {
-        const d = await file.getDatasetValue(`centroids/${name}`);
-        return normalizeDatasetArray(d.value).map((v) =>
-          typeof v === "string"
-            ? v
-            : v instanceof Uint8Array
-              ? new TextDecoder().decode(v)
-              : String(v ?? ""),
-        );
-      } catch {
-        return [];
-      }
-    };
-    const categories = await strCol("category");
-    const names = await strCol("name");
-    const sources = await strCol("source");
-    return buildCentroidTuples(data, categories, names, sources, tracks);
-  } catch {
-    return [];
-  }
-}
-
 export async function readSlpStreaming(
   source: StreamingH5Source,
   options?: StreamingSlpOptions,
@@ -247,8 +236,9 @@ export async function readSlpStreaming(
         ? source.name
         : (options?.filenameHint ?? "slp-data.slp");
 
+  let labels: Labels;
   try {
-    return await readFromStreamingFile(
+    labels = await readFromStreamingFile(
       file,
       sourcePath,
       options?.filenameHint,
@@ -258,14 +248,20 @@ export async function readSlpStreaming(
       options?.lazy ?? false,
       lazyVideoMetadata,
     );
-  } finally {
-    // Keep the file open when video backends need it: eager (openVideos) OR
-    // deferred (lazyVideoMetadata), whose per-video backends read frame data on
-    // demand from this same StreamingH5File. Only close for pure metadata reads.
-    if (!openVideos && !lazyVideoMetadata) {
-      await file.close();
-    }
+  } catch (e) {
+    // Nothing will read this file now, so end its worker, whatever the options.
+    // Don't wait for that or let it fail: the caller needs this error, and a stuck
+    // worker never answers.
+    file.close().catch(() => {});
+    throw e;
   }
+  // Keep the file open when video backends need it: eager (openVideos) OR
+  // deferred (lazyVideoMetadata), whose per-video backends read frame data on
+  // demand from this same StreamingH5File. Only close for pure metadata reads.
+  if (!openVideos && !lazyVideoMetadata) {
+    await file.close();
+  }
+  return labels;
 }
 
 /**
@@ -305,6 +301,7 @@ export async function readFromStreamingFile(
     "Building labeled frames", // 7
     "Reading identities", // 8
     "Reading sessions", // 9
+    "Reading annotations", // 10
   ] as const;
   const total = STAGES.length;
   const report = (n: number, message?: string) =>
@@ -322,14 +319,13 @@ export async function readFromStreamingFile(
   let metadataAttrs: Record<string, unknown>;
   try {
     metadataAttrs = await file.getAttrs("metadata");
-  } catch {
+  } catch (err) {
+    // A failed read says nothing about the file, so don't call it corrupt.
+    if (!String((err as Error)?.message).startsWith("Path not found"))
+      throw err;
     throw missingMetadataJsonError(labelsPath);
   }
-  const formatId = Number(
-    (metadataAttrs["format_id"] as { value?: number })?.value ??
-      metadataAttrs["format_id"] ??
-      1.0,
-  );
+  const formatId = checkSlpFormat(metadataAttrs, labelsPath);
   // Throws the same helpful error if the `metadata` group exists but its
   // required `json` attribute is missing/empty (truncated/corrupt file);
   // mirrors Python sleap-io PR #446 and matches the eager/lazy readers.
@@ -365,15 +361,26 @@ export async function readFromStreamingFile(
 
   // Read frame/instance/point data
   report(4);
-  const framesData = await readStructDatasetStreaming(file, "frames");
+  const framesRaw = await readRawTableStreaming(file, "frames");
   report(5);
-  const instancesData = await readStructDatasetStreaming(file, "instances");
+  const instancesRaw = await readRawTableStreaming(file, "instances");
   report(6);
-  const pointsData = await readStructDatasetStreaming(file, "points");
-  const predPointsData = await readStructDatasetStreaming(file, "pred_points");
-  const negativeFrames = negativeFrameKeys(
-    await readStructDatasetStreaming(file, "negative_frames"),
-  );
+  const pointsRaw = await readRawTableStreaming(file, "points");
+  const predPointsRaw = await readRawTableStreaming(file, "pred_points");
+  const pose = normalizePoseTables(labelsPath, videos.length, {
+    frames: framesRaw,
+    instances: instancesRaw,
+    points: pointsRaw,
+    predPoints: predPointsRaw,
+  });
+  const { framesData, instancesData, pointsData, predPointsData } = pose;
+  const negativeFrames =
+    pose.negativeFrames ??
+    negativeFrameKeys(
+      file.keys().includes("negative_frames")
+        ? await readStructDatasetStrict(file, "negative_frames")
+        : {},
+    );
 
   // Build labeled frames eagerly, or (lazy mode) wrap the columnar tables in a
   // LazyDataStore and defer LabeledFrame/Instance construction to first access.
@@ -391,6 +398,9 @@ export async function readFromStreamingFile(
         negativeFrames,
       })
     : undefined;
+  const lazyFrames = lazyStore ? new LazyFrameList(lazyStore) : undefined;
+  // One entry per /instances row, so links to instances index it by row.
+  const allInstances: Array<Instance | PredictedInstance> = [];
   const labeledFrames = lazyStore
     ? undefined
     : buildLabeledFrames({
@@ -402,6 +412,7 @@ export async function readFromStreamingFile(
         tracks,
         videos,
         formatId,
+        instancesByRow: allInstances,
       });
   if (labeledFrames) {
     markNegativeFrames(labeledFrames, negativeFrames, framesData, videos);
@@ -411,106 +422,6 @@ export async function readFromStreamingFile(
   report(8);
   const identities = await readIdentitiesStreaming(file);
 
-  // Per-detection identity (SLP 2.5) + category (SLP 2.7), OWNER_INSTANCE. Applied
-  // directly to concrete instances (non-lazy) or handed to the lazy store for
-  // on-demand attach in materializeFrame.
-  if (labeledFrames || lazyStore) {
-    const { links, embs, catLinks, catEmbs, categoryCatalog } =
-      await readStreamingInstanceIdentity(file);
-    if (links.size || embs.size || catLinks.size || catEmbs.size) {
-      if (labeledFrames) {
-        const allInstances = labeledFrames.flatMap((f) => f.instances);
-        for (const [ownerId, [idx, score]] of links) {
-          const inst = allInstances[ownerId];
-          if (inst && idx >= 0 && idx < identities.length) {
-            inst.identity = identities[idx];
-            inst.identityScore = score;
-          }
-        }
-        for (const [ownerId, emb] of embs) {
-          const inst = allInstances[ownerId];
-          if (inst) inst.identityEmbedding = emb;
-        }
-        for (const [ownerId, [idx, score]] of catLinks) {
-          const inst = allInstances[ownerId];
-          if (inst && idx >= 0 && idx < categoryCatalog.length) {
-            inst.category = categoryCatalog[idx];
-            inst.categoryScore = score;
-          }
-        }
-        for (const [ownerId, emb] of catEmbs) {
-          const inst = allInstances[ownerId];
-          if (inst) inst.categoryEmbedding = emb;
-        }
-      }
-      if (lazyStore) {
-        lazyStore.identities = identities;
-        lazyStore._instanceIdentityLinks = links;
-        lazyStore._instanceEmbeddings = embs;
-        lazyStore.categoryCatalog = categoryCatalog;
-        lazyStore._instanceCategoryLinks = catLinks;
-        lazyStore._instanceCategoryEmbeddings = catEmbs;
-      }
-    }
-  }
-
-  // Centroids (`/centroids` group). The eager and lazy readers read these; the
-  // streaming reader (browser/Tauri WebView) must too, or a loaded project
-  // silently drops its centroid annotations.
-  const centroidTuples = await readCentroidsStreaming(file, tracks);
-  if (centroidTuples.length) {
-    if (labeledFrames) {
-      const frameMap = new Map<string, LabeledFrame>();
-      for (const lf of labeledFrames) {
-        frameMap.set(`${videos.indexOf(lf.video)}:${lf.frameIdx}`, lf);
-      }
-      const getOrCreate = (vidIdx: number, frameIdx: number): LabeledFrame => {
-        const key = `${vidIdx}:${frameIdx}`;
-        let lf = frameMap.get(key);
-        if (!lf) {
-          lf = new LabeledFrame({ video: videos[vidIdx], frameIdx });
-          frameMap.set(key, lf);
-          labeledFrames.push(lf);
-        }
-        return lf;
-      };
-      for (const [c, vidIdx, frameIdx] of centroidTuples) {
-        if (vidIdx >= 0 && vidIdx < videos.length && frameIdx >= 0) {
-          getOrCreate(vidIdx, frameIdx).centroids.push(c);
-        }
-      }
-      // Resolve deferred instance refs (mirrors the eager reader).
-      const allInst = labeledFrames.flatMap((lf) => lf.instances);
-      for (const lf of labeledFrames) {
-        for (const c of lf.centroids) {
-          if (
-            c._instanceIdx !== null &&
-            c._instanceIdx >= 0 &&
-            c._instanceIdx < allInst.length
-          ) {
-            c.instance = allInst[c._instanceIdx];
-            c._instanceIdx = null;
-          }
-        }
-      }
-    } else if (lazyStore) {
-      const byFrame = new Map<string, Centroid[]>();
-      const undistributed: Centroid[] = [];
-      for (const [c, vidIdx, frameIdx] of centroidTuples) {
-        if (vidIdx >= 0 && frameIdx >= 0) {
-          const key = `${vidIdx}:${frameIdx}`;
-          const list = byFrame.get(key);
-          if (list) list.push(c);
-          else byFrame.set(key, [c]);
-        } else {
-          undistributed.push(c);
-        }
-      }
-      lazyStore._centroidByFrame = byFrame;
-      lazyStore._undistributedCentroids = undistributed;
-    }
-  }
-
   // Read sessions — grouping captured as index refs (no frame materialization).
   report(9);
   const sessions = await readSessionsStreaming(
@@ -519,6 +430,7 @@ export async function readFromStreamingFile(
     skeletons,
     identities,
     rawSessions,
+    { labelsPath, nFrames: (framesData.frame_id ?? []).length },
   );
   const { eventTypes, events } = await readEventsStreaming(
     file,
@@ -526,6 +438,47 @@ export async function readFromStreamingFile(
     tracks,
     identities,
   );
+
+  report(10);
+  const annotations = await readAnnotationsStreaming(
+    file,
+    videos,
+    tracks,
+    {
+      labelsPath,
+      nInstances: (instancesData.instance_type ?? []).length,
+    },
+    labeledFrames ? allInstances : undefined,
+  );
+
+  // Per-detection identity (SLP 2.5) + category (SLP 2.7): attach onto each modality's
+  // ordered detection list (index == owner_id). Lazy instances don't exist yet, so
+  // their maps + catalogs go to the store and attach in materializeFrame.
+  const pdMaps = await readPerDetectionMapsStreaming(
+    file,
+    labelsPath,
+    identities.length,
+  );
+  attachAnnotationOwners(pdMaps, annotations, identities);
+  let staticRois: ROI[] = [];
+  if (labeledFrames) {
+    attachOwnerType(pdMaps, 0, allInstances, identities);
+    staticRois = distributeAnnotations(
+      labeledFrames,
+      videos,
+      annotations,
+      allInstances,
+    );
+  }
+  if (lazyStore && lazyFrames) {
+    lazyStore.identities = identities;
+    lazyStore._instanceIdentityLinks = pdMaps.idLinks.get(0);
+    lazyStore._instanceEmbeddings = pdMaps.idEmbs.get(0);
+    lazyStore.categoryCatalog = pdMaps.categoryCatalog;
+    lazyStore._instanceCategoryLinks = pdMaps.catLinks.get(0);
+    lazyStore._instanceCategoryEmbeddings = pdMaps.catEmbs.get(0);
+    addAnnotationsToStore(lazyStore, lazyFrames, annotations);
+  }
 
   onProgress?.(total, total, "Finalizing");
   // In lazy mode omit `labeledFrames` entirely (mirrors readSlpLazy): the Labels
@@ -539,17 +492,21 @@ export async function readFromStreamingFile(
     suggestions,
     sessions,
     identities,
-    provenance: (metadataJson?.provenance as Record<string, unknown>) ?? {},
+    provenance: parseProvenance(
+      await readProvenanceStreaming(file),
+      metadataJson,
+    ),
+    rois: staticRois,
     eventTypes,
     events,
   });
-  if (lazyStore) {
+  if (lazyStore && lazyFrames) {
     // Attach the lazy proxies BEFORE injectSessionFrameResolver so the resolver's
     // frameAt() resolves against the lazy list (a single frame on demand, never
     // the full table). Note: LazyDataStore.materializeFrame indexes videos by the
     // raw video id (no buildVideoIdMap remap) — this matches readSlpLazy and only
     // differs from the eager streaming build for rare sparse/non-contiguous ids.
-    labels._lazyFrameList = new LazyFrameList(lazyStore);
+    labels._lazyFrameList = lazyFrames;
     labels._lazyDataStore = lazyStore;
   }
   // Sessions are read before the frame store exists; wire the lazy frame
@@ -563,16 +520,11 @@ export async function readFromStreamingFile(
  * Read tracks from tracks_json dataset.
  */
 async function readTracksStreaming(file: StreamingH5File): Promise<Track[]> {
-  try {
-    const keys = file.keys();
-    if (!keys.includes("tracks_json")) return [];
+  if (!file.keys().includes("tracks_json")) return [];
 
-    const data = await file.getDatasetValue("tracks_json");
-    const values = normalizeDatasetArray(data.value);
-    return parseTracks(values);
-  } catch {
-    return [];
-  }
+  const data = await file.getDatasetValue("tracks_json");
+  const values = normalizeDatasetArray(data.value);
+  return parseTracks(values);
 }
 
 /** A single `/video_crops` entry: the crop rect and OOB fill for one video. */
@@ -593,11 +545,10 @@ export async function readVideoCropsStreaming(
   file: StreamingH5File,
 ): Promise<Map<number, VideoCropEntry>> {
   const out = new Map<number, VideoCropEntry>();
-  try {
-    const keys = file.keys();
-    if (!keys.includes("video_crops")) return out;
+  if (!file.keys().includes("video_crops")) return out;
 
-    const data = await file.getDatasetValue("video_crops");
+  const data = await file.getDatasetValue("video_crops");
+  try {
     let raw: unknown = data.value;
     // h5wasm surfaces the vlen-string `/video_crops` payload as: (a) a plain
     // string, (b) a length-1 array of strings (the vlen form), or (c) raw
@@ -648,35 +599,39 @@ export async function readVideoCropsStreaming(
  * case), mirroring the sync reader and Python `_read_source_video_json`.
  */
 export async function readSourceVideoGroupJsonStreaming(
-  file: Pick<StreamingH5File, "getKeys" | "getAttrs" | "getDatasetValue">,
+  file: Pick<
+    StreamingH5File,
+    "keys" | "getKeys" | "getAttrs" | "getDatasetValue"
+  >,
   groupPath: string,
 ): Promise<Record<string, unknown> | null> {
   const svPath = `${groupPath}/source_video`;
+  if (!(await hasPath(file, svPath))) return null;
   let raw: string | undefined;
-  try {
-    const keys = await file.getKeys(svPath);
-    if (keys.includes("json")) {
-      // Oversized (spilled) metadata: a scalar `|S<n>` dataset. Decode every
-      // backend representation through the shared helper (h5wasm string,
-      // jsfive length-1 array, raw bytes) rather than the partial inline checks.
-      // Scope the guard tightly (mirrors the sync reader) so a dataset-read
-      // failure falls back to the `json` attribute instead of dropping the
-      // lineage.
-      try {
-        const { value } = await file.getDatasetValue(`${svPath}/json`);
-        raw = datasetValueToString(value);
-      } catch {
-        raw = undefined;
-      }
+  let failedRead: unknown;
+  if ((await file.getKeys(svPath)).includes("json")) {
+    // Oversized (spilled) metadata: a scalar `|S<n>` dataset. Decode every
+    // backend representation through the shared helper (h5wasm string,
+    // jsfive length-1 array, raw bytes) rather than the partial inline checks.
+    // Scope the guard tightly (mirrors the sync reader) so a dataset-read
+    // failure falls back to the `json` attribute instead of dropping the
+    // lineage.
+    try {
+      const { value } = await file.getDatasetValue(`${svPath}/json`);
+      raw = datasetValueToString(value);
+    } catch (err) {
+      failedRead = err;
     }
-    if (raw === undefined) {
-      const attrs = await file.getAttrs(svPath);
-      raw = attrToString(attrs.json);
-    }
-  } catch {
+  }
+  if (raw === undefined) {
+    const attrs = await file.getAttrs(svPath);
+    raw = attrToString(attrs.json);
+  }
+  if (raw === undefined) {
+    // With no attribute to fall back on, the next save would drop the lineage.
+    if (failedRead !== undefined) throw failedRead;
     return null;
   }
-  if (raw === undefined) return null;
   try {
     return JSON.parse(raw) as Record<string, unknown>;
   } catch {
@@ -697,266 +652,258 @@ async function readVideosStreaming(
   onVideoProgress?: (current: number, total: number) => void,
   lazyVideoMetadata: boolean = false,
 ): Promise<Video[]> {
-  try {
-    const keys = file.keys();
-    if (!keys.includes("videos_json")) return [];
+  if (!file.keys().includes("videos_json")) return [];
 
-    const data = await file.getDatasetValue("videos_json");
-    const values = normalizeDatasetArray(data.value);
-    const metadataList = parseVideosMetadata(values, labelsPath);
+  const data = await file.getDatasetValue("videos_json");
+  const values = normalizeDatasetArray(data.value);
+  const metadataList = parseVideosMetadata(values, labelsPath);
 
-    const videos: Video[] = [];
+  const videos: Video[] = [];
 
-    for (let videoIndex = 0; videoIndex < metadataList.length; videoIndex++) {
-      onVideoProgress?.(videoIndex + 1, metadataList.length);
-      const meta = metadataList[videoIndex];
+  for (let videoIndex = 0; videoIndex < metadataList.length; videoIndex++) {
+    onVideoProgress?.(videoIndex + 1, metadataList.length);
+    const meta = metadataList[videoIndex];
 
-      // Fast path: build the embedded Video from videos_json ALONE, skipping
-      // every per-video HDF5 read (dataset lookup, getAttrs, frame_numbers,
-      // frame_sizes, source_video). Those serial reads dominate open time on
-      // many-video pkg.slp over high-latency storage. No backend is built here —
-      // the caller opens one on demand (frames render blank until then). Shape
-      // and channel_order come from JSON (with the format_id default fallback),
-      // so the videos panel still reports dimensions.
-      if (lazyVideoMetadata && meta.embedded) {
-        const datasetPath = meta.dataset ?? `video${videoIndex}/video`;
-        // Seed the source frame count from videos_json (the embedded/labeled
-        // count); the deferred backend corrects it to the true source count from
-        // frame_numbers/`frames` attr on first view.
-        const frameCount = resolveSourceFrameCount({
-          jsonFrameCount: meta.frameCount,
-        });
-        const shape: [number, number, number, number] | undefined =
-          meta.height && meta.width && meta.channels
-            ? [frameCount ?? 0, meta.height, meta.width, meta.channels]
-            : undefined;
-        const channelOrder =
-          meta.channelOrder ?? (formatId < 1.4 ? "BGR" : "RGB");
-        // Deferred backend: no per-video HDF5 reads now; getFrame() lazily reads
-        // frame_numbers/frame_sizes/attrs on first view (ensureLoaded). Holds the
-        // still-open StreamingH5File, so readSlpStreaming must NOT close it.
-        const backend = new StreamingHdf5VideoBackend({
-          filename: Array.isArray(meta.filename)
-            ? (meta.filename[0] ?? "")
-            : meta.filename,
-          h5file: file,
-          datasetPath,
-          format: meta.format ?? "png",
-          channelOrder,
-          shape,
-          fps: meta.fps,
-          deferred: true,
-        });
-        const sourceVideo = meta.sourceVideo
-          ? buildSourceVideoFromDict(meta.sourceVideo, labelsPath)
-          : null;
-        videos.push(
-          new Video({
-            filename: meta.filename,
-            backend,
-            backendMetadata: {
-              dataset: datasetPath,
-              format: meta.format,
-              shape,
-              fps: meta.fps,
-              channel_order: channelOrder,
-              grayscale: meta.grayscale,
-            },
-            sourceVideo,
-            openBackend: false,
-            embedded: meta.embedded,
-          }),
-        );
-        continue;
-      }
-
-      // Auto-detect dataset path when embedded but not specified in metadata
-      let datasetPath: string | undefined = meta.dataset;
-      if (meta.embedded && !datasetPath) {
-        datasetPath =
-          (await findVideoDatasetStreaming(file, videoIndex)) ?? undefined;
-      }
-
-      // Read format/channel_order/frames from HDF5 dataset attributes when a
-      // dataset path is known. Always probe even when openVideos is false —
-      // downstream consumers (e.g. write.ts re-embed at line 1054) read
-      // channel_order from Video.backendMetadata to avoid color corruption on
-      // save, so metadata-only loads must populate it too. The `frames` attribute
-      // records the source video's total frame count for embedded videos, used
-      // by the seekbar. Matches Python sleap-io (video_reading.py:987-1006).
-      let format = meta.format;
-      let channelOrderFromAttrs: string | undefined;
-      let frameCountFromAttrs: number | undefined;
-      if (datasetPath) {
-        try {
-          const attrs = await file.getAttrs(datasetPath);
-          if (!format) {
-            format = attrToString(attrs.format);
-          }
-          channelOrderFromAttrs = attrToString(attrs.channel_order);
-          const framesNum = attrToNumber(attrs.frames);
-          if (framesNum !== undefined && framesNum > 0) {
-            frameCountFromAttrs = framesNum;
-          }
-          // Read height/width/channels from dataset attributes when JSON metadata
-          // is missing (common for pkg.slp files)
-          const readNumAttr = (attr: unknown): number | undefined => {
-            if (attr === undefined || attr === null) return undefined;
-            const v =
-              typeof attr === "object" && attr !== null && "value" in attr
-                ? (attr as { value: unknown }).value
-                : attr;
-            const n = Number(v);
-            return Number.isFinite(n) && n > 0 ? n : undefined;
-          };
-          if (!meta.height) meta.height = readNumAttr(attrs.height);
-          if (!meta.width) meta.width = readNumAttr(attrs.width);
-          if (!meta.channels) meta.channels = readNumAttr(attrs.channels);
-        } catch {
-          // Ignore attribute read errors
-        }
-      }
-
-      // For embedded videos we read frame_numbers up front so the source frame
-      // count (the seekbar extent) can be resolved synchronously — see below.
-      // frame_sizes lets the 1D-concatenated layout (JS writer) byte-range
-      // slice exactly, mirroring the sync reader (read.ts) — see issue #135.
-      let frameNumbers: number[] = [];
-      let frameSizes: number[] | undefined;
-      if (openVideos && meta.embedded && datasetPath) {
-        frameNumbers = await readFrameNumbersStreaming(file, datasetPath);
-        frameSizes = await readFrameSizesStreaming(file, datasetPath);
-      }
-
-      // Source frame count: prefer the `frames` attr, then the videos_json
-      // count, then max(frame_numbers)+1. The last fallback keeps multi-video
-      // pkg.slp files (written without a `frames` attr, e.g. older PyQt SLEAP)
-      // resolving a shape at read time instead of relying on an async per-video
-      // image-decode probe that races the UI (reporting 0 / "?" / wrong counts).
+    // Fast path: build the embedded Video from videos_json ALONE, skipping
+    // every per-video HDF5 read (dataset lookup, getAttrs, frame_numbers,
+    // frame_sizes, source_video). Those serial reads dominate open time on
+    // many-video pkg.slp over high-latency storage. No backend is built here —
+    // the caller opens one on demand (frames render blank until then). Shape
+    // and channel_order come from JSON (with the format_id default fallback),
+    // so the videos panel still reports dimensions.
+    if (lazyVideoMetadata && meta.embedded) {
+      const datasetPath = meta.dataset ?? `video${videoIndex}/video`;
+      // Seed the source frame count from videos_json (the embedded/labeled
+      // count); the deferred backend corrects it to the true source count from
+      // frame_numbers/`frames` attr on first view.
       const frameCount = resolveSourceFrameCount({
-        framesAttr: frameCountFromAttrs,
         jsonFrameCount: meta.frameCount,
-        frameNumbers,
       });
       const shape: [number, number, number, number] | undefined =
         meta.height && meta.width && meta.channels
           ? [frameCount ?? 0, meta.height, meta.width, meta.channels]
           : undefined;
-
-      // Determine channel order with priority:
-      // 1. JSON metadata (meta.channelOrder)
-      // 2. HDF5 dataset attribute (channelOrderFromAttrs)
-      // 3. Legacy fallback based on format_id (BGR for < 1.4)
       const channelOrder =
-        meta.channelOrder ??
-        channelOrderFromAttrs ??
-        (formatId < 1.4 ? "BGR" : "RGB");
-
-      // Create streaming backend for embedded videos when openVideos is true
-      let backend = null;
-      if (openVideos && meta.embedded && datasetPath) {
-        backend = new StreamingHdf5VideoBackend({
-          // Embedded videos always carry a single string filename (the labels
-          // path); the array form is only for image sequences, which never
-          // reach this embedded branch. Narrow for the type checker.
-          filename: Array.isArray(meta.filename)
-            ? (meta.filename[0] ?? "")
-            : meta.filename,
-          h5file: file,
-          datasetPath,
-          frameNumbers,
-          frameSizes,
-          format: format ?? "png",
-          channelOrder,
-          shape,
-          fps: meta.fps,
-        });
-
-        // Only probe (decode one image) when height/width are still unknown —
-        // i.e. neither the dataset attrs nor videos_json provided them. With a
-        // resolved shape this is skipped, so the common pkg.slp path no longer
-        // pays a per-video network decode.
-        if (!shape || shape[0] === 0) {
-          await backend.probeShape(frameCount ?? undefined);
-        }
-      }
-
-      let videoBackend: typeof backend | CropVideoBackend = backend;
-      const backendMetadata: Record<string, unknown> = {
-        dataset: datasetPath,
-        format,
+        meta.channelOrder ?? (formatId < 1.4 ? "BGR" : "RGB");
+      // Deferred backend: no per-video HDF5 reads now; getFrame() lazily reads
+      // frame_numbers/frame_sizes/attrs on first view (ensureLoaded). Holds the
+      // still-open StreamingH5File, so readSlpStreaming must NOT close it.
+      const backend = new StreamingHdf5VideoBackend({
+        filename: Array.isArray(meta.filename)
+          ? (meta.filename[0] ?? "")
+          : meta.filename,
+        h5file: file,
+        datasetPath,
+        format: meta.format ?? "png",
+        channelOrder,
         shape,
         fps: meta.fps,
-        channel_order: channelOrder,
-        grayscale: meta.grayscale,
-      };
-
-      // Crop reconstruction (SLP 2.3): wrap the uncropped inner backend and seed
-      // crop/source_shape/shape/crop_fill so streaming reads report the cropped
-      // view identically to the eager reader. Mirrors read.ts readVideos.
-      const cropEntry = videoCrops?.get(videoIndex);
-      if (cropEntry) {
-        const [cx1, cy1, cx2, cy2] = cropEntry.crop;
-        if (openVideos && videoBackend) {
-          // Each reloaded tile owns its freshly-reconstructed inner (ownsInner
-          // defaults to true). We do NOT share one inner across sibling mosaic
-          // tiles here: on read each video entry rebuilds a private inner, so
-          // sharing would leave the inner unowned (leaked — never closed) for no
-          // decode savings. The streaming inner already shares the single
-          // StreamingH5File worker across all backends and never closes it
-          // (streaming-hdf5-video.ts), so the per-tile wrapper is cheap and its
-          // ownsInner=true is harmless (close() only clears the wrapper's tiny
-          // legacy cache; it cannot tear down the shared worker file). Live
-          // mosaic decode-sharing is opt-in and in-memory only, via
-          // Video.crop({ shareDecode: true }). Mirrors Python slp.py make_video
-          // (slp.py:393-401).
-          videoBackend = CropVideoBackend.wrap({
-            inner: videoBackend,
-            crop: cropEntry.crop,
-            fill: cropEntry.fill,
-            // ownsInner: true (default) — see comment above.
-          });
-        }
-        if (shape && shape.length === 4) {
-          backendMetadata.source_shape = [...shape];
-          backendMetadata.shape = [shape[0], cy2 - cy1, cx2 - cx1, shape[3]];
-        }
-        backendMetadata.crop = [...cropEntry.crop];
-        backendMetadata.crop_fill = cropEntry.fill;
-      }
-
-      // Reconstruct the source_video lineage WITH its recorded shape (and any
-      // deeper chain), preferring the authoritative `{group}/source_video` HDF5
-      // group for embedded videos and falling back to the nested videos_json
-      // dict — parity with the eager reader (read.ts) for #160.
-      let sourceVideo: Video | null = null;
-      if (meta.embedded && datasetPath) {
-        const groupPath = datasetPath.endsWith("/video")
-          ? datasetPath.slice(0, -6)
-          : datasetPath;
-        const svDict = await readSourceVideoGroupJsonStreaming(file, groupPath);
-        if (svDict) sourceVideo = buildSourceVideoFromDict(svDict, labelsPath);
-      }
-      if (!sourceVideo && meta.sourceVideo) {
-        sourceVideo = buildSourceVideoFromDict(meta.sourceVideo, labelsPath);
-      }
-
+        deferred: true,
+      });
+      const sourceVideo = meta.sourceVideo
+        ? buildSourceVideoFromDict(meta.sourceVideo, labelsPath)
+        : null;
       videos.push(
         new Video({
           filename: meta.filename,
-          backend: videoBackend,
-          backendMetadata,
+          backend,
+          backendMetadata: {
+            dataset: datasetPath,
+            format: meta.format,
+            shape,
+            fps: meta.fps,
+            channel_order: channelOrder,
+            grayscale: meta.grayscale,
+          },
           sourceVideo,
-          openBackend: openVideos && meta.embedded,
+          openBackend: false,
           embedded: meta.embedded,
         }),
       );
+      continue;
     }
 
-    return videos;
-  } catch {
-    return [];
+    // Auto-detect dataset path when embedded but not specified in metadata
+    let datasetPath: string | undefined = meta.dataset;
+    if (meta.embedded && !datasetPath) {
+      datasetPath =
+        (await findVideoDatasetStreaming(file, videoIndex)) ?? undefined;
+    }
+
+    // Read format/channel_order/frames from HDF5 dataset attributes when a
+    // dataset path is known. Always probe even when openVideos is false —
+    // downstream consumers (e.g. write.ts re-embed at line 1054) read
+    // channel_order from Video.backendMetadata to avoid color corruption on
+    // save, so metadata-only loads must populate it too. The `frames` attribute
+    // records the source video's total frame count for embedded videos, used
+    // by the seekbar. Matches Python sleap-io (video_reading.py:987-1006).
+    let format = meta.format;
+    let channelOrderFromAttrs: string | undefined;
+    let frameCountFromAttrs: number | undefined;
+    // An external video's dataset lives in its own file, not this one.
+    if (datasetPath && (await hasPath(file, datasetPath))) {
+      const attrs = await file.getAttrs(datasetPath);
+      if (!format) {
+        format = attrToString(attrs.format);
+      }
+      channelOrderFromAttrs = attrToString(attrs.channel_order);
+      const framesNum = attrToNumber(attrs.frames);
+      if (framesNum !== undefined && framesNum > 0) {
+        frameCountFromAttrs = framesNum;
+      }
+      // Read height/width/channels from dataset attributes when JSON metadata
+      // is missing (common for pkg.slp files)
+      const readNumAttr = (attr: unknown): number | undefined => {
+        if (attr === undefined || attr === null) return undefined;
+        const v =
+          typeof attr === "object" && attr !== null && "value" in attr
+            ? (attr as { value: unknown }).value
+            : attr;
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? n : undefined;
+      };
+      if (!meta.height) meta.height = readNumAttr(attrs.height);
+      if (!meta.width) meta.width = readNumAttr(attrs.width);
+      if (!meta.channels) meta.channels = readNumAttr(attrs.channels);
+    }
+
+    // For embedded videos we read frame_numbers up front so the source frame
+    // count (the seekbar extent) can be resolved synchronously — see below.
+    // frame_sizes lets the 1D-concatenated layout (JS writer) byte-range
+    // slice exactly, mirroring the sync reader (read.ts) — see issue #135.
+    let frameNumbers: number[] = [];
+    let frameSizes: number[] | undefined;
+    if (openVideos && meta.embedded && datasetPath) {
+      frameNumbers = await readFrameNumbersStreaming(file, datasetPath);
+      frameSizes = await readFrameSizesStreaming(file, datasetPath);
+    }
+
+    // Source frame count: prefer the `frames` attr, then the videos_json
+    // count, then max(frame_numbers)+1. The last fallback keeps multi-video
+    // pkg.slp files (written without a `frames` attr, e.g. older PyQt SLEAP)
+    // resolving a shape at read time instead of relying on an async per-video
+    // image-decode probe that races the UI (reporting 0 / "?" / wrong counts).
+    const frameCount = resolveSourceFrameCount({
+      framesAttr: frameCountFromAttrs,
+      jsonFrameCount: meta.frameCount,
+      frameNumbers,
+    });
+    const shape: [number, number, number, number] | undefined =
+      meta.height && meta.width && meta.channels
+        ? [frameCount ?? 0, meta.height, meta.width, meta.channels]
+        : undefined;
+
+    // Determine channel order with priority:
+    // 1. JSON metadata (meta.channelOrder)
+    // 2. HDF5 dataset attribute (channelOrderFromAttrs)
+    // 3. Legacy fallback based on format_id (BGR for < 1.4)
+    const channelOrder =
+      meta.channelOrder ??
+      channelOrderFromAttrs ??
+      (formatId < 1.4 ? "BGR" : "RGB");
+
+    // Create streaming backend for embedded videos when openVideos is true
+    let backend = null;
+    if (openVideos && meta.embedded && datasetPath) {
+      backend = new StreamingHdf5VideoBackend({
+        // Embedded videos always carry a single string filename (the labels
+        // path); the array form is only for image sequences, which never
+        // reach this embedded branch. Narrow for the type checker.
+        filename: Array.isArray(meta.filename)
+          ? (meta.filename[0] ?? "")
+          : meta.filename,
+        h5file: file,
+        datasetPath,
+        frameNumbers,
+        frameSizes,
+        format: format ?? "png",
+        channelOrder,
+        shape,
+        fps: meta.fps,
+      });
+
+      // Only probe (decode one image) when height/width are still unknown —
+      // i.e. neither the dataset attrs nor videos_json provided them. With a
+      // resolved shape this is skipped, so the common pkg.slp path no longer
+      // pays a per-video network decode.
+      if (!shape || shape[0] === 0) {
+        await backend.probeShape(frameCount ?? undefined);
+      }
+    }
+
+    let videoBackend: typeof backend | CropVideoBackend = backend;
+    const backendMetadata: Record<string, unknown> = {
+      dataset: datasetPath,
+      format,
+      shape,
+      fps: meta.fps,
+      channel_order: channelOrder,
+      grayscale: meta.grayscale,
+    };
+
+    // Crop reconstruction (SLP 2.3): wrap the uncropped inner backend and seed
+    // crop/source_shape/shape/crop_fill so streaming reads report the cropped
+    // view identically to the eager reader. Mirrors read.ts readVideos.
+    const cropEntry = videoCrops?.get(videoIndex);
+    if (cropEntry) {
+      const [cx1, cy1, cx2, cy2] = cropEntry.crop;
+      if (openVideos && videoBackend) {
+        // Each reloaded tile owns its freshly-reconstructed inner (ownsInner
+        // defaults to true). We do NOT share one inner across sibling mosaic
+        // tiles here: on read each video entry rebuilds a private inner, so
+        // sharing would leave the inner unowned (leaked — never closed) for no
+        // decode savings. The streaming inner already shares the single
+        // StreamingH5File worker across all backends and never closes it
+        // (streaming-hdf5-video.ts), so the per-tile wrapper is cheap and its
+        // ownsInner=true is harmless (close() only clears the wrapper's tiny
+        // legacy cache; it cannot tear down the shared worker file). Live
+        // mosaic decode-sharing is opt-in and in-memory only, via
+        // Video.crop({ shareDecode: true }). Mirrors Python slp.py make_video
+        // (slp.py:393-401).
+        videoBackend = CropVideoBackend.wrap({
+          inner: videoBackend,
+          crop: cropEntry.crop,
+          fill: cropEntry.fill,
+          // ownsInner: true (default) — see comment above.
+        });
+      }
+      if (shape && shape.length === 4) {
+        backendMetadata.source_shape = [...shape];
+        backendMetadata.shape = [shape[0], cy2 - cy1, cx2 - cx1, shape[3]];
+      }
+      backendMetadata.crop = [...cropEntry.crop];
+      backendMetadata.crop_fill = cropEntry.fill;
+    }
+
+    // Reconstruct the source_video lineage WITH its recorded shape (and any
+    // deeper chain), preferring the authoritative `{group}/source_video` HDF5
+    // group for embedded videos and falling back to the nested videos_json
+    // dict — parity with the eager reader (read.ts) for #160.
+    let sourceVideo: Video | null = null;
+    if (meta.embedded && datasetPath) {
+      const groupPath = datasetPath.endsWith("/video")
+        ? datasetPath.slice(0, -6)
+        : datasetPath;
+      const svDict = await readSourceVideoGroupJsonStreaming(file, groupPath);
+      if (svDict) sourceVideo = buildSourceVideoFromDict(svDict, labelsPath);
+    }
+    if (!sourceVideo && meta.sourceVideo) {
+      sourceVideo = buildSourceVideoFromDict(meta.sourceVideo, labelsPath);
+    }
+
+    videos.push(
+      new Video({
+        filename: meta.filename,
+        backend: videoBackend,
+        backendMetadata,
+        sourceVideo,
+        openBackend: openVideos && meta.embedded,
+        embedded: meta.embedded,
+      }),
+    );
   }
+
+  return videos;
 }
 
 /**
@@ -967,34 +914,29 @@ async function readFrameNumbersStreaming(
   file: StreamingH5File,
   datasetPath: string,
 ): Promise<number[]> {
-  try {
-    // Extract group path from dataset path (e.g., "video0/video" -> "video0")
-    const groupPath = datasetPath.endsWith("/video")
-      ? datasetPath.slice(0, -6)
-      : datasetPath;
+  // Extract group path from dataset path (e.g., "video0/video" -> "video0")
+  const groupPath = datasetPath.endsWith("/video")
+    ? datasetPath.slice(0, -6)
+    : datasetPath;
 
-    const frameNumbersPath = `${groupPath}/frame_numbers`;
+  const frameNumbersPath = `${groupPath}/frame_numbers`;
 
-    // Check if dataset exists
-    const groupKeys = await file.getKeys(groupPath);
-    if (!groupKeys.includes("frame_numbers")) {
-      return [];
-    }
-
-    const data = await file.getDatasetValue(frameNumbersPath);
-    const values = data.value;
-
-    // Convert to number array
-    if (Array.isArray(values)) {
-      return values.map((v: unknown) => Number(v));
-    }
-    if (ArrayBuffer.isView(values)) {
-      return Array.from(values as unknown as ArrayLike<number>).map(Number);
-    }
-    return [];
-  } catch {
+  // Check if dataset exists
+  if (!(await hasPath(file, frameNumbersPath))) {
     return [];
   }
+
+  const data = await file.getDatasetValue(frameNumbersPath);
+  const values = data.value;
+
+  // Convert to number array
+  if (Array.isArray(values)) {
+    return values.map((v: unknown) => Number(v));
+  }
+  if (ArrayBuffer.isView(values)) {
+    return Array.from(values as unknown as ArrayLike<number>).map(Number);
+  }
+  return [];
 }
 
 /**
@@ -1009,29 +951,24 @@ async function readFrameSizesStreaming(
   file: StreamingH5File,
   datasetPath: string,
 ): Promise<number[] | undefined> {
-  try {
-    const groupPath = datasetPath.endsWith("/video")
-      ? datasetPath.slice(0, -6)
-      : datasetPath;
+  const groupPath = datasetPath.endsWith("/video")
+    ? datasetPath.slice(0, -6)
+    : datasetPath;
 
-    const groupKeys = await file.getKeys(groupPath);
-    if (!groupKeys.includes("frame_sizes")) {
-      return undefined;
-    }
-
-    const data = await file.getDatasetValue(`${groupPath}/frame_sizes`);
-    const values = data.value;
-
-    if (Array.isArray(values)) {
-      return values.map((v: unknown) => Number(v));
-    }
-    if (ArrayBuffer.isView(values)) {
-      return Array.from(values as unknown as ArrayLike<number>).map(Number);
-    }
-    return undefined;
-  } catch {
+  if (!(await hasPath(file, `${groupPath}/frame_sizes`))) {
     return undefined;
   }
+
+  const data = await file.getDatasetValue(`${groupPath}/frame_sizes`);
+  const values = data.value;
+
+  if (Array.isArray(values)) {
+    return values.map((v: unknown) => Number(v));
+  }
+  if (ArrayBuffer.isView(values)) {
+    return Array.from(values as unknown as ArrayLike<number>).map(Number);
+  }
+  return undefined;
 }
 
 /**
@@ -1042,47 +979,33 @@ async function findVideoDatasetStreaming(
   file: StreamingH5File,
   videoIndex: number,
 ): Promise<string | null> {
-  try {
-    // Try explicit path first (video0/video, video1/video, etc.)
-    const explicitPath = `video${videoIndex}/video`;
-    const explicitGroupPath = `video${videoIndex}`;
-    try {
-      const groupKeys = await file.getKeys(explicitGroupPath);
-      if (groupKeys.includes("video")) {
-        return explicitPath;
-      }
-    } catch {
-      // Group doesn't exist, continue to scan
-    }
+  // Try explicit path first (video0/video, video1/video, etc.)
+  const explicitPath = `video${videoIndex}/video`;
+  if (await hasPath(file, explicitPath)) {
+    return explicitPath;
+  }
 
-    // Scan root keys for video groups
-    const rootKeys = file.keys();
-    for (const key of rootKeys) {
-      if (key.startsWith("video")) {
-        try {
-          const groupKeys = await file.getKeys(key);
-          if (groupKeys.includes("video")) {
-            const candidatePath = `${key}/video`;
-            // For single video case, return first found
-            if (videoIndex === 0) {
-              return candidatePath;
-            }
-            // For multi-video, try to match by index from key
-            const keyIndex = parseInt(key.slice(5), 10);
-            if (!isNaN(keyIndex) && keyIndex === videoIndex) {
-              return candidatePath;
-            }
-          }
-        } catch {
-          // Group read failed, skip
+  // Scan root keys for video groups
+  const rootKeys = file.keys();
+  for (const key of rootKeys) {
+    if (key.startsWith("video")) {
+      const groupKeys = await file.getKeys(key);
+      if (groupKeys.includes("video")) {
+        const candidatePath = `${key}/video`;
+        // For single video case, return first found
+        if (videoIndex === 0) {
+          return candidatePath;
+        }
+        // For multi-video, try to match by index from key
+        const keyIndex = parseInt(key.slice(5), 10);
+        if (!isNaN(keyIndex) && keyIndex === videoIndex) {
+          return candidatePath;
         }
       }
     }
-
-    return null;
-  } catch {
-    return null;
   }
+
+  return null;
 }
 
 /**
@@ -1092,28 +1015,23 @@ async function readSuggestionsStreaming(
   file: StreamingH5File,
   videos: Video[],
 ): Promise<SuggestionFrame[]> {
-  try {
-    const keys = file.keys();
-    if (!keys.includes("suggestions_json")) return [];
+  if (!file.keys().includes("suggestions_json")) return [];
 
-    const data = await file.getDatasetValue("suggestions_json");
-    const values = normalizeDatasetArray(data.value);
-    const metadataList = parseSuggestions(values);
+  const data = await file.getDatasetValue("suggestions_json");
+  const values = normalizeDatasetArray(data.value);
+  const metadataList = parseSuggestions(values);
 
-    return metadataList
-      .map((meta) => {
-        const video = videos[meta.video];
-        if (!video) return null;
-        return new SuggestionFrame({
-          video,
-          frameIdx: meta.frameIdx,
-          metadata: meta.metadata,
-        });
-      })
-      .filter((s): s is SuggestionFrame => s !== null);
-  } catch {
-    return [];
-  }
+  return metadataList
+    .map((meta) => {
+      const video = videos[meta.video];
+      if (!video) return null;
+      return new SuggestionFrame({
+        video,
+        frameIdx: meta.frameIdx,
+        metadata: meta.metadata,
+      });
+    })
+    .filter((s): s is SuggestionFrame => s !== null);
 }
 
 /**
@@ -1122,59 +1040,55 @@ async function readSuggestionsStreaming(
 async function readIdentitiesStreaming(
   file: StreamingH5File,
 ): Promise<Identity[]> {
-  try {
-    const keys = file.keys();
-    if (keys.includes("identities_json")) {
-      const data = await file.getDatasetValue("identities_json");
-      const values = normalizeDatasetArray(data.value);
-      const identities: Identity[] = [];
-      for (const entry of values) {
-        const parsed = parseJsonEntry(entry) as Record<string, unknown>;
-        const { name, color, ...rest } = parsed;
-        identities.push(
-          new Identity({
-            name: (name as string) ?? "",
-            color: color as string | undefined,
-            metadata: rest,
-          }),
-        );
-      }
-      return identities;
+  const keys = file.keys();
+  if (keys.includes("identities_json")) {
+    const data = await file.getDatasetValue("identities_json");
+    const values = normalizeDatasetArray(data.value);
+    const identities: Identity[] = [];
+    for (const entry of values) {
+      const parsed = parseJsonEntry(entry) as Record<string, unknown>;
+      const { name, color, ...rest } = parsed;
+      identities.push(
+        new Identity({
+          name: (name as string) ?? "",
+          color: color as string | undefined,
+          metadata: rest,
+        }),
+      );
     }
-    // Python-style /identity group fallback (no identities_json).
-    if (keys.includes("identity")) {
-      const children = await file.getKeys("identity");
-      if (children.includes("name")) {
-        const names = normalizeDatasetArray(
-          (await file.getDatasetValue("identity/name")).value,
-        ).map((n) => decodeEntryText(n) ?? "");
-        const metadata: Record<string, unknown>[] = names.map(() => ({}));
-        if (children.includes("meta_owner")) {
-          const owners = normalizeDatasetArray(
-            (await file.getDatasetValue("identity/meta_owner")).value,
-          ).map(Number);
-          const mkeys = normalizeDatasetArray(
-            (await file.getDatasetValue("identity/meta_key")).value,
-          ).map((k) => decodeEntryText(k) ?? "");
-          const mvals = normalizeDatasetArray(
-            (await file.getDatasetValue("identity/meta_val")).value,
-          ).map((v) => decodeEntryText(v) ?? "");
-          owners.forEach((o, i) => {
-            if (metadata[o]) metadata[o][mkeys[i]] = mvals[i];
-          });
-        }
-        return names.map((name, i) => {
-          const m = metadata[i];
-          const color = typeof m.color === "string" ? m.color : undefined;
-          const { color: _color, ...rest } = m;
-          return new Identity({ name, color, metadata: rest });
+    return identities;
+  }
+  // Python-style /identity group fallback (no identities_json).
+  if (keys.includes("identity")) {
+    const children = await file.getKeys("identity");
+    if (children.includes("name")) {
+      const strings = async (name: string): Promise<string[]> =>
+        children.includes(name)
+          ? normalizeDatasetArray(
+              (await file.getDatasetValue(`identity/${name}`)).value,
+            ).map((entry) => decodeEntryText(entry) ?? "")
+          : [];
+      const names = await strings("name");
+      const metadata: Record<string, unknown>[] = names.map(() => ({}));
+      if (children.includes("meta_owner")) {
+        const owners = normalizeDatasetArray(
+          (await file.getDatasetValue("identity/meta_owner")).value,
+        ).map(Number);
+        const mkeys = await strings("meta_key");
+        const mvals = await strings("meta_val");
+        owners.forEach((o, i) => {
+          if (metadata[o]) metadata[o][mkeys[i]] = mvals[i];
         });
       }
+      return names.map((name, i) => {
+        const m = metadata[i];
+        const color = typeof m.color === "string" ? m.color : undefined;
+        const { color: _color, ...rest } = m;
+        return new Identity({ name, color, metadata: rest });
+      });
     }
-    return [];
-  } catch {
-    return [];
   }
+  return [];
 }
 
 /** Read the `/event_types` and `/events` columns over the streaming API, as stored. */
@@ -1282,120 +1196,458 @@ export async function readEventSignaturesStreaming(
 }
 
 /**
- * Read the OWNER_INSTANCE per-detection identity links + embeddings (SLP 2.5) over
- * the streaming API, keyed by global instance_id. Returns empty maps on pre-2.5
- * files. Streaming builds only `Instance`s, so only OWNER_INSTANCE is read; the
- * result is applied either to a concrete instance list (non-lazy) or handed to the
- * `LazyDataStore` for on-demand attach (lazy).
+ * Read a per-detection links table, for every owner type, with the same table rules as
+ * the eager reader. Empty when the file doesn't have it.
  */
-async function readStreamingInstanceIdentity(file: StreamingH5File): Promise<{
-  links: Map<number, [number, number | null]>;
-  embs: Map<number, Embedding>;
-  catLinks: Map<number, [number, number | null]>;
-  catEmbs: Map<number, Embedding>;
-  categoryCatalog: string[];
-}> {
-  const rootKeys = file.keys();
-
-  // OWNER_INSTANCE rows of a links table (identity or categories).
-  const readOwnerInstanceLinks = async (
-    group: string,
-    idxField: string,
-    scoreField: string,
-  ): Promise<Map<number, [number, number | null]>> => {
-    const out = new Map<number, [number, number | null]>();
-    try {
-      if (!rootKeys.includes(group)) return out;
-      if (!(await file.getKeys(group)).includes("links")) return out;
-      const cols = await readStructDatasetStreaming(
-        file,
-        `${group}/links`,
-        true,
-      );
-      const ot = cols.owner_type ?? [];
-      const oid = cols.owner_id ?? [];
-      const idx = cols[idxField] ?? [];
-      const sc = cols[scoreField] ?? [];
-      for (let i = 0; i < ot.length; i += 1) {
-        if (Number(ot[i]) !== 0) continue; // OWNER_INSTANCE only
-        const score = Number(sc[i]);
-        out.set(Number(oid[i]), [
-          Number(idx[i]),
-          Number.isNaN(score) ? null : score,
-        ]);
-      }
-    } catch {
-      /* optional */
-    }
-    return out;
-  };
-
-  // OWNER_INSTANCE rows of an /embeddings triple (identity or category).
-  const readOwnerInstanceEmbs = async (
-    vecName: string,
-    otName: string,
-    oidName: string,
-  ): Promise<Map<number, Embedding>> => {
-    const out = new Map<number, Embedding>();
-    try {
-      if (!rootKeys.includes("embeddings")) return out;
-      if (!(await file.getKeys("embeddings")).includes(vecName)) return out;
-      const vd = await file.getDatasetValue(`embeddings/${vecName}`);
-      const flat = vd.value as ArrayLike<number>;
-      const rows = vd.shape?.[0] ?? 0;
-      const dim = vd.shape && vd.shape.length >= 2 ? vd.shape[1] : 0;
-      if (!rows || !dim) return out;
-      const ot = normalizeDatasetArray(
-        (await file.getDatasetValue(`embeddings/${otName}`)).value,
-      );
-      const oid = normalizeDatasetArray(
-        (await file.getDatasetValue(`embeddings/${oidName}`)).value,
-      );
-      for (let i = 0; i < rows; i += 1) {
-        if (Number(ot[i]) !== 0) continue; // OWNER_INSTANCE only
-        const vec = new Array<number>(dim);
-        for (let j = 0; j < dim; j += 1) vec[j] = Number(flat[i * dim + j]);
-        out.set(Number(oid[i]), new Embedding(vec));
-      }
-    } catch {
-      /* optional */
-    }
-    return out;
-  };
-
-  let categoryCatalog: string[] = [];
-  try {
-    if (
-      rootKeys.includes("categories") &&
-      (await file.getKeys("categories")).includes("name")
-    ) {
-      categoryCatalog = normalizeDatasetArray(
-        (await file.getDatasetValue("categories/name")).value,
-      ).map((n) => decodeEntryText(n) ?? "");
-    }
-  } catch {
-    /* optional */
+async function readLinksTableStreaming(
+  file: StreamingH5File,
+  table: "identity/links" | "categories/links",
+  idxField: string,
+  scoreField: string,
+  labelsPath: string,
+  nCatalog: number,
+): Promise<Map<number, Map<number, [number, number | null]>>> {
+  const read = await readTableStreaming(file, table, labelsPath);
+  if (!read) return new Map();
+  if (
+    read.columnar &&
+    nCatalog > 0 &&
+    indexOutOfRange(read.rows[idxField] ?? [], nCatalog, false)
+  ) {
+    reportTableProblems(labelsPath, [
+      `/${table} ${idxField} is not one of the ${nCatalog} catalog entries`,
+    ]);
   }
+  return groupLinks(read.rows, idxField, scoreField);
+}
 
+/** Read one `/embeddings` triple, for every owner type (see {@link groupEmbeddings}). */
+async function readEmbeddingTripleStreaming(
+  file: StreamingH5File,
+  vecName: string,
+  otName: string,
+  oidName: string,
+): Promise<Map<number, Map<number, Embedding>>> {
+  if (!(await hasPath(file, `embeddings/${vecName}`))) return new Map();
+  const vectors = await file.getDatasetValue(`embeddings/${vecName}`);
+  const rows = vectors.shape?.[0] ?? 0;
+  const dim = vectors.shape && vectors.shape.length >= 2 ? vectors.shape[1] : 0;
+  if (!rows || !dim) return new Map();
+  const column = async (name: string): Promise<ArrayLike<unknown>> =>
+    (await hasPath(file, `embeddings/${name}`))
+      ? ((await file.getDatasetValue(`embeddings/${name}`))
+          .value as ArrayLike<unknown>)
+      : [];
+  return groupEmbeddings(
+    vectors.value as ArrayLike<number>,
+    rows,
+    dim,
+    await column(otName),
+    await column(oidName),
+  );
+}
+
+/**
+ * Read all per-detection identity (SLP 2.5) + category (SLP 2.7) join maps + the
+ * category catalog. Empty maps on older files.
+ */
+async function readPerDetectionMapsStreaming(
+  file: StreamingH5File,
+  labelsPath: string,
+  nIdentities: number,
+): Promise<PerDetectionMaps> {
+  const categoryCatalog = (await hasPath(file, "categories/name"))
+    ? normalizeDatasetArray(
+        (await file.getDatasetValue("categories/name")).value,
+      ).map((n) => decodeEntryText(n) ?? "")
+    : [];
   return {
-    links: await readOwnerInstanceLinks(
-      "identity",
+    idLinks: await readLinksTableStreaming(
+      file,
+      "identity/links",
       "identity_idx",
       "identity_score",
+      labelsPath,
+      nIdentities,
     ),
-    embs: await readOwnerInstanceEmbs("vectors", "owner_type", "owner_id"),
-    catLinks: await readOwnerInstanceLinks(
-      "categories",
+    idEmbs: await readEmbeddingTripleStreaming(
+      file,
+      "vectors",
+      "owner_type",
+      "owner_id",
+    ),
+    catLinks: await readLinksTableStreaming(
+      file,
+      "categories/links",
       "category_idx",
       "category_score",
+      labelsPath,
+      categoryCatalog.length,
     ),
-    catEmbs: await readOwnerInstanceEmbs(
+    catEmbs: await readEmbeddingTripleStreaming(
+      file,
       "category_vectors",
       "category_owner_type",
       "category_owner_id",
     ),
     categoryCatalog,
   };
+}
+
+/**
+ * Read every annotation table, in table order. Mirrors `readAnnotations` in `read.ts`.
+ *
+ * Every table and buffer is optional, and a file without one pays nothing for it: the
+ * root keys are already known, and only what is present is read. What is present is
+ * read in full, and a failed read is an error: unlike a missing table, it would drop
+ * annotations from the project, and the next save would lose them for good.
+ */
+async function readAnnotationsStreaming(
+  file: StreamingH5File,
+  videos: Video[],
+  tracks: Track[],
+  context: TableContext,
+  instances?: Array<Instance | PredictedInstance>,
+): Promise<AnnotationTuples> {
+  const { rois, migratedBboxes } = await readRoisWithMigrationStreaming(
+    file,
+    videos,
+    tracks,
+    context,
+    instances,
+  );
+  const bboxes = await readBboxesStreaming(file, tracks, context.labelsPath);
+  return {
+    rois,
+    bboxes:
+      bboxes.length === 0 && migratedBboxes.length > 0
+        ? migratedBboxes
+        : bboxes,
+    masks: await readMasksStreaming(file, videos, tracks, context),
+    centroids: await readCentroidsStreaming(file, tracks),
+    labelImages: await readLabelImagesStreaming(
+      file,
+      videos,
+      tracks,
+      context,
+      instances,
+    ),
+  };
+}
+
+async function readRoisWithMigrationStreaming(
+  file: StreamingH5File,
+  videos: Video[],
+  tracks: Track[],
+  context: TableContext,
+  instances?: Array<Instance | PredictedInstance>,
+): Promise<{
+  rois: Routed<ROI>[];
+  migratedBboxes: Routed<BoundingBox>[];
+}> {
+  const table = await readTableStreaming(file, "rois", context.labelsPath);
+  if (!table) return { rois: [], migratedBboxes: [] };
+  const rows = table.rows;
+  if (!(rows.annotation_type ?? []).length) {
+    return { rois: [], migratedBboxes: [] };
+  }
+
+  const wkb = await readTableBufferStreaming(file, "rois", table.columnar);
+  // A 2.x table without its geometry buffer has never been readable.
+  if (!wkb && !table.columnar) return { rois: [], migratedBboxes: [] };
+
+  return buildRois(
+    {
+      rows,
+      columnar: table.columnar,
+      wkb: toBytes(wkb?.value),
+      categories: table.columnar
+        ? rows.category
+        : await readStringMetadataStreaming(
+            file,
+            "roi_categories",
+            "rois",
+            "categories",
+          ),
+      names: table.columnar
+        ? rows.name
+        : await readStringMetadataStreaming(file, "roi_names", "rois", "names"),
+      sources: table.columnar
+        ? rows.source
+        : await readStringMetadataStreaming(
+            file,
+            "roi_sources",
+            "rois",
+            "sources",
+          ),
+    },
+    videos,
+    tracks,
+    context,
+    instances,
+  );
+}
+
+async function readBboxesStreaming(
+  file: StreamingH5File,
+  tracks: Track[],
+  labelsPath: string,
+): Promise<Routed<BoundingBox>[]> {
+  if (!file.keys().includes("bboxes")) return [];
+  // Python has written /bboxes as a group of columns since format 2.0; sleap-io.js
+  // writes a flat matrix with sibling string datasets.
+  const columnar = await isGroupStreaming(file, "bboxes");
+  const rows = columnar
+    ? (normalizeColumnarTable(
+        labelsPath,
+        "bboxes",
+        await readGroupTableStreaming(file, "bboxes"),
+      ) as Rows)
+    : ((await readStructDatasetStrict(file, "bboxes")) as Rows);
+  if (!bboxRowCount(rows)) return [];
+
+  return buildBboxes(
+    {
+      rows,
+      categories: columnar
+        ? rows.category
+        : await readStringMetadataStreaming(
+            file,
+            "bbox_categories",
+            "bboxes",
+            "categories",
+          ),
+      names: columnar
+        ? rows.name
+        : await readStringMetadataStreaming(
+            file,
+            "bbox_names",
+            "bboxes",
+            "names",
+          ),
+      sources: columnar
+        ? rows.source
+        : await readStringMetadataStreaming(
+            file,
+            "bbox_sources",
+            "bboxes",
+            "sources",
+          ),
+    },
+    tracks,
+  );
+}
+
+async function readMasksStreaming(
+  file: StreamingH5File,
+  videos: Video[],
+  tracks: Track[],
+  context: TableContext,
+): Promise<Routed<SegmentationMask>[]> {
+  const table = await readTableStreaming(file, "masks", context.labelsPath);
+  if (!table) return [];
+  const rows = table.rows;
+  if (!(rows.height ?? []).length) return [];
+
+  const rle = await readTableBufferStreaming(file, "masks", table.columnar);
+  // A 2.x table without its RLE buffer has never been readable.
+  if (!rle && !table.columnar) return [];
+
+  return buildMasks(
+    {
+      rows,
+      columnar: table.columnar,
+      rle: toBytes(rle?.value),
+      categories: table.columnar
+        ? rows.category
+        : await readStringMetadataStreaming(
+            file,
+            "mask_categories",
+            "masks",
+            "categories",
+          ),
+      names: table.columnar
+        ? rows.name
+        : await readStringMetadataStreaming(
+            file,
+            "mask_names",
+            "masks",
+            "names",
+          ),
+      sources: table.columnar
+        ? rows.source
+        : await readStringMetadataStreaming(
+            file,
+            "mask_sources",
+            "masks",
+            "sources",
+          ),
+      scoreMaps: await readScoreMapsStreaming(
+        file,
+        "masks/score_maps",
+        context.labelsPath,
+      ),
+    },
+    videos,
+    tracks,
+    context,
+  );
+}
+
+async function readLabelImagesStreaming(
+  file: StreamingH5File,
+  videos: Video[],
+  tracks: Track[],
+  context: TableContext,
+  instances?: Array<Instance | PredictedInstance>,
+): Promise<Routed<LabelImage>[]> {
+  const { labelsPath } = context;
+  const table = await readTableStreaming(file, "label_images", labelsPath);
+  if (!table) return [];
+  const rows = table.rows;
+  if (!(rows.video ?? []).length) return [];
+
+  const sources = table.columnar
+    ? rows.source
+    : await readStringMetadataStreaming(
+        file,
+        "label_image_sources",
+        "label_images",
+        "sources",
+      );
+  const dataPath = tableBufferPath("label_images", table.columnar) as string;
+  const data = (await hasPath(file, dataPath))
+    ? await readPixelDataStreaming(file, dataPath)
+    : null;
+  const base = { rows, columnar: table.columnar, sources };
+  if (!data) {
+    return buildLabelImages(
+      { ...base, data: null, objects: null, scoreMaps: null },
+      videos,
+      tracks,
+      context,
+      instances,
+    );
+  }
+
+  // Read objects table (may not exist if all label images have 0 objects)
+  let objects: LabelImageObjectsTable | null = null;
+  const objTable = await readTableStreaming(
+    file,
+    "label_images/objects",
+    labelsPath,
+  );
+  if (objTable) {
+    objects = {
+      rows: objTable.rows,
+      categories: objTable.columnar
+        ? objTable.rows.category
+        : await readStringMetadataStreaming(
+            file,
+            "label_image_obj_categories",
+            "label_image_objects",
+            "categories",
+          ),
+      names: objTable.columnar
+        ? objTable.rows.name
+        : await readStringMetadataStreaming(
+            file,
+            "label_image_obj_names",
+            "label_image_objects",
+            "names",
+          ),
+    };
+  }
+
+  return buildLabelImages(
+    {
+      ...base,
+      data,
+      objects,
+      scoreMaps: await readScoreMapsStreaming(
+        file,
+        "label_images/score_maps",
+        labelsPath,
+      ),
+    },
+    videos,
+    tracks,
+    context,
+    instances,
+  );
+}
+
+/**
+ * Read `/centroids` (SLP first-class centroid annotations), in either layout: a group
+ * of columns, or the flat matrix older JS versions wrote. Mirrors `readCentroids` in
+ * `read.ts`. Returns `[centroid, videoIdx, frameIdx]` routing tuples; `[]` when absent.
+ */
+async function readCentroidsStreaming(
+  file: StreamingH5File,
+  tracks: Track[],
+): Promise<Routed<Centroid>[]> {
+  if (!file.keys().includes("centroids")) return [];
+  const children = await file.getKeys("centroids");
+  if (!children.includes("x")) {
+    return buildCentroidTuples(
+      (await readStructDatasetStrict(file, "centroids")) as Record<
+        string,
+        ArrayLike<number>
+      >,
+      await readStringMetadataStreaming(
+        file,
+        "centroid_categories",
+        "centroids",
+        "categories",
+      ),
+      await readStringMetadataStreaming(
+        file,
+        "centroid_names",
+        "centroids",
+        "names",
+      ),
+      await readStringMetadataStreaming(
+        file,
+        "centroid_sources",
+        "centroids",
+        "sources",
+      ),
+      tracks,
+    );
+  }
+
+  const numCol = async (name: string): Promise<ArrayLike<number>> =>
+    children.includes(name)
+      ? ((await file.getDatasetValue(`centroids/${name}`))
+          .value as ArrayLike<number>)
+      : [];
+  const data: Record<string, ArrayLike<number>> = {
+    x: await numCol("x"),
+    y: await numCol("y"),
+    z: await numCol("z"),
+    video: await numCol("video"),
+    frame_idx: await numCol("frame_idx"),
+    track: await numCol("track"),
+    instance: await numCol("instance"),
+    is_predicted: await numCol("is_predicted"),
+    score: await numCol("score"),
+    tracking_score: await numCol("tracking_score"),
+  };
+  const strCol = async (name: string): Promise<string[]> => {
+    if (!children.includes(name)) return [];
+    const d = await file.getDatasetValue(`centroids/${name}`);
+    return normalizeDatasetArray(d.value).map((v) =>
+      typeof v === "string"
+        ? v
+        : v instanceof Uint8Array
+          ? new TextDecoder().decode(v)
+          : String(v ?? ""),
+    );
+  };
+  const categories = await strCol("category");
+  const names = await strCol("name");
+  const sources = await strCol("source");
+  return buildCentroidTuples(data, categories, names, sources, tracks);
 }
 
 /**
@@ -1411,6 +1663,10 @@ export async function readSessionsStreaming(
   skeletons: Skeleton[],
   identities?: Identity[],
   captureRaw: boolean = false,
+  context: { labelsPath: string; nFrames: number | null } = {
+    labelsPath: "This file",
+    nFrames: null,
+  },
 ): Promise<RecordingSession[]> {
   try {
     const keys = file.keys();
@@ -1425,7 +1681,12 @@ export async function readSessionsStreaming(
 
     // SLP 2.8 columnar /session_data (read once for all sessions), or null for
     // legacy ≤2.7 files.
-    const sessionData = await readSessionDataStreaming(file);
+    const sessionData = await readSessionDataStreaming(
+      file,
+      context.labelsPath,
+      identities?.length ?? 0,
+      context.nFrames,
+    );
 
     const sessions: RecordingSession[] = [];
     for (const entry of values) {
@@ -1671,26 +1932,27 @@ export async function readSessionsStreaming(
  *
  * `file.keys()` is a root-level snapshot, so the group's child datasets are listed
  * via `getKeys("session_data")`; the struct tables are read through
- * `readStructDatasetStreaming` (with `assumePresent`, since presence is already
+ * `readRawTableStreaming` (with `assumePresent`, since presence is already
  * confirmed), and `points_3d`/`pred_points_3d` + the vlen meta arrays via
  * `getDatasetValue` (whole-read — the tables are small; range-reads can come later).
  */
 async function readSessionDataStreaming(
   file: StreamingH5File,
+  labelsPath: string,
+  nIdentities: number,
+  nFrames: number | null,
 ): Promise<SessionData | null> {
   if (!file.keys().includes("session_data")) return null;
   const children = new Set(await file.getKeys("session_data"));
 
-  const struct = async (
-    name: string,
-  ): Promise<Record<string, unknown[]> | null> => {
+  let allColumnar = true;
+  const struct = async (name: string): Promise<Columns | null> => {
     if (!children.has(name)) return null;
-    const cols = await readStructDatasetStreaming(
-      file,
-      `session_data/${name}`,
-      true,
-    );
-    return Object.keys(cols).length ? cols : null;
+    const table = `session_data/${name}` as ColumnarTableName;
+    const raw = await readRawTableStreaming(file, table, true);
+    allColumnar &&= raw.columnar;
+    if (raw.columnar) return normalizeColumnarTable(labelsPath, table, raw);
+    return Object.keys(raw.columns).length ? raw.columns : null;
   };
   const frameGroups = await struct("frame_groups");
   const instanceGroups = await struct("instance_groups");
@@ -1712,7 +1974,7 @@ async function readSessionDataStreaming(
     return normalizeDatasetArray(d.value);
   };
 
-  return {
+  const sessionData: SessionData = {
     frameGroups,
     instanceGroups,
     members,
@@ -1721,87 +1983,262 @@ async function readSessionDataStreaming(
     frameGroupMeta: await meta("frame_group_meta"),
     instanceGroupMeta: await meta("instance_group_meta"),
   };
+  if (allColumnar) {
+    reportTableProblems(
+      labelsPath,
+      sessionProblems(sessionData, { nIdentities, nFrames }),
+    );
+  }
+  return sessionData;
+}
+
+/** Whether a node is a group of columns: the only thing with no shape. */
+async function isGroupStreaming(
+  file: StreamingH5File,
+  path: string,
+): Promise<boolean> {
+  return (await file.getDatasetMeta(path)).shape === undefined;
+}
+
+/** Read a table's group of columns (SLP 3.0), leaving out its buffer and sub-tables. */
+async function readGroupTableStreaming(
+  file: StreamingH5File,
+  table: ColumnarTableName,
+): Promise<RawTable> {
+  const columns = (
+    await file.getDatasetValue(table, undefined, tableMembers(table))
+  ).value as Columns;
+  const members = await file.getKeys(table);
+  return {
+    columns,
+    otherMembers: members.filter((name) => !(name in columns)),
+    columnar: true,
+  };
 }
 
 /**
- * Read a structured dataset and normalize to column format.
+ * Read one table into columns, whichever layout it is in. The worker reads a group
+ * of columns (SLP 3.0) as it reads a compound table, and a group is the only thing
+ * with no shape. A table the file doesn't have reads as no columns, but a failed read
+ * is thrown: it would otherwise open the file with rows missing, for the next save to
+ * make permanent.
+ *
+ * `file.keys()` lists only the root, so a caller that reads a nested table and has
+ * already found it passes `assumePresent`.
  */
-export async function readStructDatasetStreaming(
+async function readRawTableStreaming(
+  file: StreamingH5File,
+  table: ColumnarTableName,
+  assumePresent = false,
+): Promise<RawTable> {
+  if (!assumePresent && !file.keys().includes(table)) {
+    return { columns: {}, columnar: false };
+  }
+  if (await isGroupStreaming(file, table)) {
+    return readGroupTableStreaming(file, table);
+  }
+  return {
+    columns: await readStructDatasetStrict(file, table),
+    columnar: false,
+  };
+}
+
+/**
+ * Read one table, whichever layout it is in, as columns the rest of this file can index
+ * (`columnar` says it was a group of them), or `null` if the file doesn't have it. Any
+ * failed read is thrown. Mirrors `readTable` in `read.ts`.
+ */
+async function readTableStreaming(
+  file: StreamingH5File,
+  table: ColumnarTableName,
+  labelsPath: string,
+): Promise<{ rows: Rows; columnar: boolean } | null> {
+  if ((await hasPath(file, table)) && (await isGroupStreaming(file, table))) {
+    return {
+      rows: normalizeColumnarTable(
+        labelsPath,
+        table,
+        await readGroupTableStreaming(file, table),
+      ) as Rows,
+      columnar: true,
+    };
+  }
+  const legacyPath = legacyTablePath(table);
+  if (!(await hasPath(file, legacyPath))) return null;
+  return {
+    rows: (await readStructDatasetStrict(file, legacyPath)) as Rows,
+    columnar: false,
+  };
+}
+
+/** The byte buffer a table's rows index into, or `null` if the file doesn't have it. */
+async function readTableBufferStreaming(
+  file: StreamingH5File,
+  table: ColumnarTableName,
+  columnar: boolean,
+): Promise<{ value: unknown; shape: number[] } | null> {
+  const path = tableBufferPath(table, columnar) as string;
+  return (await hasPath(file, path)) ? file.getDatasetValue(path) : null;
+}
+
+/**
+ * The most label image pixels to read from the worker at once. A dataset read as one
+ * piece needs that much of the worker's WebAssembly memory, which stops at 2 GiB and
+ * never shrinks back, and 3-D pixel data reaches that at about 2,000 frames of 512x512.
+ */
+const PIXEL_BLOCK_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Read label image pixel data: a blob (1-D), or frames (3-D), which take a block of
+ * frames at a time once they are too large for one read.
+ *
+ * Exported for testing the block reads without a file of that size; not part of the
+ * public API.
+ */
+export async function readPixelDataStreaming(
   file: StreamingH5File,
   path: string,
-  assumePresent = false,
+  blockBytes: number = PIXEL_BLOCK_BYTES,
+): Promise<LabelImagePixels> {
+  const meta = await file.getDatasetMeta(path);
+  const shape = meta.shape ?? [];
+  const frameBytes =
+    shape[1] * shape[2] * ((meta.metadata?.size as number) ?? 4);
+  if (shape.length !== 3 || shape[0] * frameBytes <= blockBytes) {
+    return file.getDatasetValue(path);
+  }
+  // The worker checks this on whole reads only, so a frame of video doesn't pay for it.
+  checkDatasetFilters(meta, path);
+  const framesPerBlock = Math.max(1, Math.floor(blockBytes / frameBytes));
+  const blocks: unknown[] = [];
+  for (let start = 0; start < shape[0]; start += framesPerBlock) {
+    const end = Math.min(start + framesPerBlock, shape[0]);
+    blocks.push(
+      (await file.getDatasetValue(path, [[start, end], [], []])).value,
+    );
+  }
+  return { value: blocks, shape, framesPerBlock };
+}
+
+/** Read a score-map index and the bytes it indexes into, if the file has them. */
+async function readScoreMapsStreaming(
+  file: StreamingH5File,
+  table: "masks/score_maps" | "label_images/score_maps",
+  labelsPath: string,
+): Promise<ScoreMapTable | null> {
+  const index = await readTableStreaming(file, table, labelsPath);
+  if (!index) return null;
+  const data = await readTableBufferStreaming(file, table, index.columnar);
+  if (!data && !index.columnar) return null;
+  return {
+    rows: index.rows,
+    columnar: index.columnar,
+    data: toBytes(data?.value),
+  };
+}
+
+/**
+ * Read string metadata from a root-level dataset or fall back to a JSON attribute on
+ * the table. v1.9+ writes string datasets; older files use JSON-encoded attrs. Mirrors
+ * `readStringMetadata` in `read.ts`.
+ */
+async function readStringMetadataStreaming(
+  file: StreamingH5File,
+  datasetPath: string,
+  tablePath: string,
+  attrName: string,
+): Promise<string[]> {
+  if (file.keys().includes(datasetPath)) {
+    // Try the "json" attribute on the string dataset first
+    const fromJson = parseStringListAttr(
+      (await file.getAttrs(datasetPath)).json,
+    );
+    if (fromJson.length > 0) return fromJson;
+    // Fall back to raw value
+    const strings = stringsFromDataset(
+      (await file.getDatasetValue(datasetPath)).value,
+    );
+    if (strings) return strings;
+  }
+  return parseStringListAttr((await file.getAttrs(tablePath))[attrName]);
+}
+
+/** The value of `/provenance_json`, if the file has one (see {@link parseProvenance}). */
+async function readProvenanceStreaming(
+  file: StreamingH5File,
+): Promise<unknown> {
+  if (!file.keys().includes("provenance_json")) return undefined;
+  return (await file.getDatasetValue("provenance_json")).value;
+}
+
+/**
+ * Read a structured dataset that is known to exist, as columns. A failed read is
+ * thrown.
+ */
+export async function readStructDatasetStrict(
+  file: StreamingH5File,
+  path: string,
 ): Promise<Record<string, unknown[]>> {
-  try {
-    // `file.keys()` is a root-level snapshot, so a nested path (e.g.
-    // `session_data/frame_groups`) is never listed there — callers that have
-    // already confirmed presence via `getKeys` pass `assumePresent`.
-    if (!assumePresent && !file.keys().includes(path)) return {};
+  const meta = await file.getDatasetMeta(path);
+  // The worker checks this on whole reads only, and a big table is read in slices.
+  checkDatasetFilters(meta, path);
 
-    const meta = await file.getDatasetMeta(path);
-
-    // Get field names: try dtype metadata first, then HDF5 dataset attributes.
-    // Matches main-thread reader's getFieldNames (read.ts:1356-1372).
-    let fieldNames = getFieldNamesFromMeta(meta);
-    if (fieldNames.length === 0) {
-      try {
-        const attrs = await file.getAttrs(path);
-        const fnAttr = attrs.field_names ?? attrs.fieldNames;
-        if (fnAttr) {
-          // Accept an array, a `{value}` wrapper (worker-serialized), or a bare
-          // string/bytes (some backends return the attribute value unwrapped).
-          let raw: unknown = Array.isArray(fnAttr)
-            ? fnAttr
-            : ((fnAttr as { value?: unknown })?.value ?? fnAttr);
-          if (typeof raw === "string") {
-            try {
-              raw = JSON.parse(raw);
-            } catch {
-              /* not JSON */
-            }
-          }
-          if (raw instanceof Uint8Array) {
-            try {
-              raw = JSON.parse(new TextDecoder().decode(raw));
-            } catch {
-              /* not JSON */
-            }
-          }
-          if (Array.isArray(raw)) {
-            fieldNames = raw.map(String);
-          }
+  // Get field names: try dtype metadata first, then HDF5 dataset attributes.
+  // Matches main-thread reader's getFieldNames (read.ts:1356-1372).
+  let fieldNames = getFieldNamesFromMeta(meta);
+  if (fieldNames.length === 0) {
+    const attrs = await file.getAttrs(path);
+    const fnAttr = attrs.field_names ?? attrs.fieldNames;
+    if (fnAttr) {
+      // Accept an array, a `{value}` wrapper (worker-serialized), or a bare
+      // string/bytes (some backends return the attribute value unwrapped).
+      let raw: unknown = Array.isArray(fnAttr)
+        ? fnAttr
+        : ((fnAttr as { value?: unknown })?.value ?? fnAttr);
+      if (typeof raw === "string") {
+        try {
+          raw = JSON.parse(raw);
+        } catch {
+          /* not JSON */
         }
-      } catch {
-        /* ignore attribute read errors */
+      }
+      if (raw instanceof Uint8Array) {
+        try {
+          raw = JSON.parse(new TextDecoder().decode(raw));
+        } catch {
+          /* not JSON */
+        }
+      }
+      if (Array.isArray(raw)) {
+        fieldNames = raw.map(String);
       }
     }
-
-    const shape = (meta.shape ?? []).map(Number);
-    if (shape.length === 2 && shape[0] > 0 && fieldNames.length === shape[1]) {
-      const columns = await readMatrixColumns(
-        file,
-        path,
-        shape[0],
-        shape[1],
-        fieldNames,
-      );
-      if (columns) return columns;
-    }
-    const members = (meta as DatasetMetaWithMembers).metadata?.compound_type
-      ?.members;
-    if (
-      shape.length === 1 &&
-      members?.length &&
-      shape[0] * members.length > MATRIX_SLICE_ELEMENTS
-    ) {
-      const columns = await readCompoundColumns(file, path, shape[0], members);
-      if (columns) return columns;
-    }
-
-    const data = await file.getDatasetValue(path);
-    return normalizeStructData(data.value, data.shape, fieldNames);
-  } catch {
-    return {};
   }
+
+  const shape = (meta.shape ?? []).map(Number);
+  if (shape.length === 2 && shape[0] > 0 && fieldNames.length === shape[1]) {
+    const columns = await readMatrixColumns(
+      file,
+      path,
+      shape[0],
+      shape[1],
+      fieldNames,
+    );
+    if (columns) return columns;
+  }
+  const members = (meta as DatasetMetaWithMembers).metadata?.compound_type
+    ?.members;
+  if (
+    shape.length === 1 &&
+    members?.length &&
+    shape[0] * members.length > MATRIX_SLICE_ELEMENTS
+  ) {
+    const columns = await readCompoundColumns(file, path, shape[0], members);
+    if (columns) return columns;
+  }
+
+  const data = await file.getDatasetValue(path);
+  return normalizeStructData(data.value, data.shape, fieldNames);
 }
 
 /** Elements of a table read per request, so no read holds the whole table. */
@@ -2000,12 +2437,16 @@ function normalizeStructData(
     const [rowCount, colCount] = shape;
     const arr = value as unknown as ArrayLike<number>;
 
-    if (fieldNames.length === colCount) {
+    if (fieldNames.length > 0) {
+      // As the eager reader's normalizeStructDataset: a field past the columns reads
+      // as undefined, and a column past the fields is dropped.
       const result: Record<string, unknown[]> = {};
-      for (let col = 0; col < colCount; col++) {
-        const colData: unknown[] = [];
-        for (let row = 0; row < rowCount; row++) {
-          colData.push(arr[row * colCount + col]);
+      for (let col = 0; col < fieldNames.length; col++) {
+        const colData: unknown[] = new Array(rowCount);
+        if (col < colCount) {
+          for (let row = 0; row < rowCount; row++) {
+            colData[row] = arr[row * colCount + col];
+          }
         }
         result[fieldNames[col]] = colData;
       }
@@ -2053,6 +2494,8 @@ function buildLabeledFrames(options: {
   tracks: Track[];
   videos: Video[];
   formatId: number;
+  /** Filled with each instance at its `/instances` row (unknown types left out). */
+  instancesByRow?: Array<Instance | PredictedInstance>;
 }): LabeledFrame[] {
   const frames: LabeledFrame[] = [];
   const {
@@ -2064,6 +2507,7 @@ function buildLabeledFrames(options: {
     tracks,
     videos,
     formatId,
+    instancesByRow,
   } = options;
   const frameIds = (framesData.frame_id ?? []) as number[];
   const videoIdToIndex = buildVideoIdMap(framesData, videos);
@@ -2090,6 +2534,8 @@ function buildLabeledFrames(options: {
       const instanceType = Number(
         (instancesData.instance_type as number[])?.[instIdx] ?? 0,
       );
+      // Rows of an unknown type are skipped, as in Python.
+      if (instanceType !== 0 && instanceType !== 1) continue;
       const skeletonId = Number(
         (instancesData.skeleton as number[])?.[instIdx] ?? 0,
       );
@@ -2154,6 +2600,7 @@ function buildLabeledFrames(options: {
       }
 
       instanceById.set(instIdx, instance);
+      if (instancesByRow) instancesByRow[instIdx] = instance;
       instances.push(instance);
     }
 

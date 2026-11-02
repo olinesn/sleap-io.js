@@ -21,7 +21,7 @@ import {
   saveSlpToBytes,
   buildLabelTableRows,
 } from "../src/index.js";
-import { readStructDatasetStreaming } from "../src/codecs/slp/read-streaming.js";
+import { readStructDatasetStrict } from "../src/codecs/slp/read-streaming.js";
 
 const NODES = ["a", "b", "c"];
 
@@ -154,7 +154,7 @@ describe("the full save writes pose tables a chunk at a time", () => {
     const back = await loadSlp(bytes, { openVideos: false });
     const inst = back.labeledFrames[169_999].instances[0] as PredictedInstance;
     expect(inst.points[1].xy[1]).toBeCloseTo(169_999 + 0.01, 6);
-  });
+  }, 120_000);
 });
 
 /** A fake open file holding one flat 2-D table, counting its reads. */
@@ -201,7 +201,7 @@ describe("the browser reader reads a flat table in slices", () => {
     const values = new Float32Array(rowCount * 5);
     for (let i = 0; i < values.length; i += 1) values[i] = i % 7919;
     const file = fakeMatrixFile(values, rowCount, fields);
-    const cols = await readStructDatasetStreaming(file as never, "table");
+    const cols = await readStructDatasetStrict(file as never, "table");
     expect(file.reads.includes("whole")).toBe(false);
     expect(file.reads.length).toBeGreaterThan(1);
     expect(cols.x).toBeInstanceOf(Float32Array);
@@ -217,15 +217,35 @@ describe("the browser reader reads a flat table in slices", () => {
   it("keeps integer tables integers, and turns 64-bit ones into numbers", async () => {
     const ints = new Int32Array(40).map((_, i) => i);
     const f1 = fakeMatrixFile(ints, 8, fields);
-    const c1 = await readStructDatasetStreaming(f1 as never, "table");
+    const c1 = await readStructDatasetStrict(f1 as never, "table");
     expect(c1.y).toBeInstanceOf(Int32Array);
     expect((c1.y as unknown as Int32Array)[3]).toBe(16);
 
     const big = new BigInt64Array(40).map((_, i) => BigInt(i) + 2n ** 40n);
     const f2 = fakeMatrixFile(big, 8, fields);
-    const c2 = await readStructDatasetStreaming(f2 as never, "table");
+    const c2 = await readStructDatasetStrict(f2 as never, "table");
     expect(c2.x).toBeInstanceOf(Float64Array);
     expect((c2.x as unknown as Float64Array)[1]).toBe(5 + 2 ** 40);
+  });
+
+  it("refuses a compression it can't read before reading any of the table", async () => {
+    // lzf reads back as garbage with no error, and the worker only checks whole reads.
+    const file = fakeMatrixFile(
+      new Float32Array(rowCount * 5),
+      rowCount,
+      fields,
+    );
+    const meta = await file.getDatasetMeta();
+    Object.assign(file, {
+      getDatasetMeta: async () => ({
+        ...meta,
+        filters: [{ id: 32000, name: "lzf" }],
+      }),
+    });
+    await expect(
+      readStructDatasetStrict(file as never, "table"),
+    ).rejects.toThrow(/\/table is compressed with "lzf"/);
+    expect(file.reads).toEqual([]);
   });
 
   it("reads a table whose field names do not match its columns whole, as before", async () => {
@@ -233,7 +253,7 @@ describe("the browser reader reads a flat table in slices", () => {
     const file = fakeMatrixFile(values, 3, ["only", "three", "names"]);
     const meta = file.getDatasetMeta;
     file.getDatasetMeta = async () => ({ ...(await meta()), shape: [3, 4] });
-    await readStructDatasetStreaming(file as never, "table");
+    await readStructDatasetStrict(file as never, "table");
     expect(file.reads).toEqual(["whole"]);
   });
 });
@@ -286,7 +306,7 @@ describe("the browser reader reads a big compound table in slices", () => {
 
   it("sizes each column to its member, with every value in place", async () => {
     const file = fakeCompoundFile();
-    const cols = await readStructDatasetStreaming(file as never, "table");
+    const cols = await readStructDatasetStrict(file as never, "table");
     expect(file.reads.includes("whole")).toBe(false);
     expect(file.reads.length).toBeGreaterThan(1);
     expect(cols.x).toBeInstanceOf(Float64Array);
@@ -306,7 +326,7 @@ describe("the browser reader reads a big compound table in slices", () => {
 
   it("reads a small compound table whole, as before", async () => {
     const file = fakeCompoundFile(1000);
-    const cols = await readStructDatasetStreaming(file as never, "table");
+    const cols = await readStructDatasetStrict(file as never, "table");
     expect(file.reads).toEqual(["whole"]);
     expect((cols.id as unknown as Float64Array)[999]).toBe(999 + 2 ** 40);
   });

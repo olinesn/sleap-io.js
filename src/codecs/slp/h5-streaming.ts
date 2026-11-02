@@ -13,6 +13,7 @@ import {
   type H5WorkerMessage,
   type H5WorkerResponse,
 } from "./h5-worker.js";
+import { videoNumbersOfEntries, withFrameVideoIds } from "./frame-video-ids.js";
 import {
   RemoteIOError,
   isUrl,
@@ -53,7 +54,10 @@ export interface StreamingH5Options {
 export interface RangeSource {
   /** Total file size in bytes. */
   size: number;
-  /** Read `[offset, offset + length)`; may return fewer bytes at EOF. */
+  /**
+   * Read `[offset, offset + length)`; may return fewer bytes at EOF. A read that
+   * throws, or returns nothing for bytes inside `size`, fails whatever asked for them.
+   */
   readRange: (offset: number, length: number) => Promise<Uint8Array>;
 }
 
@@ -74,8 +78,8 @@ export function isRangeSource(source: unknown): source is RangeSource {
  * returned length in `control[1]` (RETLEN), then set `control[0]` = READY (`2`)
  * and `notify` — RETLEN is stored BEFORE the READY release so a Worker's
  * `Atomics.wait`/load (acquire) sees a consistent (length, data) pair. On a read
- * failure, publishes 0 bytes + READY so the Worker gets a clean short read / EOF
- * instead of hanging.
+ * failure, publishes a length of -1 + READY, so the Worker fails the read instead of
+ * hanging.
  *
  * Extracted from {@link StreamingH5File}'s Worker message handler so the
  * (otherwise Worker-gated) main-thread half of the protocol is unit-testable.
@@ -96,13 +100,32 @@ export async function serviceRangeBridge(
     Atomics.store(control, 0, 2); // STATE = READY
     Atomics.notify(control, 0);
   } catch (err) {
-    // Signal 0 bytes: the Worker treats it as a short read / EOF and h5wasm
-    // surfaces a clean read error rather than hanging.
-    Atomics.store(control, 1, 0);
+    Atomics.store(control, 1, -1); // RETLEN = failed
     Atomics.store(control, 0, 2);
     Atomics.notify(control, 0);
     console.error("[StreamingH5File] readRange failed:", err);
   }
+}
+
+/**
+ * Whether a path exists. Each level is looked up in a listing of its parent, so a failed
+ * read is thrown, not taken for a path that isn't there. `file.keys()` lists only the
+ * root, so a root-level name costs nothing, and a nested one costs a listing per level,
+ * without reading any data.
+ * @internal
+ */
+export async function hasPath(
+  file: Pick<StreamingH5File, "keys" | "getKeys">,
+  path: string,
+): Promise<boolean> {
+  const [root, ...rest] = path.split("/").filter(Boolean);
+  if (!file.keys().includes(root)) return false;
+  let parent = root;
+  for (const part of rest) {
+    if (!(await file.getKeys(parent)).includes(part)) return false;
+    parent = `${parent}/${part}`;
+  }
+  return true;
 }
 
 /**
@@ -569,18 +592,21 @@ export class StreamingH5File {
    * reading values. `metadata` carries the layout details the in-place
    * writability gate needs — `compound_type.members` (per-member dtype class,
    * used to detect Python's non-writable enum/bool columns) and `chunks` (⇒
-   * resizable). Pass this straight to `onDiskTableFromMeta`.
+   * resizable). Pass this straight to `onDiskTableFromMeta`. `filters` lists the
+   * dataset's compression, for `checkDatasetFilters`.
    */
   async getDatasetMeta(path: string): Promise<{
     shape: number[];
     dtype: string;
     metadata?: Record<string, unknown>;
+    filters?: unknown;
   }> {
     const result = await this.send("getDatasetMeta", { path });
     const meta = result.meta as {
       shape: number[];
       dtype: string;
       metadata?: Record<string, unknown>;
+      filters?: unknown;
     };
     return meta;
   }
@@ -590,12 +616,19 @@ export class StreamingH5File {
    *
    * @param path - Path to the dataset
    * @param slice - Optional slice specification (array of [start, end] pairs)
+   * @param skipMembers - When `path` is a group of columns (SLP 3.0), the members
+   *   not to read with them, such as the table's byte buffer
    */
   async getDatasetValue(
     path: string,
     slice?: Array<[number, number] | []>,
+    skipMembers?: readonly string[],
   ): Promise<{ value: unknown; shape: number[]; dtype: string }> {
-    const result = await this.send("getDatasetValue", { path, slice });
+    const result = await this.send("getDatasetValue", {
+      path,
+      slice,
+      skipMembers,
+    });
     const data = result.data as {
       value: unknown;
       shape: number[];
@@ -945,11 +978,19 @@ export class StreamingH5Writer {
    * row-major `Float64Array` here and TRANSFERRED to the Worker (rather than
    * structured-cloning a nested array), which packs them into the on-disk layout
    * (flat matrix or compound record) and replaces the `/metadata` json attr when
-   * `update.metadataJson` is set. Never touches any `video{i}/video` group.
+   * `update.metadataJson` is set. Never touches any `video{i}/video` group. The
+   * file's `videos_json` decides what `frames` and `negative_frames` store for each
+   * video ({@link withFrameVideoIds}); that throws, before anything is written, if
+   * nothing would read back.
    */
   async updateLabelsInPlace(
-    update: LabelTableUpdate,
+    labelTables: LabelTableUpdate,
   ): Promise<H5WorkerResponse> {
+    const { entries } = await this.send("getDestVideosJson");
+    const update = withFrameVideoIds(
+      labelTables,
+      videoNumbersOfEntries(entries),
+    );
     const tables: Array<{
       name: string;
       fields: string[];
@@ -1033,6 +1074,7 @@ export class StreamingH5Writer {
    * structure from {@link saveSlpStructureToBytes}, WITHOUT embedded images) and
    * opened append-mode; call {@link appendEmbeddedVideos} afterwards to copy the
    * big `video{i}/video` datasets from source to dest, then {@link close}.
+   * `sourceFilename` is only what an error calls the source; by default, its name.
    */
   async openAppendOpfs(
     destOpfsPath: string,

@@ -39,6 +39,7 @@ vi.mock("../src/codecs/slp/h5-streaming.js", () => ({
 const { loadSlp } = await import("../src/io/main.js");
 const { readSlp, readSlpLazy } = await import("../src/codecs/slp/read.js");
 const { H5_WORKER_CODE } = await import("../src/codecs/slp/h5-worker.js");
+const { workerFile } = await import("./worker-file");
 
 const FIXTURE = fileURLToPath(
   new URL("./data/slp/minimal_instance.slp", import.meta.url),
@@ -137,6 +138,72 @@ describe("loadSlp, for sources other than a picked file", () => {
   });
 });
 
+describe("loadSlp, when the Worker can't read one table of a file", () => {
+  // A 2.x file, with all five tables a failed read used to leave out.
+  const legacyBytes = () =>
+    new Uint8Array(
+      readFileSync(
+        fileURLToPath(
+          new URL("./data/slp/py_written_30_twin_legacy.slp", import.meta.url),
+        ),
+      ),
+    ).buffer as ArrayBuffer;
+  const poses = (labels: Awaited<ReturnType<typeof loadSlp>>) =>
+    labels.labeledFrames.map((frame) => [
+      frame.frameIdx,
+      frame.isNegative,
+      frame.instances.map((instance) => [
+        instance.constructor.name,
+        instance.points.map((point) => point.xy),
+      ]),
+    ]);
+
+  /** A Worker file that reads the real file, apart from one table that fails. */
+  const fileFailingOn = async (table: string) => {
+    const { file } = await workerFile(legacyBytes());
+    const send = (file as any).send.bind(file);
+    (file as any).send = (type: string, payload: any) =>
+      type === "getDatasetValue" && payload?.path === table
+        ? Promise.reject(new Error(`could not read ${table}`))
+        : send(type, payload);
+    return file;
+  };
+
+  for (const table of [
+    "frames",
+    "instances",
+    "points",
+    "pred_points",
+    "negative_frames",
+  ]) {
+    it(`retries bytes on the main thread when /${table} fails, and gets all of it`, async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const expected = poses(
+        await readSlp(legacyBytes(), { openVideos: false }),
+      );
+      warn.mockClear();
+      const file = await fileFailingOn(table);
+      stubBrowser();
+      openWorker = async () => file;
+      const labels = await loadSlp(legacyBytes(), { openVideos: false });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain("falling back");
+      expect(poses(labels)).toEqual(expected);
+    });
+
+    it(`gives the error for a picked file when /${table} fails`, async () => {
+      const file = await fileFailingOn(table);
+      stubBrowser();
+      openWorker = async () => file;
+      await expect(
+        loadSlp(new File([legacyBytes()], "mice.slp"), {
+          openVideos: false,
+        }),
+      ).rejects.toThrow(`could not read ${table}`);
+    });
+  }
+});
+
 describe("a file HDF5 can't open says so", () => {
   // A valid start with the rest missing fails the same way as not being HDF5.
   const junk = () => new Uint8Array(4096).fill(7);
@@ -161,7 +228,7 @@ describe("a file HDF5 can't open says so", () => {
 
   it("the Worker says the same words, for every way it opens a file", () => {
     expect(H5_WORKER_CODE).not.toContain("keys: currentFile.keys()");
-    const start = H5_WORKER_CODE.indexOf("function keysOfOpenedFile()");
+    const start = H5_WORKER_CODE.indexOf("function keysOfOpenedFile(");
     const end = H5_WORKER_CODE.indexOf("\n}\n", start) + 3;
     const check = new Function(
       "currentFile",

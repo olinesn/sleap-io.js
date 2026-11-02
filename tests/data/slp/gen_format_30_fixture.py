@@ -2,9 +2,9 @@
 """Regenerate ``py_written_30_columnar.slp``, a file in SLP format 3.0.
 
 Python sleap-io 0.10 writes format 3.0 by default: every table is a group of
-columns instead of a compound dataset. This library cannot read that layout yet
-and must refuse it (``tests/slp-newer-format.test.ts``), because read with the 2.x
-code it opens as 0 frames with no error.
+columns instead of a compound dataset. ``tests/slp-format-30.test.ts`` reads this
+file through every reader, and ``tests/slp-newer-format.test.ts`` marks a copy as
+format 4.0 to check that it is refused.
 
 Run from this folder:
 

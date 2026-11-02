@@ -5,8 +5,8 @@
  * its own timeout, so the first test that asks starts it).
  *
  * The Python version is pinned, to 0.9.5. `release/0.10`'s reader takes the same
- * tables (`_TABLE_SPECS`, its `legacy` dtypes), which was checked by reading it, not
- * by running it. To try another version on a saved file, see the top of
+ * tables (`_TABLE_SPECS`, its `legacy` dtypes), which was checked by running it by hand
+ * at e5bf2b170. To try another version on a saved file, see the top of
  * tests/python-read-annotations.py.
  */
 import { afterAll, describe, it, expect, setDefaultTimeout } from "./bun-test";

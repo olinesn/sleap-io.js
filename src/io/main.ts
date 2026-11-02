@@ -59,7 +59,7 @@ function isBrowserWithWorkerSupport(): boolean {
  *   "Finalizing"). Stage counts differ by path (streaming is finer-grained).
  * @returns Loaded Labels object
  * @throws {UnsupportedSlpFormatError} If the file is in an SLP format newer than
- *   this library can read (3.0 or above).
+ *   this library can read (4.0 or above), or requires a feature it doesn't understand.
  */
 export async function loadSlp(
   source: SlpSource,

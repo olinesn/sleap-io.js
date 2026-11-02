@@ -13,6 +13,7 @@ import {
   type H5WorkerMessage,
   type H5WorkerResponse,
 } from "./h5-worker.js";
+import { videoNumbersOfEntries, withFrameVideoIds } from "./frame-video-ids.js";
 import { RemoteIOError, isUrl, resolveUrl } from "../../io/remote.js";
 import type {
   SerializableEmbedEntry,
@@ -939,11 +940,19 @@ export class StreamingH5Writer {
    * row-major `Float64Array` here and TRANSFERRED to the Worker (rather than
    * structured-cloning a nested array), which packs them into the on-disk layout
    * (flat matrix or compound record) and replaces the `/metadata` json attr when
-   * `update.metadataJson` is set. Never touches any `video{i}/video` group.
+   * `update.metadataJson` is set. Never touches any `video{i}/video` group. The
+   * file's `videos_json` decides what `frames` and `negative_frames` store for each
+   * video ({@link withFrameVideoIds}); that throws, before anything is written, if
+   * nothing would read back.
    */
   async updateLabelsInPlace(
-    update: LabelTableUpdate,
+    labelTables: LabelTableUpdate,
   ): Promise<H5WorkerResponse> {
+    const { entries } = await this.send("getDestVideosJson");
+    const update = withFrameVideoIds(
+      labelTables,
+      videoNumbersOfEntries(entries),
+    );
     const tables: Array<{
       name: string;
       fields: string[];

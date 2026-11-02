@@ -36,6 +36,12 @@ import type {
 } from "../../model/label-image.js";
 import { deflate } from "pako";
 import type { Identity } from "../../model/identity.js";
+import { type Event, type EventType, cloneEvent } from "../../model/event.js";
+import {
+  eventColumnsOf,
+  eventSignatures,
+  eventTypeColumnsOf,
+} from "./events.js";
 import { PredictedInstance3D } from "../../model/instance3d.js";
 import type { LazyDataStore } from "../../model/lazy.js";
 import {
@@ -212,6 +218,7 @@ function writeSlpToFile(
   labels: Labels,
   plan?: EmbedPlan | null,
 ): void {
+  labels._collectEvents();
   writeMetadata(file, labels);
 
   const videoNumbers =
@@ -223,6 +230,7 @@ function writeSlpToFile(
   writeTracks(file, labels.tracks);
   writeSuggestions(file, labels.suggestions, labels.videos);
   writeIdentities(file, labels.identities);
+  writeEvents(file, labels);
   writeSessions(
     file,
     labels.sessions,
@@ -355,6 +363,7 @@ class LazySourceFallback extends Error {
  * @throws LazySourceFallback if any session references a swapped video.
  */
 function makeLazySourceLabels(labels: Labels): Labels {
+  labels._collectEvents();
   const restoredVideos = labels.videos.map((v) => v.sourceVideo ?? v);
   const videoMap = new Map<Video, Video>();
   for (let i = 0; i < labels.videos.length; i++) {
@@ -394,6 +403,8 @@ function makeLazySourceLabels(labels: Labels): Labels {
     suggestions: remappedSuggestions,
     sessions: labels.sessions, // safe: verified no swapped refs
     identities: labels.identities,
+    eventTypes: labels.eventTypes,
+    events: eventsOnVideos(labels.events, videoMap),
     provenance: labels.provenance,
     rois: labels._staticRois,
   });
@@ -583,12 +594,14 @@ function writeSlpToFileLazy(file: any, labels: Labels): void {
     );
   }
 
+  labels._collectEvents();
   writeMetadata(file, labels);
   const videoNumbers = writeVideos(file, labels.videos);
   writeVideoCrops(file, labels.videos);
   writeTracks(file, labels.tracks);
   writeSuggestions(file, labels.suggestions, labels.videos);
   writeIdentities(file, labels.identities);
+  writeEvents(file, labels);
   // Sessions: pass empty labeledFrames since they aren't materialized.
   // Frame-group refs resolved by lf index will be lost — matches Python.
   writeSessions(file, labels.sessions, labels.videos, [], labels.identities);
@@ -829,6 +842,8 @@ export interface SlpWriteHeader {
   identities?: Identity[];
   sessions?: RecordingSession[];
   provenance?: Record<string, unknown>;
+  eventTypes?: EventType[];
+  events?: Event[];
 }
 
 /** Whether a detection carries an identity, category or embedding. */
@@ -1806,6 +1821,8 @@ export async function openSlpWriter(
       sessions: header.sessions ?? [],
       identities: header.identities ?? [],
       provenance: header.provenance ?? {},
+      eventTypes: header.eventTypes ?? [],
+      events: header.events ?? [],
     });
 
     writeMetadata(file, headerLabels);
@@ -1814,6 +1831,7 @@ export async function openSlpWriter(
     writeTracks(file, headerLabels.tracks);
     writeSuggestions(file, headerLabels.suggestions, headerLabels.videos);
     writeIdentities(file, headerLabels.identities);
+    writeEvents(file, headerLabels);
     writeSessions(
       file,
       headerLabels.sessions,
@@ -1907,6 +1925,8 @@ export interface MergeStoresOptions {
   suggestions?: SuggestionFrame[];
   provenance?: Record<string, unknown>;
   windowFrames?: number;
+  eventTypes?: EventType[];
+  events?: Event[];
 }
 
 /**
@@ -1943,6 +1963,8 @@ async function buildMergedWriter(
     identities: options?.identities,
     sessions: options?.sessions,
     provenance: options?.provenance,
+    eventTypes: options?.eventTypes,
+    events: options?.events,
   });
 
   try {
@@ -2045,6 +2067,9 @@ async function writeSlpBytes(
   { includeEmbeddedData }: { includeEmbeddedData: boolean },
 ): Promise<Uint8Array> {
   const embedMode = options?.embed ?? false;
+  // An event may reference a video nothing else does: register it before any plan
+  // is made from the video list.
+  labels._collectEvents();
 
   // Auto-preserve already-embedded videos unless the caller externalizes them.
   // An already-embedded video is ALWAYS raw-copied (preserved) unless the caller
@@ -2135,6 +2160,11 @@ async function writeSlpBytes(
       provenance: labels.provenance,
       rois: labels._staticRois,
       identities: labels.identities,
+      eventTypes: labels.eventTypes,
+      events: eventsOnVideos(
+        labels.events,
+        new Map(labels.videos.map((v, i) => [v, restoredVideos[i]])),
+      ),
     });
   }
 
@@ -2295,6 +2325,12 @@ function writeMetadata(file: any, labels: Labels): void {
   // CATALOG alone (identities present but unlinked) does not trigger it.
   if (hasPerDetectionIdentity(labels)) {
     formatId = Math.max(formatId, 2.5);
+  }
+
+  // v2.6: frame-spanning events (/event_types catalog + /events), only when there
+  // is event data to persist.
+  if (labels.events.length > 0 || labels.eventTypes.length > 0) {
+    formatId = Math.max(formatId, 2.6);
   }
 
   // v2.7: class/category subsystem (/categories catalog + /categories/links +
@@ -2672,6 +2708,125 @@ function writeIdentities(file: any, identities: Identity[]): void {
     file.create_dataset({ name: "identity/meta_key", data: metaKey });
     file.create_dataset({ name: "identity/meta_val", data: metaVal });
   }
+}
+
+/** `events` with each video swapped through `videoMap`; shares unswapped events. */
+function eventsOnVideos(events: Event[], videoMap: Map<Video, Video>): Event[] {
+  if (!events.length) return events;
+  return events.map((ev) => {
+    const video = ev.video ? videoMap.get(ev.video) : undefined;
+    return video && video !== ev.video ? cloneEvent(ev, { video }) : ev;
+  });
+}
+
+/** The optional entity-attribute-value metadata table of an event group. */
+function writeEavMetadata(
+  file: any,
+  group: string,
+  owners: ArrayLike<number | bigint> | undefined,
+  keys: string[] | undefined,
+  vals: string[] | undefined,
+): void {
+  if (!owners || !keys || !vals) return;
+  file.create_dataset({
+    name: `${group}/meta_owner`,
+    data: Int32Array.from(owners as ArrayLike<number>),
+    shape: [owners.length],
+    dtype: "<i", // int32 (see the dtype-char note above)
+  });
+  file.create_dataset({ name: `${group}/meta_key`, data: keys });
+  file.create_dataset({ name: `${group}/meta_val`, data: vals });
+}
+
+/**
+ * Write the event catalog and the events (SLP 2.6), in the layout Python sleap-io
+ * reads and writes: an `/event_types` group (`name`, optional `description`, optional
+ * `meta_*`) and an `/events` group with one dataset per column (the `score`, `scores`
+ * + `score_offsets` and `meta_*` columns only when some event uses them). Writes
+ * nothing when there are no event types and no events, so such files stay
+ * byte-identical.
+ */
+function writeEvents(file: any, labels: Labels): void {
+  if (labels.eventTypes.length) {
+    const types = eventTypeColumnsOf(labels.eventTypes);
+    file.create_group("event_types");
+    file.create_dataset({ name: "event_types/name", data: types.name });
+    if (types.description) {
+      file.create_dataset({
+        name: "event_types/description",
+        data: types.description,
+      });
+    }
+    writeEavMetadata(
+      file,
+      "event_types",
+      types.metaOwner,
+      types.metaKey,
+      types.metaVal,
+    );
+  }
+  const n = labels.events.length;
+  if (!n) return;
+  const cols = eventColumnsOf(
+    labels.events,
+    labels.videos,
+    labels.eventTypes,
+    labels.tracks,
+    labels.identities,
+  );
+  file.create_group("events");
+  const int64 = (name: string, values: ArrayLike<number | bigint>) =>
+    file.create_dataset({
+      name: `events/${name}`,
+      data: BigInt64Array.from(values as ArrayLike<number>, (v) => BigInt(v)),
+      shape: [values.length],
+      dtype: "<q", // true int64 (see the dtype-char note above)
+    });
+  const int8 = (name: string, values: ArrayLike<number | bigint>) =>
+    file.create_dataset({
+      name: `events/${name}`,
+      data: Int8Array.from(values as ArrayLike<number>),
+      shape: [values.length],
+      dtype: "<b",
+    });
+  int64("video", cols.video);
+  int64("start_frame", cols.startFrame);
+  int64("end_frame", cols.endFrame);
+  int64("type", cols.type);
+  int8("subject_kind", cols.subjectKind);
+  int8("target_kind", cols.targetKind);
+  int64("subject_idx", cols.subjectIdx);
+  int64("target_idx", cols.targetIdx);
+  file.create_dataset({
+    name: "events/is_predicted",
+    data: Uint8Array.from(cols.isPredicted as ArrayLike<number>),
+    shape: [n],
+    dtype: "<B",
+  });
+  file.create_dataset({ name: "events/name", data: cols.name });
+  file.create_dataset({ name: "events/source", data: cols.source });
+  if (cols.score) {
+    file.create_dataset({
+      name: "events/score",
+      data: Float64Array.from(cols.score),
+      shape: [n],
+      dtype: "<d",
+    });
+  }
+  if (cols.scores && cols.scoreOffsets) {
+    const m = cols.scores.length;
+    file.create_dataset({
+      name: "events/scores",
+      data: Float32Array.from(cols.scores),
+      shape: [m],
+      dtype: "<f", // float32 (see the dtype-char note above)
+      chunks: [Math.min(WRITE_CHUNK_ROWS, Math.max(1, m))],
+      compression: "gzip",
+      compression_opts: 1,
+    });
+    int64("score_offsets", cols.scoreOffsets);
+  }
+  writeEavMetadata(file, "events", cols.metaOwner, cols.metaKey, cols.metaVal);
 }
 
 // ---- Per-detection identity/embedding owner types (SLP 2.5) --------------------
@@ -3748,6 +3903,12 @@ export interface OnDiskSidecars {
   rowReferences?: string[];
   /** Per-video signatures (see {@link buildVideoSignatures}). */
   videos: string[] | null;
+  /**
+   * Event catalog + events signatures (see {@link buildEventSignatures}). Leaving
+   * it out means "no events on disk", so a project with events falls back to a full
+   * re-save unless the caller probes them (`readEventSignaturesStreaming`).
+   */
+  events?: string[] | null;
 }
 
 /**
@@ -3765,7 +3926,23 @@ export function buildExpectedSidecars(labels: Labels): OnDiskSidecars {
     metadataJson: buildMetadataJson(labels),
     rowReferences: findRowReferences(labels),
     videos: buildVideoSignatures(labels.videos),
+    events: buildEventSignatures(labels),
   };
+}
+
+/** Signatures of the events a `labels` would write, to compare with what is on disk. */
+export function buildEventSignatures(labels: Labels): string[] {
+  labels._collectEvents();
+  return eventSignatures(
+    eventTypeColumnsOf(labels.eventTypes),
+    eventColumnsOf(
+      labels.events,
+      labels.videos,
+      labels.eventTypes,
+      labels.tracks,
+      labels.identities,
+    ),
+  );
 }
 
 /** Element-wise string-array equality (null treated as empty). */
@@ -3797,6 +3974,8 @@ function sameStringArray(a: string[] | null, b: string[] | null): boolean {
  *    the (rewritten) frames table's `video` indices would point into a stale
  *    video list. Compared semantically via per-video signatures
  *    ({@link buildVideoSignatures}), not a byte-exact `videos_json` diff; OR
+ *  - the events or their catalog changed — the in-place writer does NOT rewrite
+ *    `/event_types` / `/events`; OR
  *  - the `/metadata` json changed (e.g. a skeleton or provenance edit) but
  *    `update.metadataJson` was not set to carry that change into the attr; OR
  *  - anything points at a detection by its row or position ({@link findRowReferences}):
@@ -3898,6 +4077,18 @@ export function checkInPlaceWritable(
     return {
       ok: false,
       reason: `the project has ${sidecars.expected.rowReferences.join(", ")}, which point at detections by position; an in-place save cannot update those tables (an edit that moved a detection would leave them on another animal) — re-save the whole file instead`,
+    };
+  }
+  if (
+    !sameStringArray(
+      sidecars.onDisk.events ?? null,
+      sidecars.expected.events ?? null,
+    )
+  ) {
+    return {
+      ok: false,
+      reason:
+        "the events changed; an in-place save cannot update /event_types or /events — re-save the whole file instead",
     };
   }
   if (

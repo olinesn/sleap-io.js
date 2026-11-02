@@ -220,6 +220,7 @@ export {
   buildSuggestionsJson,
   buildVideoSignatures,
   buildExpectedSidecars,
+  buildEventSignatures,
   checkInPlaceWritable,
   onDiskTableFromMeta,
   writeLabelTablesInPlace,

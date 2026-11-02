@@ -285,10 +285,6 @@ async function openFromUrl(
   url: string,
   options?: OpenH5Options,
 ): Promise<{ file: H5File; close: () => void }> {
-  const filename =
-    options?.filenameHint ??
-    url.split("/").pop()?.split("?")[0] ??
-    "slp-data.slp";
   const streamMode = options?.stream ?? "auto";
   const hasHeaders = !!(
     options?.headers && Object.keys(options.headers).length > 0
@@ -317,19 +313,29 @@ async function openFromUrl(
     (streamMode === "auto" || streamMode === "range")
   ) {
     const mountPath = `/slp-remote-${Date.now()}`;
+    // Under a name of our own, so the path can't fail: a hint can be a full path or a
+    // URL, and a failed path here would silently mean the whole-file download below.
+    // The worker does the same: openRemoteFile in h5-worker.ts.
+    const lazyPath = `${mountPath}/remote.slp`;
     fs.mkdir?.(mountPath);
     try {
-      fs.createLazyFile(mountPath, filename, resolved, true, false);
-      const file = new module.File(`${mountPath}/${filename}`, "r");
+      fs.createLazyFile(mountPath, "remote.slp", resolved, true, false);
+      const file = new module.File(lazyPath, "r");
       return {
         file,
         close: () => {
           file.close();
-          fs.unlink?.(`${mountPath}/${filename}`);
+          fs.unlink?.(lazyPath);
           fs.rmdir?.(mountPath);
         },
       };
     } catch {
+      // The first read can fail with the lazy file already made (a server that refuses
+      // HEAD, a missing file), and rmdir would then throw instead of reaching the
+      // download. On the main thread, createLazyFile fails before making it.
+      try {
+        fs.unlink?.(lazyPath);
+      } catch {}
       fs.rmdir?.(mountPath);
     }
   }

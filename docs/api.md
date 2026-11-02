@@ -763,15 +763,38 @@ The SLP format version (`format_id`) is set automatically based on content:
 | 2.3 | Virtual video crops present |
 | 2.4 | Persisted mask `fromPredicted` provenance link |
 
+##### Format 3.0
+
+Python sleap-io 0.10 writes format 3.0 by default, which stores every table as a group
+of columns. Every reader here reads it, checking each table's layout on its own.
+
+A 3.0 table is held to the same rules as in Python: a missing required column, columns
+of different lengths, or ranges and links that contradict each other (a frame's
+instances, an instance's points, a link to a row that doesn't exist) throw an error
+naming the table. 2.x tables are read as leniently as before.
+
+This library writes the 2.x layout, so saving a project opened from a 3.0 file keeps
+its poses, tracks, sessions and annotations but not:
+
+- unknown columns, and the per-record `metadata/` of instances, frames and boxes (the
+  reader warns about these on the console when it opens the file);
+- the `labeled` flag: an unlabeled point becomes a hidden point with no location,
+  which is what Python's `legacy_format=True` with `unlabeled_as="absent"` writes
+  (the reader warns about this too);
+- float64 scores, which the 2.x tables store as float32.
+
+A file with columns compressed by Python's `compression="lzf"` is refused, because
+the HDF5 build this library uses can't decompress them (`"gzip"` reads fine). The
+in-place save refuses a 3.0 file too, so an app falls back to saving the whole file.
+
 ##### Files newer than this library
 
-This library reads SLP formats below 3.0. Python sleap-io 0.10 writes format 3.0 by
-default, which stores every table as a group of columns. Every reader (`loadSlp`,
-`readSlp`, `readSlpLazy`, `readSlpStreaming`, and `loadSlpMetadata` and
-`validateSlpBuffer` from the lite entry) refuses such a file with an
-`UnsupportedSlpFormatError` instead of opening it as an empty project.
+This library reads SLP formats below 4.0. Every reader (`loadSlp`, `readSlp`,
+`readSlpLazy`, `readSlpStreaming`, and `loadSlpMetadata` and `validateSlpBuffer` from
+the lite entry) refuses a newer file, or one whose `required_features` lists something
+it doesn't understand, with an `UnsupportedSlpFormatError` instead of misreading it.
 
-To open one here, re-save it from Python in the 2.x layout:
+To open one here, upgrade sleap-io.js or re-save it from Python in the 2.x layout:
 
 ```python
 import sleap_io as sio
@@ -780,7 +803,8 @@ sio.save_slp(sio.load_slp("mice.slp"), "mice_2x.slp", legacy_format=True)
 ```
 
 Apps can catch the error to word it for their own users. Its `formatId` holds the
-file's version:
+file's version, and `unsupportedFeatures` the features it requires that this library
+doesn't understand, if that is why it was refused:
 
 ```ts
 try {

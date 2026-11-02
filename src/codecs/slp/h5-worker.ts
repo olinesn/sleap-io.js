@@ -143,10 +143,29 @@ let rangeMaxChunk = 0;
 // sees the real size of the already-written bytes instead of an empty file.
 let writeFileSize = 0;
 
+// The first read of a file that failed, on any device. It leaves HDF5 stopped mid-call,
+// holding state for bytes that never came (its buffers read as zeros afterwards, so the
+// same read tried again would succeed with the wrong data) and h5wasm freeing pointers
+// from a buffer that was never filled. So nothing more comes out of this worker: every
+// answer from here on is this error, whatever became of the request. See initH5Wasm.
+let failedRead = null;
+
+function errorText(error) {
+  // Robustly extract error message from various error types
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object') {
+    // Handle Emscripten errors which may be objects with various properties
+    return error.message || error.error || error.reason || JSON.stringify(error);
+  }
+  return 'Unknown error';
+}
+
 self.onmessage = async function(e) {
   const { type, payload, id } = e.data;
 
   try {
+    if (failedRead && type !== 'close') throw failedRead;
     switch (type) {
       case 'init':
         await initH5Wasm(payload?.h5wasmUrl);
@@ -246,6 +265,10 @@ self.onmessage = async function(e) {
         respond(id, openAppendOpfsResult);
         break;
 
+      case 'getDestVideosJson':
+        respond(id, { success: true, entries: getDestVideosJson() });
+        break;
+
       case 'updateLabelsInPlace':
         const updateResult = updateLabelsInPlace(payload);
         respond(id, updateResult);
@@ -272,30 +295,22 @@ self.onmessage = async function(e) {
         break;
 
       case 'getDatasetValue':
-        const data = getDatasetValue(payload.path, payload.slice);
+        const data = getDatasetValue(payload.path, payload.slice, payload.skipMembers);
         respond(id, { success: true, data }, data.transferables);
         break;
 
       case 'close':
-        closeFile();
-        respond(id, { success: true });
+        // Not after a failed read: closing would have HDF5 flush what it holds over the
+        // file. The caller ends this worker next, which releases everything.
+        if (!failedRead) closeFile();
+        self.postMessage({ id, success: true });
         break;
 
       default:
         respond(id, { success: false, error: 'Unknown message type: ' + type });
     }
   } catch (error) {
-    // Robustly extract error message from various error types
-    let errorMessage = 'Unknown error';
-    if (error instanceof Error) {
-      errorMessage = error.message;
-    } else if (typeof error === 'string') {
-      errorMessage = error;
-    } else if (error && typeof error === 'object') {
-      // Handle Emscripten errors which may be objects with various properties
-      errorMessage = error.message || error.error || error.reason || JSON.stringify(error);
-    }
-    respond(id, { success: false, error: errorMessage });
+    respond(id, { success: false, error: errorText(error) });
   }
 };
 
@@ -314,7 +329,9 @@ function queueEncode(id, fn) {
 }
 
 function respond(id, data, transferables) {
-  if (transferables) {
+  if (failedRead) {
+    self.postMessage({ id, success: false, error: errorText(failedRead) });
+  } else if (transferables) {
     self.postMessage({ id, ...data }, transferables);
   } else {
     self.postMessage({ id, ...data });
@@ -343,6 +360,17 @@ async function initH5Wasm(h5wasmUrl) {
       if (String(what).includes('://')) throw new Error('Aborted(' + what + ')');
     };
   }
+  // Every device's reads pass through here. HDF5 and h5wasm can each swallow what a read
+  // throws, and h5wasm ignores a failed H5Dread, so a read has to be caught at this end.
+  const read = FS.read;
+  FS.read = function() {
+    try {
+      return read.apply(this, arguments);
+    } catch (error) {
+      failedRead = failedRead || error;
+      throw error;
+    }
+  };
 }
 
 async function openRemoteFile(url, filename = 'data.h5', headers) {
@@ -405,13 +433,23 @@ async function openRemoteFile(url, filename = 'data.h5', headers) {
 // Opening doesn't throw for a file HDF5 can't open: it hands back an invalid id, and
 // keys() then fails with "error - name not defined!". Same words as
 // cannotOpenAsHdf5Message in h5.ts, which this worker code can't import.
-function keysOfOpenedFile() {
-  if (Number(currentFile.file_id) < 0) {
-    throw new Error("Could not open '" + currentFilename + "' as an HDF5 file. "
+function keysOfOpenedFile(file = currentFile, name = currentFilename) {
+  if (Number(file.file_id) < 0) {
+    throw new Error("Could not open '" + name + "' as an HDF5 file. "
       + "It may be missing, incomplete (cut off, or still downloading), or not a "
       + "SLEAP file at all.");
   }
-  return currentFile.keys();
+  return file.keys();
+}
+
+// Mount a File with WORKERFS (zero-copy access) and return the path to open. It goes
+// in under a name of our own, so that path can't disagree with the mount. WORKERFS
+// would otherwise use file.name, which needn't work as a path ('', '/a.slp', '../a.slp').
+// A name the caller gives the file is only for showing: it can be a full path or a URL.
+function mountWorkerfsFile(file, dir) {
+  FS.mkdir(dir);
+  FS.mount(FS.filesystems.WORKERFS, { blobs: [{ name: 'local.h5', data: file }] }, dir);
+  return dir + '/local.h5';
 }
 
 async function openLocalFile(file, filename) {
@@ -422,21 +460,14 @@ async function openLocalFile(file, filename) {
   // Close any existing file
   closeFile();
 
-  // Use provided filename or file.name
-  const fname = filename || file.name || 'local.h5';
-
   // Create mount point for WORKERFS
   mountPath = '/local-' + Date.now();
   mountType = 'local';
-  currentFilename = fname;
-  FS.mkdir(mountPath);
-
-  // Mount the file using WORKERFS (zero-copy access)
-  FS.mount(FS.filesystems.WORKERFS, { files: [file] }, mountPath);
+  // What messages call this file: the provided filename or file.name
+  currentFilename = filename || file.name || 'local.h5';
 
   // Open with h5wasm
-  const filePath = mountPath + '/' + fname;
-  currentFile = new h5wasm.File(filePath, 'r');
+  currentFile = new h5wasm.File(mountWorkerfsFile(file, mountPath), 'r');
 
   return {
     success: true,
@@ -480,6 +511,16 @@ async function openBufferFile(buffer, filename = 'data.h5') {
   };
 }
 
+// BLOCK until the main thread has answered the request in STATE. In a loop, because a
+// wake-up can belong to the last request: the main thread sets READY, then notifies, and
+// this thread may not have needed that notify, and be waiting on its next request by the
+// time it comes. Taking that for an answer would read the last request's bytes.
+function waitForBridge(state) {
+  while (Atomics.load(rangeControl, 0) === state) {
+    Atomics.wait(rangeControl, 0, state);
+  }
+}
+
 // B-seam: request [offset, offset+want) from the main thread and BLOCK the worker
 // until it writes the bytes back into the shared data area and wakes us. Returns a
 // view over the shared data area (valid only until the next bridgeRead) — callers
@@ -488,12 +529,19 @@ async function openBufferFile(buffer, filename = 'data.h5') {
 // dual-bridge main-thread listener (StreamingH5Writer.openAppend) can route the
 // request to the right reader; the single-bridge paths (createRangeFile) pass no
 // target, which is harmless — those listeners don't look at it.
+//
+// Every caller asks only for bytes inside the file, so getting none back is a failure,
+// reported or not. A short read would look like the end of the file, and HDF5 fills that
+// in with zeros, so the data would read as zeros.
 function bridgeRead(offset, length, target) {
   var want = length < rangeMaxChunk ? length : rangeMaxChunk;
   Atomics.store(rangeControl, 0, 1);                                  // STATE = REQUEST
   self.postMessage({ type: 'rangeRequest', target: target, offset: offset, length: want });
-  Atomics.wait(rangeControl, 0, 1);                                  // block until STATE != REQUEST
+  waitForBridge(1);
   var got = Atomics.load(rangeControl, 1);                           // RETLEN (acquire)
+  if (got <= 0) {
+    throw new Error('Could not read ' + want + ' bytes at offset ' + offset + ' of the file.');
+  }
   return rangeData.subarray(0, got);
 }
 
@@ -520,7 +568,6 @@ function createRangeFile(parent, name, size) {
     var pos = position;
     while (pos < end) {
       var chunk = bridgeRead(pos, end - pos);
-      if (chunk.length === 0) break;                                  // short read / EOF
       buffer.set(chunk, offset + got);
       got += chunk.length;
       pos += chunk.length;
@@ -556,7 +603,6 @@ function createSourceRangeFile(parent, name, size) {
     var pos = position;
     while (pos < end) {
       var chunk = bridgeRead(pos, end - pos, 'source');
-      if (chunk.length === 0) break;                                  // short read / EOF
       buffer.set(chunk, offset + got);
       got += chunk.length;
       pos += chunk.length;
@@ -606,7 +652,7 @@ function bridgeWrite(fileOffset, buffer, bufOffset, length, target) {
     rangeData.set(buffer.subarray(bufOffset + written, bufOffset + written + want), 0);
     Atomics.store(rangeControl, 0, 3);                                   // STATE = WRITE_REQUEST
     self.postMessage({ type: 'writeRequest', target: target, offset: fileOffset + written, length: want });
-    Atomics.wait(rangeControl, 0, 3);                                    // block until != WRITE_REQUEST
+    waitForBridge(3);
     if (Atomics.load(rangeControl, 1) !== 0) {
       throw new Error('bridgeWrite failed at offset ' + (fileOffset + written));
     }
@@ -619,7 +665,7 @@ function bridgeWrite(fileOffset, buffer, bufOffset, length, target) {
 function bridgeTruncate(len, target) {
   Atomics.store(rangeControl, 0, 4);                                     // STATE = TRUNCATE_REQUEST
   self.postMessage({ type: 'truncateRequest', target: target, length: len });
-  Atomics.wait(rangeControl, 0, 4);
+  waitForBridge(4);
   if (Atomics.load(rangeControl, 1) !== 0) throw new Error('bridgeTruncate failed at len ' + len);
 }
 
@@ -673,7 +719,6 @@ function createWriteRangeFile(parent, name, initialSize) {
     var got = 0, pos = position;
     while (pos < end) {
       var chunk = bridgeRead(pos, end - pos, 'dest');
-      if (chunk.length === 0) break;
       buffer.set(chunk, offset + got);
       got += chunk.length;
       pos += chunk.length;
@@ -895,14 +940,9 @@ async function openAppendOpfs(destOpfsPath, sourceFile, structureBytes, sourceFi
   closeFile();
 
   // SOURCE: the user's opened file, read-only via WORKERFS (on-demand sync reads).
-  var srcFname = (sourceFile && sourceFile.name) || sourceFilename || 'source.slp';
-  srcFname = (((srcFname).split('/').pop() || '').split('\\\\').pop()) || 'source.slp';
   sourceMountPath = '/opfs-append-src-' + Date.now();
-  sourceMountFilename = srcFname;
   sourceMountIsWorkerfs = true;
-  FS.mkdir(sourceMountPath);
-  FS.mount(FS.filesystems.WORKERFS, { files: [sourceFile] }, sourceMountPath);
-  currentSourceFile = new h5wasm.File(sourceMountPath + '/' + srcFname, 'r');
+  currentSourceFile = new h5wasm.File(mountWorkerfsFile(sourceFile, sourceMountPath), 'r');
 
   // DEST: seed the OPFS file with the structure bytes, then open it append-mode
   // over the OPFS write device.
@@ -925,7 +965,7 @@ async function openAppendOpfs(destOpfsPath, sourceFile, structureBytes, sourceFi
 
   return {
     success: true,
-    sourceKeys: currentSourceFile.keys(),
+    sourceKeys: keysOfOpenedFile(currentSourceFile, sourceFilename || sourceFile.name || 'source.slp'),
     destKeys: currentDestFile.keys()
   };
 }
@@ -974,13 +1014,12 @@ function getSourceBlobGroupInfo(sourceGroup) {
     layout = isVlen ? 'vlen' : 'concat';
   }
   var frameSizes = null;
-  try {
-    var fsDs = currentSourceFile.get(sourceGroup + '/frame_sizes');
-    if (fsDs) {
-      var raw = fsDs.value;
-      frameSizes = raw instanceof Int32Array ? raw : Int32Array.from(raw);
-    }
-  } catch (e) { /* no frame_sizes dataset (legacy source) - leave null */ }
+  // Absent on a legacy source, where get() finds nothing.
+  var fsDs = currentSourceFile.get(sourceGroup + '/frame_sizes');
+  if (fsDs) {
+    var raw = fsDs.value;
+    frameSizes = raw instanceof Int32Array ? raw : Int32Array.from(raw);
+  }
   info = { layout: layout, videoDs: videoDs, frameSizes: frameSizes, offsets: null };
   sourceBlobGroupCache[sourceGroup] = info;
   return info;
@@ -1190,6 +1229,9 @@ function writeOneTableInPlaceWorker(file, diskName, fields, flat, rowCount, colC
     setStringAttrWorker(file.get(diskName), 'field_names', JSON.stringify(fields));
     return;
   }
+  if (typeof ds.keys === 'function' && ds.shape === undefined) {
+    throw new Error('in-place update of ' + diskName + ': it is a group of columns (SLP format 3.0), which cannot be written in place - re-save the whole file instead');
+  }
   var md = ds.metadata;
   var members = md && md.compound_type && md.compound_type.members;
   var isCompound = !!(members && members.length > 0);
@@ -1224,6 +1266,15 @@ function writeOneTableInPlaceWorker(file, diskName, fields, flat, rowCount, colC
   } else {
     ds.write_slice([[0, rowCount], [0, colCount]], flat);
   }
+}
+
+// The open DEST file's videos_json, which updateLabelsInPlace leaves as it is. The
+// main thread needs it to decide what /frames stores for each video (see
+// withFrameVideoIds, used by StreamingH5Writer.updateLabelsInPlace).
+function getDestVideosJson() {
+  if (!currentDestFile) throw new Error('getDestVideosJson: no dest file open (call openWrite first)');
+  var ds = currentDestFile.get('videos_json');
+  return ds ? ds.value : [];
 }
 
 // Worker port of writeLabelTablesInPlace (write.ts — KEEP IN LOCKSTEP): patch the
@@ -1295,10 +1346,17 @@ function getDatasetMeta(path) {
   if (!currentFile) throw new Error('No file open');
   const dataset = currentFile.get(path);
   if (!dataset) throw new Error('Dataset not found: ' + path);
+  let filters;
+  try {
+    filters = dataset.filters;
+  } catch (e) {
+    // an h5wasm that can't list filters; nothing to go on
+  }
   return {
     shape: dataset.shape,
     dtype: dataset.dtype,
-    metadata: dataset.metadata
+    metadata: dataset.metadata,
+    filters
   };
 }
 
@@ -1373,10 +1431,70 @@ function readCompoundColumnsWorker(dataset, M) {
   return { columns: columns, buffers: buffers };
 }
 
-function getDatasetValue(path, slice) {
+// Refuse a filter this HDF5 build doesn't have: h5wasm logs the failure but hands back
+// the buffer it allocated, so the file would read as garbage numbers with no error.
+// Mirrors checkDatasetFilters in ./columnar.ts (keep them in lockstep).
+function checkDatasetFiltersWorker(dataset, path) {
+  let filters;
+  try {
+    filters = dataset.filters;
+  } catch (e) {
+    return; // an h5wasm that can't list filters; nothing to go on
+  }
+  if (!Array.isArray(filters)) return;
+  for (let i = 0; i < filters.length; i++) {
+    if (filters[i].id > 6) {
+      throw new Error('/' + path + ' is compressed with "' + (filters[i].name || filters[i].id) + '", which sleap-io.js cannot read. Re-save the file from Python sleap-io with compression="gzip" or without compression.');
+    }
+  }
+}
+
+// Read a table stored as a group with one 1-D dataset per column (SLP 3.0), so it
+// reaches the main thread in the same { field: array } shape as a compound table.
+// Subgroups and other shapes aren't columns. 64-bit integers become Float64Array
+// (exact below 2^53, as in readCompoundColumnsWorker); mirrors numberColumn and
+// readH5GroupColumns in ./columnar.ts (keep them in lockstep). skipMembers names the
+// 1-D members that aren't columns (byte buffers), so they aren't read with the rows.
+function readGroupColumnsWorker(group, path, skipMembers) {
+  const columns = {};
+  const buffers = [];
+  const names = group.keys();
+  for (let k = 0; k < names.length; k++) {
+    if (skipMembers && skipMembers.indexOf(names[k]) !== -1) continue;
+    const child = group.get(names[k]);
+    if (!child || !child.shape || child.shape.length !== 1) continue;
+    checkDatasetFiltersWorker(child, path + '/' + names[k]);
+    let col = child.value;
+    const signed = col instanceof BigInt64Array;
+    if (signed || col instanceof BigUint64Array) {
+      const lo = new Uint32Array(col.buffer, col.byteOffset, col.length * 2);
+      const hi = signed ? new Int32Array(col.buffer, col.byteOffset, lo.length) : lo;
+      const out = new Float64Array(col.length);
+      for (let i = 0; i < out.length; i++) out[i] = hi[2 * i + 1] * 4294967296 + lo[2 * i];
+      col = out;
+    }
+    columns[names[k]] = col;
+    if (ArrayBuffer.isView(col)) buffers.push(col.buffer);
+  }
+  return { columns: columns, buffers: buffers };
+}
+
+function getDatasetValue(path, slice, skipMembers) {
   if (!currentFile) throw new Error('No file open');
   const dataset = currentFile.get(path);
   if (!dataset) throw new Error('Dataset not found: ' + path);
+
+  if (typeof dataset.keys === 'function' && dataset.shape === undefined) {
+    const res = readGroupColumnsWorker(dataset, path, skipMembers);
+    return {
+      value: { type: 'columns', columns: res.columns },
+      shape: dataset.shape,
+      dtype: dataset.dtype,
+      transferables: res.buffers
+    };
+  }
+  // Whole reads only: a frame read of an embedded video shouldn't pay for this.
+  if (!slice) checkDatasetFiltersWorker(dataset, path);
 
   // Variable-length (vlen) datasets: h5wasm's high-level dataset.slice() corrupts
   // the heap here — its post-read reclaim walks the FULL dataset dataspace over a
@@ -1607,6 +1725,7 @@ export type H5WorkerMessageType =
   | "openWrite"
   | "openWriteOpfs"
   | "openAppendOpfs"
+  | "getDestVideosJson"
   | "updateLabelsInPlace"
   | "getKeys"
   | "getAttr"

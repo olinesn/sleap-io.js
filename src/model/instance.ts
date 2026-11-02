@@ -224,6 +224,14 @@ export class Instance {
   trackingScore: number;
 
   /**
+   * The instance this one is a copy of, for an app that rebuilds an instance it still
+   * means to be the same detection (an undo, say). Multi-camera groups hold instances,
+   * and this is how a group finds a member's copy after either has been moved. Never
+   * saved. No slot until set: a project can have millions of instances.
+   */
+  declare copyOf?: Instance | null;
+
+  /**
    * Persistent cross-video re-ID identity of this detection (SLP 2.5+), distinct
    * from the ephemeral within-video {@link Track}. Persisted in the `/identity`
    * catalog + `/identity/links`; attached after read, defaults to null.

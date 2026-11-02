@@ -139,10 +139,29 @@ let rangeMaxChunk = 0;
 // sees the real size of the already-written bytes instead of an empty file.
 let writeFileSize = 0;
 
+// The first read of a file that failed, on any device. It leaves HDF5 stopped mid-call,
+// holding state for bytes that never came (its buffers read as zeros afterwards, so the
+// same read tried again would succeed with the wrong data) and h5wasm freeing pointers
+// from a buffer that was never filled. So nothing more comes out of this worker: every
+// answer from here on is this error, whatever became of the request. See initH5Wasm.
+let failedRead = null;
+
+function errorText(error) {
+  // Robustly extract error message from various error types
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object') {
+    // Handle Emscripten errors which may be objects with various properties
+    return error.message || error.error || error.reason || JSON.stringify(error);
+  }
+  return 'Unknown error';
+}
+
 self.onmessage = async function(e) {
   const { type, payload, id } = e.data;
 
   try {
+    if (failedRead && type !== 'close') throw failedRead;
     switch (type) {
       case 'init':
         await initH5Wasm(payload?.h5wasmUrl);
@@ -277,25 +296,17 @@ self.onmessage = async function(e) {
         break;
 
       case 'close':
-        closeFile();
-        respond(id, { success: true });
+        // Not after a failed read: closing would have HDF5 flush what it holds over the
+        // file. The caller ends this worker next, which releases everything.
+        if (!failedRead) closeFile();
+        self.postMessage({ id, success: true });
         break;
 
       default:
         respond(id, { success: false, error: 'Unknown message type: ' + type });
     }
   } catch (error) {
-    // Robustly extract error message from various error types
-    let errorMessage = 'Unknown error';
-    if (error instanceof Error) {
-      errorMessage = error.message;
-    } else if (typeof error === 'string') {
-      errorMessage = error;
-    } else if (error && typeof error === 'object') {
-      // Handle Emscripten errors which may be objects with various properties
-      errorMessage = error.message || error.error || error.reason || JSON.stringify(error);
-    }
-    respond(id, { success: false, error: errorMessage });
+    respond(id, { success: false, error: errorText(error) });
   }
 };
 
@@ -314,7 +325,9 @@ function queueEncode(id, fn) {
 }
 
 function respond(id, data, transferables) {
-  if (transferables) {
+  if (failedRead) {
+    self.postMessage({ id, success: false, error: errorText(failedRead) });
+  } else if (transferables) {
     self.postMessage({ id, ...data }, transferables);
   } else {
     self.postMessage({ id, ...data });
@@ -335,6 +348,17 @@ async function initH5Wasm(h5wasmUrl) {
   h5wasmModule = h5wasm;
   // FS is exposed directly on h5wasm module after ready
   FS = h5wasm.FS;
+  // Every device's reads pass through here. HDF5 and h5wasm can each swallow what a read
+  // throws, and h5wasm ignores a failed H5Dread, so a read has to be caught at this end.
+  const read = FS.read;
+  FS.read = function() {
+    try {
+      return read.apply(this, arguments);
+    } catch (error) {
+      failedRead = failedRead || error;
+      throw error;
+    }
+  };
 }
 
 async function openRemoteFile(url, filename = 'data.h5', headers) {
@@ -476,6 +500,16 @@ async function openBufferFile(buffer, filename = 'data.h5') {
   };
 }
 
+// BLOCK until the main thread has answered the request in STATE. In a loop, because a
+// wake-up can belong to the last request: the main thread sets READY, then notifies, and
+// this thread may not have needed that notify, and be waiting on its next request by the
+// time it comes. Taking that for an answer would read the last request's bytes.
+function waitForBridge(state) {
+  while (Atomics.load(rangeControl, 0) === state) {
+    Atomics.wait(rangeControl, 0, state);
+  }
+}
+
 // B-seam: request [offset, offset+want) from the main thread and BLOCK the worker
 // until it writes the bytes back into the shared data area and wakes us. Returns a
 // view over the shared data area (valid only until the next bridgeRead) — callers
@@ -484,12 +518,19 @@ async function openBufferFile(buffer, filename = 'data.h5') {
 // dual-bridge main-thread listener (StreamingH5Writer.openAppend) can route the
 // request to the right reader; the single-bridge paths (createRangeFile) pass no
 // target, which is harmless — those listeners don't look at it.
+//
+// Every caller asks only for bytes inside the file, so getting none back is a failure,
+// reported or not. A short read would look like the end of the file, and HDF5 fills that
+// in with zeros, so the data would read as zeros.
 function bridgeRead(offset, length, target) {
   var want = length < rangeMaxChunk ? length : rangeMaxChunk;
   Atomics.store(rangeControl, 0, 1);                                  // STATE = REQUEST
   self.postMessage({ type: 'rangeRequest', target: target, offset: offset, length: want });
-  Atomics.wait(rangeControl, 0, 1);                                  // block until STATE != REQUEST
+  waitForBridge(1);
   var got = Atomics.load(rangeControl, 1);                           // RETLEN (acquire)
+  if (got <= 0) {
+    throw new Error('Could not read ' + want + ' bytes at offset ' + offset + ' of the file.');
+  }
   return rangeData.subarray(0, got);
 }
 
@@ -516,7 +557,6 @@ function createRangeFile(parent, name, size) {
     var pos = position;
     while (pos < end) {
       var chunk = bridgeRead(pos, end - pos);
-      if (chunk.length === 0) break;                                  // short read / EOF
       buffer.set(chunk, offset + got);
       got += chunk.length;
       pos += chunk.length;
@@ -552,7 +592,6 @@ function createSourceRangeFile(parent, name, size) {
     var pos = position;
     while (pos < end) {
       var chunk = bridgeRead(pos, end - pos, 'source');
-      if (chunk.length === 0) break;                                  // short read / EOF
       buffer.set(chunk, offset + got);
       got += chunk.length;
       pos += chunk.length;
@@ -602,7 +641,7 @@ function bridgeWrite(fileOffset, buffer, bufOffset, length, target) {
     rangeData.set(buffer.subarray(bufOffset + written, bufOffset + written + want), 0);
     Atomics.store(rangeControl, 0, 3);                                   // STATE = WRITE_REQUEST
     self.postMessage({ type: 'writeRequest', target: target, offset: fileOffset + written, length: want });
-    Atomics.wait(rangeControl, 0, 3);                                    // block until != WRITE_REQUEST
+    waitForBridge(3);
     if (Atomics.load(rangeControl, 1) !== 0) {
       throw new Error('bridgeWrite failed at offset ' + (fileOffset + written));
     }
@@ -615,7 +654,7 @@ function bridgeWrite(fileOffset, buffer, bufOffset, length, target) {
 function bridgeTruncate(len, target) {
   Atomics.store(rangeControl, 0, 4);                                     // STATE = TRUNCATE_REQUEST
   self.postMessage({ type: 'truncateRequest', target: target, length: len });
-  Atomics.wait(rangeControl, 0, 4);
+  waitForBridge(4);
   if (Atomics.load(rangeControl, 1) !== 0) throw new Error('bridgeTruncate failed at len ' + len);
 }
 
@@ -669,7 +708,6 @@ function createWriteRangeFile(parent, name, initialSize) {
     var got = 0, pos = position;
     while (pos < end) {
       var chunk = bridgeRead(pos, end - pos, 'dest');
-      if (chunk.length === 0) break;
       buffer.set(chunk, offset + got);
       got += chunk.length;
       pos += chunk.length;
@@ -965,13 +1003,12 @@ function getSourceBlobGroupInfo(sourceGroup) {
     layout = isVlen ? 'vlen' : 'concat';
   }
   var frameSizes = null;
-  try {
-    var fsDs = currentSourceFile.get(sourceGroup + '/frame_sizes');
-    if (fsDs) {
-      var raw = fsDs.value;
-      frameSizes = raw instanceof Int32Array ? raw : Int32Array.from(raw);
-    }
-  } catch (e) { /* no frame_sizes dataset (legacy source) - leave null */ }
+  // Absent on a legacy source, where get() finds nothing.
+  var fsDs = currentSourceFile.get(sourceGroup + '/frame_sizes');
+  if (fsDs) {
+    var raw = fsDs.value;
+    frameSizes = raw instanceof Int32Array ? raw : Int32Array.from(raw);
+  }
   info = { layout: layout, videoDs: videoDs, frameSizes: frameSizes, offsets: null };
   sourceBlobGroupCache[sourceGroup] = info;
   return info;

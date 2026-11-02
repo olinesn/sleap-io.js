@@ -49,7 +49,10 @@ export interface StreamingH5Options {
 export interface RangeSource {
   /** Total file size in bytes. */
   size: number;
-  /** Read `[offset, offset + length)`; may return fewer bytes at EOF. */
+  /**
+   * Read `[offset, offset + length)`; may return fewer bytes at EOF. A read that
+   * throws, or returns nothing for bytes inside `size`, fails whatever asked for them.
+   */
   readRange: (offset: number, length: number) => Promise<Uint8Array>;
 }
 
@@ -70,8 +73,8 @@ export function isRangeSource(source: unknown): source is RangeSource {
  * returned length in `control[1]` (RETLEN), then set `control[0]` = READY (`2`)
  * and `notify` — RETLEN is stored BEFORE the READY release so a Worker's
  * `Atomics.wait`/load (acquire) sees a consistent (length, data) pair. On a read
- * failure, publishes 0 bytes + READY so the Worker gets a clean short read / EOF
- * instead of hanging.
+ * failure, publishes a length of -1 + READY, so the Worker fails the read instead of
+ * hanging.
  *
  * Extracted from {@link StreamingH5File}'s Worker message handler so the
  * (otherwise Worker-gated) main-thread half of the protocol is unit-testable.
@@ -92,13 +95,32 @@ export async function serviceRangeBridge(
     Atomics.store(control, 0, 2); // STATE = READY
     Atomics.notify(control, 0);
   } catch (err) {
-    // Signal 0 bytes: the Worker treats it as a short read / EOF and h5wasm
-    // surfaces a clean read error rather than hanging.
-    Atomics.store(control, 1, 0);
+    Atomics.store(control, 1, -1); // RETLEN = failed
     Atomics.store(control, 0, 2);
     Atomics.notify(control, 0);
     console.error("[StreamingH5File] readRange failed:", err);
   }
+}
+
+/**
+ * Whether a path exists. Each level is looked up in a listing of its parent, so a failed
+ * read is thrown, not taken for a path that isn't there. `file.keys()` lists only the
+ * root, so a root-level name costs nothing, and a nested one costs a listing per level,
+ * without reading any data.
+ * @internal
+ */
+export async function hasPath(
+  file: Pick<StreamingH5File, "keys" | "getKeys">,
+  path: string,
+): Promise<boolean> {
+  const [root, ...rest] = path.split("/").filter(Boolean);
+  if (!file.keys().includes(root)) return false;
+  let parent = root;
+  for (const part of rest) {
+    if (!(await file.getKeys(parent)).includes(part)) return false;
+    parent = `${parent}/${part}`;
+  }
+  return true;
 }
 
 /**

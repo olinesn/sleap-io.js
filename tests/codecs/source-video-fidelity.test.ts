@@ -246,51 +246,64 @@ describe("readSourceVideoGroupJsonStreaming", () => {
   const blob =
     '{"filename":"o.mp4","backend":{"shape":[80,384,384,1],"filename":"o.mp4"}}';
 
+  /** A file with `video0/source_video`, whose members and attributes are these. */
+  const fileWith = (
+    members: string[],
+    file: {
+      getAttrs?: (path: string) => Promise<Record<string, unknown>>;
+      getDatasetValue?: () => Promise<{
+        value: unknown;
+        shape: number[];
+        dtype: string;
+      }>;
+    },
+  ) => ({
+    keys: () => ["video0"],
+    getKeys: async (p: string) =>
+      p === "video0" ? ["video", "source_video"] : members,
+    getAttrs: file.getAttrs ?? (async () => ({})),
+    getDatasetValue:
+      file.getDatasetValue ??
+      (async () => {
+        throw new Error("no dataset");
+      }),
+  });
+
   it("reads the json attribute (normal case)", async () => {
-    const file = {
-      getKeys: async () => [],
+    const file = fileWith([], {
       getAttrs: async (p: string) =>
         p === "video0/source_video" ? { json: blob } : {},
-      getDatasetValue: async () => {
-        throw new Error("no dataset");
-      },
-    };
+    });
     const dict = await readSourceVideoGroupJsonStreaming(file, "video0");
     expect(dict).not.toBeNull();
     expect((dict?.backend as any).shape).toEqual([80, 384, 384, 1]);
   });
 
   it("prefers the json dataset when present (oversized metadata)", async () => {
-    const file = {
-      getKeys: async () => ["json"],
-      getAttrs: async () => ({}),
+    const file = fileWith(["json"], {
       getDatasetValue: async () => ({ value: blob, shape: [1], dtype: "S" }),
-    };
+    });
     const dict = await readSourceVideoGroupJsonStreaming(file, "video0");
     expect((dict?.backend as any).shape).toEqual([80, 384, 384, 1]);
   });
 
   it("decodes a scalar |S<n> json dataset returned as a plain string (#214)", async () => {
     // What the h5wasm worker returns for Python's np.bytes_ scalar spill.
-    const file = {
-      getKeys: async () => ["json"],
-      getAttrs: async () => ({}),
+    const file = fileWith(["json"], {
       getDatasetValue: async () => ({ value: blob, shape: [], dtype: "A73" }),
-    };
+    });
     const dict = await readSourceVideoGroupJsonStreaming(file, "video0");
     expect((dict?.backend as any).shape).toEqual([80, 384, 384, 1]);
   });
 
   it("decodes a scalar json dataset returned as raw bytes (#214)", async () => {
-    const file = {
-      getKeys: async () => ["json"],
-      getAttrs: async () => ({}),
+    const file = fileWith(["json"], {
       getDatasetValue: async () => ({
         value: new TextEncoder().encode(blob),
         shape: [],
         dtype: "B",
       }),
-    };
+    });
     const dict = await readSourceVideoGroupJsonStreaming(file, "video0");
     expect((dict?.backend as any).shape).toEqual([80, 384, 384, 1]);
   });
@@ -298,27 +311,66 @@ describe("readSourceVideoGroupJsonStreaming", () => {
   it("falls back to the attribute when the dataset read throws (#214)", async () => {
     // A throw from getDatasetValue must not lose the lineage when the attribute
     // is still available (parity with the sync reader's scoped guard).
-    const file = {
-      getKeys: async () => ["json"],
+    const file = fileWith(["json"], {
       getAttrs: async (p: string) =>
         p === "video0/source_video" ? { json: blob } : {},
       getDatasetValue: async () => {
         throw new Error("boom");
       },
-    };
+    });
     const dict = await readSourceVideoGroupJsonStreaming(file, "video0");
     expect((dict?.backend as any).shape).toEqual([80, 384, 384, 1]);
   });
 
-  it("returns null when the group is absent", async () => {
-    const file = {
-      getKeys: async () => [],
-      getAttrs: async () => ({}),
+  it("gives the error when the dataset read throws and there is no attribute", async () => {
+    // The lineage is in that dataset, so a null here would lose it at the next save.
+    const file = fileWith(["json"], {
       getDatasetValue: async () => {
-        throw new Error("no dataset");
+        throw new Error("boom");
       },
+    });
+    await expect(
+      readSourceVideoGroupJsonStreaming(file, "video0"),
+    ).rejects.toThrow("boom");
+  });
+
+  it("gives the error when the group's attributes can't be read", async () => {
+    const file = fileWith([], {
+      getAttrs: async () => {
+        throw new Error("boom");
+      },
+    });
+    await expect(
+      readSourceVideoGroupJsonStreaming(file, "video0"),
+    ).rejects.toThrow("boom");
+  });
+
+  it("returns null when the group is absent", async () => {
+    const throwing = async () => {
+      throw new Error("no such path");
     };
-    expect(await readSourceVideoGroupJsonStreaming(file, "video0")).toBeNull();
+    expect(
+      await readSourceVideoGroupJsonStreaming(
+        {
+          keys: () => ["video0"],
+          getKeys: async () => ["video"],
+          getAttrs: throwing,
+          getDatasetValue: throwing,
+        },
+        "video0",
+      ),
+    ).toBeNull();
+    expect(
+      await readSourceVideoGroupJsonStreaming(
+        {
+          keys: () => [],
+          getKeys: throwing,
+          getAttrs: throwing,
+          getDatasetValue: throwing,
+        },
+        "video0",
+      ),
+    ).toBeNull();
   });
 });
 

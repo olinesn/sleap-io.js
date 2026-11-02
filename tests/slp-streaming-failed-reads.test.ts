@@ -1,12 +1,20 @@
 /**
- * A table the streaming reader can't read is an error, in any layout.
+ * Anything the streaming reader can't read is an error, in any layout.
  *
- * The worker can fail on a table that exists: a dropped connection, a file that went
- * away, a compression filter it refuses. Reading that as a table with no rows opens the
- * project with poses missing, skips `loadSlp`'s retry, and hands the loss to the next
- * save. A table the file doesn't have is a different thing, and still reads as empty.
+ * The worker can fail on something that exists: a dropped connection, a file that went
+ * away, a compression filter it refuses. Reading that as a table with no rows, or a file
+ * with no videos, opens the project with data missing, skips `loadSlp`'s retry, and hands
+ * the loss to the next save. What the file doesn't have is a different thing, and still
+ * reads as empty.
  */
-import { afterEach, describe, expect, it, vi } from "./bun-test";
+import {
+  afterEach,
+  describe,
+  expect,
+  it,
+  setDefaultTimeout,
+  vi,
+} from "./bun-test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -17,7 +25,10 @@ import {
   saveSlpToBytes,
 } from "../src/codecs/slp/write.js";
 import { Labels } from "../src/index.js";
-import { readRecording, tmpPath } from "./worker-file";
+import { poses, readRecording, tmpPath } from "./worker-file";
+
+// Failing every request in turn reads a file a hundred times, more slowly under coverage.
+setDefaultTimeout(120_000);
 
 const fixture = (name: string): ArrayBuffer =>
   new Uint8Array(
@@ -38,17 +49,6 @@ const quietWarnings = () =>
 
 const bufferOf = (bytes: Uint8Array): ArrayBuffer =>
   new Uint8Array(bytes).buffer as ArrayBuffer;
-
-/** What the frame tables hold, in a form `toEqual` can compare. */
-const poses = (labels: Labels) =>
-  Array.from(labels.labeledFrames).map((frame) => ({
-    frameIdx: frame.frameIdx,
-    isNegative: frame.isNegative,
-    instances: frame.instances.map((instance) => ({
-      type: instance.constructor.name,
-      points: instance.points.map((point) => point.xy),
-    })),
-  }));
 
 /** Saved by `saveSlpToBytes`: some tables flat, with an attribute naming the columns. */
 const saved = async () =>
@@ -117,7 +117,7 @@ describe("a failed read of a table that exists is an error", () => {
         for (const read of reads) {
           for (const lazy of [false, true]) {
             await expect(
-              readRecording(bytes, failing(read, table), lazy),
+              readRecording(bytes, failing(read, table), { lazy }),
             ).rejects.toThrow(`could not read ${table}`);
           }
         }
@@ -149,7 +149,7 @@ describe("a failed read of a table that exists is an error", () => {
     for (const lazy of [false, true]) {
       it(`gives the reason, not an empty project${lazy ? " (lazy)" : ""}`, async () => {
         await expect(
-          readRecording(fixture(LZF), undefined, lazy),
+          readRecording(fixture(LZF), undefined, { lazy }),
         ).rejects.toThrow(/\/frames is compressed with "lzf".*Re-save/);
       });
     }
@@ -271,7 +271,7 @@ describe("a table the file doesn't have still reads as empty", () => {
       expect(requests.filter(([, p]) => p === table)).toEqual([]);
       expect(poses(labels)).toEqual(eager);
 
-      const lazy = await readRecording(bytes, undefined, true);
+      const lazy = await readRecording(bytes, undefined, { lazy: true });
       expect(lazy.requests.filter(([, p]) => p === table)).toEqual([]);
       lazy.labels.materialize();
       expect(poses(lazy.labels)).toEqual(eager);
@@ -294,5 +294,200 @@ describe("a table the file doesn't have still reads as empty", () => {
       bufferOf(await saveSlpToBytes(new Labels())),
     );
     expect(empty.labels.labeledFrames.length).toBe(0);
+  });
+});
+
+describe("any request the reader makes", () => {
+  const WITHOUT_VIDEOS = [
+    PYTHON_2X,
+    PYTHON_30,
+    "py_written_25_identity.slp",
+    "py_written_27_category.slp",
+    "py_written_28_multiview3d.slp",
+    "py_written_annotations.slp",
+    "predictions_1.2.7_provenance_and_tracking.slp",
+    "js_flat_annotations.slp",
+    "multiview.slp",
+    "imgvideo.slp",
+    "typical.slp",
+  ];
+  const WITH_VIDEOS = [
+    "minimal_instance.pkg.slp",
+    "spilled_source_video.pkg.slp",
+    "cropped_format_2_3.pkg.slp",
+    "py_written_30_embedded.pkg.slp",
+    "py_written_30_embedded_legacy.pkg.slp",
+  ];
+  const cases: Array<
+    [string, () => ArrayBuffer | Promise<ArrayBuffer>, object]
+  > = [
+    ...WITHOUT_VIDEOS.map(
+      (file) =>
+        [file, () => fixture(file), {}] as [string, () => ArrayBuffer, object],
+    ),
+    ...WITH_VIDEOS.flatMap((file) =>
+      [{}, { openVideos: true }, { lazyVideoMetadata: true }].map(
+        (options) =>
+          [
+            `${file} ${JSON.stringify(options)}`,
+            () => fixture(file),
+            options,
+          ] as [string, () => ArrayBuffer, object],
+      ),
+    ),
+    [
+      "saved here, so with identities_json",
+      async () =>
+        bufferOf(
+          await saveSlpToBytes(
+            await readSlp(fixture("py_written_25_identity.slp"), {
+              openVideos: false,
+            }),
+          ),
+        ),
+      {},
+    ],
+  ];
+
+  for (const [name, bytes, options] of cases) {
+    it(`${name}: failing any of them is an error`, async () => {
+      quietWarnings();
+      const file = await bytes();
+      const { requests, refused } = await readRecording(
+        file,
+        undefined,
+        options,
+      );
+      // Everything asked for is there, so a request that fails can't be taken for one
+      // that found nothing.
+      expect(refused).toEqual([]);
+
+      const distinct = new Map(requests.map((r) => [r.join(" "), r]));
+      expect(distinct.size).toBeGreaterThan(0);
+      for (const [request, [type, path]] of distinct) {
+        const message = `could not read: ${request}`;
+        await expect(
+          readRecording(
+            file,
+            (t, p) =>
+              t === type && p === path ? new Error(message) : undefined,
+            options,
+          ),
+        ).rejects.toThrow(message);
+      }
+    });
+  }
+});
+
+describe("what a file doesn't have isn't a failed read", () => {
+  /** A small file: `build` adds to its root. */
+  async function smallFile(
+    videos: object[],
+    build: (f: any) => void = () => {},
+  ): Promise<ArrayBuffer> {
+    const module = await ready;
+    const p = await tmpPath();
+    const f: any = new H5File(p, "w");
+    const meta = f.create_group("metadata");
+    meta.create_attribute("format_id", 2.8);
+    meta.create_attribute(
+      "json",
+      JSON.stringify({
+        version: "2.0.0",
+        skeletons: [{ graph: { name: "s" }, links: [], nodes: [{ id: 0 }] }],
+        nodes: [{ name: "a" }],
+      }),
+    );
+    f.create_dataset({
+      name: "videos_json",
+      data: videos.map((video) => JSON.stringify(video)),
+    });
+    build(f);
+    f.close();
+    const out = module.FS.readFile(p);
+    module.FS.unlink(p);
+    return new Uint8Array(out).buffer as ArrayBuffer;
+  }
+
+  for (const options of [
+    {},
+    { openVideos: true },
+    { lazyVideoMetadata: true },
+  ]) {
+    const label = JSON.stringify(options);
+
+    it(`a video in another file, whose dataset isn't here ${label}`, async () => {
+      const { labels, refused } = await readRecording(
+        await smallFile([
+          {
+            filename: "other.h5",
+            backend: { filename: "other.h5", dataset: "box" },
+          },
+        ]),
+        undefined,
+        options,
+      );
+      expect(refused).toEqual([]);
+      expect(labels.videos.length).toBe(1);
+    });
+
+    it(`an embedded video whose group isn't here ${label}`, async () => {
+      const { labels, refused } = await readRecording(
+        await smallFile([
+          {
+            filename: ".",
+            backend: { filename: ".", dataset: "video7/video" },
+          },
+          { filename: ".", backend: { filename: "." } },
+        ]),
+        undefined,
+        options,
+      );
+      // Opening videos tries to read a frame's shape from each one with a dataset.
+      expect(refused.map(([, path]) => path)).toEqual(
+        "openVideos" in options ? ["video7/video"] : [],
+      );
+      expect(labels.videos.length).toBe(2);
+    });
+  }
+
+  it("a dataset path with a leading slash still finds the dataset", async () => {
+    const { labels, refused } = await readRecording(
+      await smallFile(
+        [
+          {
+            filename: ".",
+            backend: { filename: ".", dataset: "/video0/video" },
+          },
+        ],
+        (f) => {
+          const group = f.create_group("video0");
+          group.create_dataset({
+            name: "video",
+            data: new Uint8Array(8),
+            shape: [1, 8],
+          });
+          group.get("video").create_attribute("channel_order", "BGR");
+        },
+      ),
+    );
+    expect(refused).toEqual([]);
+    expect(labels.videos[0].backendMetadata.channel_order).toBe("BGR");
+  });
+
+  it("identities with some of their metadata columns", async () => {
+    const bytes = await smallFile([{ filename: "a.mp4", backend: {} }], (f) => {
+      const identity = f.create_group("identity");
+      identity.create_dataset({ name: "name", data: ["mouse"] });
+      identity.create_dataset({
+        name: "meta_owner",
+        data: new Int32Array([0]),
+      });
+    });
+    const { labels, refused } = await readRecording(bytes);
+    expect(refused).toEqual([]);
+    const eager = await readSlp(bytes, { openVideos: false });
+    expect(labels.identities.map((i) => i.name)).toEqual(["mouse"]);
+    expect(eager.identities.map((i) => i.name)).toEqual(["mouse"]);
   });
 });

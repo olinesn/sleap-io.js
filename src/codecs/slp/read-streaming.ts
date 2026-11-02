@@ -15,11 +15,22 @@ import {
   type StreamingH5Source,
 } from "./h5-streaming.js";
 import {
+  type ColumnarTableName,
+  type Columns,
+  indexOutOfRange,
+  normalizeColumnarTable,
+  normalizePoseTables,
+  type RawTable,
+  reportTableProblems,
+  sessionProblems,
+} from "./columnar.js";
+import {
   attrToNumber,
   attrToString,
-  checkFormatId,
+  checkSlpFormat,
   datasetValueToString,
   parseMetadataJson,
+  parseProvenance,
   missingMetadataJsonError,
   parseJsonEntry,
   decodeEntryText,
@@ -325,12 +336,7 @@ export async function readFromStreamingFile(
   } catch {
     throw missingMetadataJsonError(labelsPath);
   }
-  const formatId = Number(
-    (metadataAttrs["format_id"] as { value?: number })?.value ??
-      metadataAttrs["format_id"] ??
-      1.0,
-  );
-  checkFormatId(formatId, labelsPath);
+  const formatId = checkSlpFormat(metadataAttrs, labelsPath);
   // Throws the same helpful error if the `metadata` group exists but its
   // required `json` attribute is missing/empty (truncated/corrupt file);
   // mirrors Python sleap-io PR #446 and matches the eager/lazy readers.
@@ -366,15 +372,24 @@ export async function readFromStreamingFile(
 
   // Read frame/instance/point data
   report(4);
-  const framesData = await readStructDatasetStreaming(file, "frames");
+  const framesRaw = await readRawTableStreaming(file, "frames");
   report(5);
-  const instancesData = await readStructDatasetStreaming(file, "instances");
+  const instancesRaw = await readRawTableStreaming(file, "instances");
   report(6);
-  const pointsData = await readStructDatasetStreaming(file, "points");
-  const predPointsData = await readStructDatasetStreaming(file, "pred_points");
-  const negativeFrames = negativeFrameKeys(
-    await readStructDatasetStreaming(file, "negative_frames"),
-  );
+  const pointsRaw = await readRawTableStreaming(file, "points");
+  const predPointsRaw = await readRawTableStreaming(file, "pred_points");
+  const pose = normalizePoseTables(labelsPath, videos.length, {
+    frames: framesRaw,
+    instances: instancesRaw,
+    points: pointsRaw,
+    predPoints: predPointsRaw,
+  });
+  const { framesData, instancesData, pointsData, predPointsData } = pose;
+  const negativeFrames =
+    pose.negativeFrames ??
+    negativeFrameKeys(
+      await readStructDatasetStreaming(file, "negative_frames"),
+    );
 
   // Build labeled frames eagerly, or (lazy mode) wrap the columnar tables in a
   // LazyDataStore and defer LabeledFrame/Instance construction to first access.
@@ -392,6 +407,8 @@ export async function readFromStreamingFile(
         negativeFrames,
       })
     : undefined;
+  // One entry per /instances row, so links to instances index it by row.
+  const allInstances: Array<Instance | PredictedInstance> = [];
   const labeledFrames = lazyStore
     ? undefined
     : buildLabeledFrames({
@@ -403,6 +420,7 @@ export async function readFromStreamingFile(
         tracks,
         videos,
         formatId,
+        instancesByRow: allInstances,
       });
   if (labeledFrames) {
     markNegativeFrames(labeledFrames, negativeFrames, framesData, videos);
@@ -417,10 +435,9 @@ export async function readFromStreamingFile(
   // on-demand attach in materializeFrame.
   if (labeledFrames || lazyStore) {
     const { links, embs, catLinks, catEmbs, categoryCatalog } =
-      await readStreamingInstanceIdentity(file);
+      await readStreamingInstanceIdentity(file, labelsPath, identities.length);
     if (links.size || embs.size || catLinks.size || catEmbs.size) {
       if (labeledFrames) {
-        const allInstances = labeledFrames.flatMap((f) => f.instances);
         for (const [ownerId, [idx, score]] of links) {
           const inst = allInstances[ownerId];
           if (inst && idx >= 0 && idx < identities.length) {
@@ -481,15 +498,14 @@ export async function readFromStreamingFile(
         }
       }
       // Resolve deferred instance refs (mirrors the eager reader).
-      const allInst = labeledFrames.flatMap((lf) => lf.instances);
       for (const lf of labeledFrames) {
         for (const c of lf.centroids) {
           if (
             c._instanceIdx !== null &&
             c._instanceIdx >= 0 &&
-            c._instanceIdx < allInst.length
+            allInstances[c._instanceIdx]
           ) {
-            c.instance = allInst[c._instanceIdx];
+            c.instance = allInstances[c._instanceIdx];
             c._instanceIdx = null;
           }
         }
@@ -520,6 +536,7 @@ export async function readFromStreamingFile(
     skeletons,
     identities,
     rawSessions,
+    { labelsPath, nFrames: (framesData.frame_id ?? []).length },
   );
 
   onProgress?.(total, total, "Finalizing");
@@ -534,7 +551,10 @@ export async function readFromStreamingFile(
     suggestions,
     sessions,
     identities,
-    provenance: (metadataJson?.provenance as Record<string, unknown>) ?? {},
+    provenance: parseProvenance(
+      await readProvenanceStreaming(file),
+      metadataJson,
+    ),
   });
   if (lazyStore) {
     // Attach the lazy proxies BEFORE injectSessionFrameResolver so the resolver's
@@ -1177,7 +1197,11 @@ async function readIdentitiesStreaming(
  * result is applied either to a concrete instance list (non-lazy) or handed to the
  * `LazyDataStore` for on-demand attach (lazy).
  */
-async function readStreamingInstanceIdentity(file: StreamingH5File): Promise<{
+async function readStreamingInstanceIdentity(
+  file: StreamingH5File,
+  labelsPath: string,
+  nIdentities: number,
+): Promise<{
   links: Map<number, [number, number | null]>;
   embs: Map<number, Embedding>;
   catLinks: Map<number, [number, number | null]>;
@@ -1191,30 +1215,36 @@ async function readStreamingInstanceIdentity(file: StreamingH5File): Promise<{
     group: string,
     idxField: string,
     scoreField: string,
+    nCatalog: number,
   ): Promise<Map<number, [number, number | null]>> => {
     const out = new Map<number, [number, number | null]>();
     try {
       if (!rootKeys.includes(group)) return out;
       if (!(await file.getKeys(group)).includes("links")) return out;
-      const cols = await readStructDatasetStreaming(
-        file,
-        `${group}/links`,
-        true,
-      );
-      const ot = cols.owner_type ?? [];
-      const oid = cols.owner_id ?? [];
-      const idx = cols[idxField] ?? [];
-      const sc = cols[scoreField] ?? [];
-      for (let i = 0; i < ot.length; i += 1) {
-        if (Number(ot[i]) !== 0) continue; // OWNER_INSTANCE only
-        const score = Number(sc[i]);
-        out.set(Number(oid[i]), [
-          Number(idx[i]),
-          Number.isNaN(score) ? null : score,
-        ]);
-      }
     } catch {
-      /* optional */
+      return out; // optional
+    }
+    const table = `${group}/links` as ColumnarTableName;
+    const raw = await readRawTableStreaming(file, table, true);
+    const cols = raw.columnar
+      ? normalizeColumnarTable(labelsPath, table, raw)
+      : raw.columns;
+    const ot = cols.owner_type ?? [];
+    const oid = cols.owner_id ?? [];
+    const idx = cols[idxField] ?? [];
+    const sc = cols[scoreField] ?? [];
+    if (raw.columnar && nCatalog > 0 && indexOutOfRange(idx, nCatalog, false)) {
+      reportTableProblems(labelsPath, [
+        `/${table} ${idxField} is not one of the ${nCatalog} catalog entries`,
+      ]);
+    }
+    for (let i = 0; i < ot.length; i += 1) {
+      if (Number(ot[i]) !== 0) continue; // OWNER_INSTANCE only
+      const score = Number(sc[i]);
+      out.set(Number(oid[i]), [
+        Number(idx[i]),
+        Number.isNaN(score) ? null : score,
+      ]);
     }
     return out;
   };
@@ -1271,12 +1301,14 @@ async function readStreamingInstanceIdentity(file: StreamingH5File): Promise<{
       "identity",
       "identity_idx",
       "identity_score",
+      nIdentities,
     ),
     embs: await readOwnerInstanceEmbs("vectors", "owner_type", "owner_id"),
     catLinks: await readOwnerInstanceLinks(
       "categories",
       "category_idx",
       "category_score",
+      categoryCatalog.length,
     ),
     catEmbs: await readOwnerInstanceEmbs(
       "category_vectors",
@@ -1300,6 +1332,10 @@ export async function readSessionsStreaming(
   skeletons: Skeleton[],
   identities?: Identity[],
   captureRaw: boolean = false,
+  context: { labelsPath: string; nFrames: number | null } = {
+    labelsPath: "This file",
+    nFrames: null,
+  },
 ): Promise<RecordingSession[]> {
   try {
     const keys = file.keys();
@@ -1314,7 +1350,12 @@ export async function readSessionsStreaming(
 
     // SLP 2.8 columnar /session_data (read once for all sessions), or null for
     // legacy ≤2.7 files.
-    const sessionData = await readSessionDataStreaming(file);
+    const sessionData = await readSessionDataStreaming(
+      file,
+      context.labelsPath,
+      identities?.length ?? 0,
+      context.nFrames,
+    );
 
     const sessions: RecordingSession[] = [];
     for (const entry of values) {
@@ -1560,26 +1601,27 @@ export async function readSessionsStreaming(
  *
  * `file.keys()` is a root-level snapshot, so the group's child datasets are listed
  * via `getKeys("session_data")`; the struct tables are read through
- * `readStructDatasetStreaming` (with `assumePresent`, since presence is already
+ * `readRawTableStreaming` (with `assumePresent`, since presence is already
  * confirmed), and `points_3d`/`pred_points_3d` + the vlen meta arrays via
  * `getDatasetValue` (whole-read — the tables are small; range-reads can come later).
  */
 async function readSessionDataStreaming(
   file: StreamingH5File,
+  labelsPath: string,
+  nIdentities: number,
+  nFrames: number | null,
 ): Promise<SessionData | null> {
   if (!file.keys().includes("session_data")) return null;
   const children = new Set(await file.getKeys("session_data"));
 
-  const struct = async (
-    name: string,
-  ): Promise<Record<string, unknown[]> | null> => {
+  let allColumnar = true;
+  const struct = async (name: string): Promise<Columns | null> => {
     if (!children.has(name)) return null;
-    const cols = await readStructDatasetStreaming(
-      file,
-      `session_data/${name}`,
-      true,
-    );
-    return Object.keys(cols).length ? cols : null;
+    const table = `session_data/${name}` as ColumnarTableName;
+    const raw = await readRawTableStreaming(file, table, true);
+    allColumnar &&= raw.columnar;
+    if (raw.columnar) return normalizeColumnarTable(labelsPath, table, raw);
+    return Object.keys(raw.columns).length ? raw.columns : null;
   };
   const frameGroups = await struct("frame_groups");
   const instanceGroups = await struct("instance_groups");
@@ -1601,7 +1643,7 @@ async function readSessionDataStreaming(
     return normalizeDatasetArray(d.value);
   };
 
-  return {
+  const sessionData: SessionData = {
     frameGroups,
     instanceGroups,
     members,
@@ -1610,6 +1652,60 @@ async function readSessionDataStreaming(
     frameGroupMeta: await meta("frame_group_meta"),
     instanceGroupMeta: await meta("instance_group_meta"),
   };
+  if (allColumnar) {
+    reportTableProblems(
+      labelsPath,
+      sessionProblems(sessionData, { nIdentities, nFrames }),
+    );
+  }
+  return sessionData;
+}
+
+/**
+ * Read one table into columns, whichever layout it is in. The worker reads a group
+ * of columns (SLP 3.0) as it reads a compound table, and a group is the only thing
+ * with no shape. A failure on a group is thrown: unlike the optional 2.x reads, it
+ * would otherwise open the file as 0 frames.
+ */
+async function readRawTableStreaming(
+  file: StreamingH5File,
+  path: string,
+  assumePresent = false,
+): Promise<RawTable> {
+  if (!assumePresent && !file.keys().includes(path)) {
+    return { columns: {}, columnar: false };
+  }
+  let isGroup = false;
+  try {
+    isGroup = (await file.getDatasetMeta(path)).shape === undefined;
+  } catch {
+    /* read as a dataset, below */
+  }
+  if (!isGroup) {
+    return {
+      columns: await readStructDatasetStreaming(file, path, true),
+      columnar: false,
+    };
+  }
+  const columns = (await file.getDatasetValue(path)).value as Columns;
+  const members = await file.getKeys(path).catch(() => []);
+  return {
+    columns,
+    otherMembers: members.filter((name) => !(name in columns)),
+    columnar: true,
+  };
+}
+
+/** The value of `/provenance_json`, if the file has one (see {@link parseProvenance}). */
+async function readProvenanceStreaming(
+  file: StreamingH5File,
+): Promise<unknown> {
+  try {
+    if (!file.keys().includes("provenance_json")) return undefined;
+    return (await file.getDatasetValue("provenance_json")).value;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1802,6 +1898,8 @@ function buildLabeledFrames(options: {
   tracks: Track[];
   videos: Video[];
   formatId: number;
+  /** Filled with each instance at its `/instances` row (unknown types left out). */
+  instancesByRow?: Array<Instance | PredictedInstance>;
 }): LabeledFrame[] {
   const frames: LabeledFrame[] = [];
   const {
@@ -1813,6 +1911,7 @@ function buildLabeledFrames(options: {
     tracks,
     videos,
     formatId,
+    instancesByRow,
   } = options;
   const frameIds = (framesData.frame_id ?? []) as number[];
   const videoIdToIndex = buildVideoIdMap(framesData, videos);
@@ -1839,6 +1938,8 @@ function buildLabeledFrames(options: {
       const instanceType = Number(
         (instancesData.instance_type as number[])?.[instIdx] ?? 0,
       );
+      // Rows of an unknown type are skipped, as in Python.
+      if (instanceType !== 0 && instanceType !== 1) continue;
       const skeletonId = Number(
         (instancesData.skeleton as number[])?.[instIdx] ?? 0,
       );
@@ -1903,6 +2004,7 @@ function buildLabeledFrames(options: {
       }
 
       instanceById.set(instIdx, instance);
+      if (instancesByRow) instancesByRow[instIdx] = instance;
       instances.push(instance);
     }
 

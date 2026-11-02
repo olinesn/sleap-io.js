@@ -365,7 +365,9 @@ export async function readFromStreamingFile(
   const negativeFrames =
     pose.negativeFrames ??
     negativeFrameKeys(
-      await readStructDatasetStreaming(file, "negative_frames"),
+      file.keys().includes("negative_frames")
+        ? await readStructDatasetStrict(file, "negative_frames")
+        : {},
     );
 
   // Build labeled frames eagerly, or (lazy mode) wrap the columnar tables in a
@@ -1957,8 +1959,12 @@ async function readGroupTableStreaming(
 /**
  * Read one table into columns, whichever layout it is in. The worker reads a group
  * of columns (SLP 3.0) as it reads a compound table, and a group is the only thing
- * with no shape. A failure on a group is thrown: unlike the optional 2.x reads, it
- * would otherwise open the file as 0 frames.
+ * with no shape. A table the file doesn't have reads as no columns, but a failed read
+ * is thrown: it would otherwise open the file with rows missing, for the next save to
+ * make permanent.
+ *
+ * `file.keys()` lists only the root, so a caller that reads a nested table and has
+ * already found it passes `assumePresent`.
  */
 async function readRawTableStreaming(
   file: StreamingH5File,
@@ -1968,19 +1974,13 @@ async function readRawTableStreaming(
   if (!assumePresent && !file.keys().includes(table)) {
     return { columns: {}, columnar: false };
   }
-  let isGroup = false;
-  try {
-    isGroup = await isGroupStreaming(file, table);
-  } catch {
-    /* read as a dataset, below */
+  if (await isGroupStreaming(file, table)) {
+    return readGroupTableStreaming(file, table);
   }
-  if (!isGroup) {
-    return {
-      columns: await readStructDatasetStreaming(file, table, true),
-      columnar: false,
-    };
-  }
-  return readGroupTableStreaming(file, table);
+  return {
+    columns: await readStructDatasetStrict(file, table),
+    columnar: false,
+  };
 }
 
 /**
@@ -2116,26 +2116,9 @@ async function readProvenanceStreaming(
 }
 
 /**
- * Read a structured dataset and normalize to column format. A failed read gives no
- * columns; use {@link readStructDatasetStrict} for a table that must not go missing.
+ * Read a structured dataset that is known to exist, as columns. A failed read is
+ * thrown.
  */
-async function readStructDatasetStreaming(
-  file: StreamingH5File,
-  path: string,
-  assumePresent = false,
-): Promise<Record<string, unknown[]>> {
-  try {
-    // `file.keys()` is a root-level snapshot, so a nested path (e.g.
-    // `session_data/frame_groups`) is never listed there — callers that have
-    // already confirmed presence via `getKeys` pass `assumePresent`.
-    if (!assumePresent && !file.keys().includes(path)) return {};
-    return await readStructDatasetStrict(file, path);
-  } catch {
-    return {};
-  }
-}
-
-/** Read a structured dataset that is known to exist. A failed read is thrown. */
 async function readStructDatasetStrict(
   file: StreamingH5File,
   path: string,
@@ -2147,35 +2130,31 @@ async function readStructDatasetStrict(
   // Matches main-thread reader's getFieldNames (read.ts:1356-1372).
   let fieldNames = getFieldNamesFromMeta(meta);
   if (fieldNames.length === 0) {
-    try {
-      const attrs = await file.getAttrs(path);
-      const fnAttr = attrs.field_names ?? attrs.fieldNames;
-      if (fnAttr) {
-        // Accept an array, a `{value}` wrapper (worker-serialized), or a bare
-        // string/bytes (some backends return the attribute value unwrapped).
-        let raw: unknown = Array.isArray(fnAttr)
-          ? fnAttr
-          : ((fnAttr as { value?: unknown })?.value ?? fnAttr);
-        if (typeof raw === "string") {
-          try {
-            raw = JSON.parse(raw);
-          } catch {
-            /* not JSON */
-          }
-        }
-        if (raw instanceof Uint8Array) {
-          try {
-            raw = JSON.parse(new TextDecoder().decode(raw));
-          } catch {
-            /* not JSON */
-          }
-        }
-        if (Array.isArray(raw)) {
-          fieldNames = raw.map(String);
+    const attrs = await file.getAttrs(path);
+    const fnAttr = attrs.field_names ?? attrs.fieldNames;
+    if (fnAttr) {
+      // Accept an array, a `{value}` wrapper (worker-serialized), or a bare
+      // string/bytes (some backends return the attribute value unwrapped).
+      let raw: unknown = Array.isArray(fnAttr)
+        ? fnAttr
+        : ((fnAttr as { value?: unknown })?.value ?? fnAttr);
+      if (typeof raw === "string") {
+        try {
+          raw = JSON.parse(raw);
+        } catch {
+          /* not JSON */
         }
       }
-    } catch {
-      /* ignore attribute read errors */
+      if (raw instanceof Uint8Array) {
+        try {
+          raw = JSON.parse(new TextDecoder().decode(raw));
+        } catch {
+          /* not JSON */
+        }
+      }
+      if (Array.isArray(raw)) {
+        fieldNames = raw.map(String);
+      }
     }
   }
 

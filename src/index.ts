@@ -22,6 +22,7 @@ export * from "./model/suggestions.js";
 export * from "./model/labels-set.js";
 export * from "./model/camera.js";
 export * from "./model/identity.js";
+export * from "./model/event.js";
 export * from "./model/embedding.js";
 export * from "./model/instance3d.js";
 export * from "./model/lazy.js";
@@ -133,7 +134,10 @@ export {
 } from "./codecs/slp/h5-streaming.js";
 
 // Streaming SLP reader (uses Web Worker, recommended for browser)
-export { readSlpStreaming } from "./codecs/slp/read-streaming.js";
+export {
+  readSlpStreaming,
+  readEventSignaturesStreaming,
+} from "./codecs/slp/read-streaming.js";
 
 // Thrown by every SLP reader for a file too new to read (format 3.0 or above).
 export { UnsupportedSlpFormatError } from "./codecs/slp/parsers.js";

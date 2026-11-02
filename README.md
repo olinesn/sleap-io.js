@@ -20,6 +20,7 @@ JavaScript/TypeScript utilities for reading and writing SLEAP `.slp` files with 
 - Ultralytics YOLO dataset reader/writer (pose, detection, segmentation; Node.js).
 - JABS (Jackson Lab) pose-file reader (predicted poses + static-object ROIs; Node.js).
 - 3D pose data structures with cross-library interop (Python sleap-io, luc3d).
+- Frame-spanning events (behavior bouts and their ethogram) with cross-library interop (SLP format 2.6).
 - Video backends accept `string`, `File`, or `Blob` sources.
 - Browser-safe: Node.js-only dependencies (`skia-canvas`, `child_process`) are dynamically imported, so bundlers can tree-shake them.
 - Dictionary and numpy codecs for interchange.

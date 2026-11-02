@@ -578,6 +578,52 @@ group.instance3d = inst3d;
 labels.identities.push(animal);
 ```
 
+## Events (Behavior Bouts)
+
+An `Event` is an annotation with a duration: a `(video, startFrame, endFrame, type)` interval such as a behavior bout, a stimulus epoch or a review flag. Events live on `labels.events` rather than on any frame, because an event may cover frames with no pose labels. The catalog of types, the "ethogram" for behavior, lives on `labels.eventTypes`. Python sleap-io reads and writes the same data (SLP format 2.6).
+
+```ts
+import { EventType, PredictedEvent, UserEvent } from "@talmolab/sleap-io.js";
+
+const attack = new EventType({
+  name: "attack",
+  description: "One mouse attacks another.",
+  metadata: { color: "#e6194b" }, // string keys and string values
+});
+
+// Both ends are inclusive: this covers frames 100 through 140.
+labels.events.push(
+  new UserEvent({
+    type: attack,
+    video,
+    startFrame: 100,
+    endFrame: 140,
+    subject: mouse1, // a Track or an Identity; null = no individual
+    target: mouse2, // null = not directed at anyone
+  }),
+);
+
+// A bare string makes the type for you. No endFrame means a single frame.
+labels.events.push(new UserEvent({ type: "rear", video, startFrame: 50 }));
+
+// Model output: per-frame scores, one overall score, both, or neither.
+labels.events.push(
+  new PredictedEvent({
+    type: attack,
+    video,
+    startFrame: 200,
+    endFrame: 202,
+    scores: [0.6, 0.9, 0.7],
+    score: 0.74,
+  }),
+);
+
+labels.getEvents({ type: "attack", predicted: false }); // filter by video, subject, type, frameIdx, predicted
+labels.eventsAt(video, 120); // what is happening at this frame?
+```
+
+Saving collects the catalog (one entry per name) and registers any video, track or identity an event uses. A file with no events and no event types is written exactly as before. `labels.copy()`, `labels.merge()`, `replaceVideos` and `removeVideos` all carry events. An in-place save (`checkInPlaceWritable`) refuses when events changed, so the caller falls back to a full re-save.
+
 ## TrackMate CSV Import
 
 Import tracking results from TrackMate (ImageJ/Fiji) CSV exports (Node.js only):

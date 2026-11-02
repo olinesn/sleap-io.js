@@ -47,7 +47,7 @@ describe("readSlpStreaming closes the worker when a read fails", () => {
     { openVideos: true, lazyVideoMetadata: true },
   ]) {
     it(`options ${JSON.stringify(options)}`, async () => {
-      const file = fileWithFormat(3);
+      const file = fileWithFormat(4);
       await expect(readSlpStreaming("mice.slp", options)).rejects.toThrow(
         UnsupportedSlpFormatError,
       );
@@ -56,7 +56,7 @@ describe("readSlpStreaming closes the worker when a read fails", () => {
   }
 
   it("a close that fails does not replace the clear error", async () => {
-    fileWithFormat(3, async () => {
+    fileWithFormat(4, async () => {
       throw new Error("worker close failed");
     });
     await expect(
@@ -66,7 +66,7 @@ describe("readSlpStreaming closes the worker when a read fails", () => {
 
   it("a close that never finishes does not hold the error back", async () => {
     // Nothing times out a message to the worker, so a stuck worker never answers.
-    fileWithFormat(3, () => new Promise<void>(() => {}));
+    fileWithFormat(4, () => new Promise<void>(() => {}));
     await expect(
       readSlpStreaming("mice.slp", { openVideos: true }),
     ).rejects.toThrow(UnsupportedSlpFormatError);
@@ -95,7 +95,7 @@ describe("loadSlp in a browser", () => {
   it("does not retry a file too new to read on the main thread", async () => {
     stubBrowser();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const file = fileWithFormat(3);
+    const file = fileWithFormat(4);
     // A retry would read these bytes, which are not an HDF5 file, and fail with
     // an error about that instead.
     await expect(

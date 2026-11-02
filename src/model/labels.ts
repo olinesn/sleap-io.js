@@ -15,6 +15,7 @@ import { SuggestionFrame } from "./suggestions.js";
 import { Video } from "./video.js";
 import {
   type RecordingSession,
+  FramePositions,
   cloneRecordingSession,
   injectSessionFrameResolver,
 } from "./camera.js";
@@ -731,6 +732,9 @@ export class Labels {
     if (store) {
       this._staticRois = store._undistributedRois;
     }
+
+    // The frames can be edited from here on, so groups stop reading them by position.
+    injectSessionFrameResolver(this);
   }
 
   /**
@@ -1459,6 +1463,8 @@ export class Labels {
         identities: newIdentities,
       });
 
+      // The store's links resolve through its catalog, so it must be the copy's.
+      newStore.identities = labelsCopy.identities;
       labelsCopy._lazyDataStore = newStore;
       labelsCopy._lazyFrameList = newLazyFrames;
       injectSessionFrameResolver(labelsCopy);
@@ -1487,6 +1493,9 @@ export class Labels {
         return nf;
       });
 
+      const positions = this.sessions.length
+        ? new FramePositions(this.labeledFrames)
+        : undefined;
       labelsCopy = new Labels({
         labeledFrames: newFrames,
         videos: newVideos,
@@ -1505,7 +1514,12 @@ export class Labels {
         // Instance/LabeledFrame references onto the copied objects; ref-backed
         // grouping re-resolves via the resolver injected below.
         sessions: this.sessions.map((s) =>
-          cloneRecordingSession(s, { videoMap, frameMap, instanceMap }),
+          cloneRecordingSession(s, {
+            videoMap,
+            frameMap,
+            instanceMap,
+            positions,
+          }),
         ),
         provenance: { ...this.provenance },
         rois: cloneAncillary(this._staticRois),

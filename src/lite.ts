@@ -27,10 +27,20 @@ import {
   getValue,
   isDataset,
   isGroup,
+  type JsfiveGroup,
   type JsfiveSource,
 } from "./codecs/slp/jsfive.js";
 import {
+  type Columns,
+  type ColumnarTableName,
+  normalizeColumnarTable,
+  reportTableProblems,
+  sessionProblems,
+} from "./codecs/slp/columnar.js";
+import {
+  checkSlpFormat,
   parseJsonAttr,
+  parseProvenance,
   parseSkeletons,
   parseTracks,
   parseVideosMetadata,
@@ -55,6 +65,7 @@ export type {
   CameraMetadata,
 } from "./codecs/slp/parsers.js";
 export type { JsfiveSource } from "./codecs/slp/jsfive.js";
+export { UnsupportedSlpFormatError } from "./codecs/slp/parsers.js";
 export { Skeleton, Node, Edge, Symmetry } from "./model/skeleton.js";
 export { Track } from "./model/instance.js";
 
@@ -119,6 +130,8 @@ export interface SlpMetadata {
  * @param options.filename - Filename hint for embedded video paths
  * @returns SlpMetadata object with skeletons, counts, video info
  * @throws Error if the file is not a valid SLP file
+ * @throws {UnsupportedSlpFormatError} If the file is in an SLP format newer than
+ *   this library can read (4.0 or above), or requires a feature it doesn't understand
  *
  * @example
  * ```typescript
@@ -133,19 +146,31 @@ export interface SlpMetadata {
 /**
  * Read the columnar `/session_data` group (SLP 2.8) via jsfive into a
  * backend-agnostic {@link SessionData} for {@link parseSessionsMetadata}, or `null`
- * when the group is absent (legacy ≤2.7). jsfive returns a 2-D dataset's value as a
- * flat plain array + a `shape`, and the `field_names` attribute as a JSON string, so
- * the struct tables are strided into column records here. Whole-reads only (jsfive
- * has no hyperslab slicing); the tables are small and `points_3d` is chunked+gzip.
+ * when the group is absent (legacy ≤2.7). In SLP 3.0 the struct tables are groups of
+ * columns. Before that, jsfive returns a 2-D dataset's value as a flat plain array + a
+ * `shape`, and the `field_names` attribute as a JSON string, so the struct tables are
+ * strided into column records here. Whole-reads only (jsfive has no hyperslab
+ * slicing); the tables are small and `points_3d` is chunked+gzip.
  */
 function readSessionDataJsfive(
   file: ReturnType<typeof openJsfiveFile>,
+  labelsPath: string,
 ): SessionData | null {
   const grp = file.get("session_data");
   if (!grp || !isGroup(grp)) return null;
 
-  const struct = (name: string): Record<string, unknown[]> | null => {
-    const ds = file.get(`session_data/${name}`);
+  let allColumnar = true;
+  const struct = (name: string): Columns | null => {
+    const path = `session_data/${name}`;
+    const ds = file.get(path);
+    if (ds && isGroup(ds)) {
+      return normalizeColumnarTable(
+        labelsPath,
+        path as ColumnarTableName,
+        readGroupColumns(file, path, ds),
+      );
+    }
+    allColumnar = false;
     if (!ds || !isDataset(ds)) return null;
     const flat = getValue(ds) as ArrayLike<number> | null;
     const shape = getShape(ds);
@@ -194,7 +219,7 @@ function readSessionDataJsfive(
     return v != null ? [v] : null;
   };
 
-  return {
+  const sessionData: SessionData = {
     frameGroups,
     instanceGroups,
     members,
@@ -203,6 +228,70 @@ function readSessionDataJsfive(
     frameGroupMeta: meta("frame_group_meta"),
     instanceGroupMeta: meta("instance_group_meta"),
   };
+  if (allColumnar) {
+    reportTableProblems(
+      labelsPath,
+      sessionProblems(sessionData, {
+        nIdentities: getShape(file.get("identity/name"))[0] ?? 0,
+        nFrames: tableRows(file, "frames"),
+      }),
+    );
+  }
+  return sessionData;
+}
+
+/** Read every 1-D dataset of a group as a column (an SLP 3.0 table). */
+function readGroupColumns(
+  file: ReturnType<typeof openJsfiveFile>,
+  path: string,
+  group: JsfiveGroup,
+): { columns: Columns; otherMembers: string[] } {
+  const columns: Columns = {};
+  const otherMembers: string[] = [];
+  for (const name of group.keys) {
+    const child = file.get(`${path}/${name}`);
+    if (!isDataset(child) || getShape(child).length !== 1) {
+      otherMembers.push(name);
+      continue;
+    }
+    // Not getValue: a column that can't be read must not read as a missing column.
+    try {
+      columns[name] = child.value as ArrayLike<unknown>;
+    } catch (e) {
+      throw new Error(`/${path}/${name} can't be read: ${String(e)}`);
+    }
+  }
+  return { columns, otherMembers };
+}
+
+/** A table's row count, from its shape: a group of columns (3.0) has none of its own. */
+function tableRows(
+  file: ReturnType<typeof openJsfiveFile>,
+  path: string,
+): number {
+  const item = file.get(path);
+  if (!item || !isGroup(item)) return getShape(item)[0] ?? 0;
+  for (const name of item.keys) {
+    const shape = getShape(file.get(`${path}/${name}`));
+    if (shape.length === 1) return shape[0];
+  }
+  return 0;
+}
+
+/**
+ * Refuse a file newer than this library can read. Runs before the structure checks,
+ * since a newer layout may not have what they look for; a file with no `/metadata`
+ * is left to them.
+ */
+function checkFileFormat(
+  file: ReturnType<typeof openJsfiveFile>,
+  filename?: string,
+): void {
+  if (!file.keys.includes("metadata")) return;
+  const metadataGroup = file.get("metadata");
+  if (metadataGroup) {
+    checkSlpFormat(getAttrs(metadataGroup), filename);
+  }
 }
 
 export async function loadSlpMetadata(
@@ -212,6 +301,8 @@ export async function loadSlpMetadata(
   const file = openJsfiveFile(source, options?.filename);
 
   try {
+    checkFileFormat(file, options?.filename);
+
     // Verify SLEAP structure
     const requiredKeys = ["metadata", "frames", "instances", "points"];
     for (const key of requiredKeys) {
@@ -227,11 +318,7 @@ export async function loadSlpMetadata(
     }
 
     const metadataAttrs = getAttrs(metadataGroup);
-    const formatId = Number(
-      (metadataAttrs.format_id as { value?: unknown })?.value ??
-        metadataAttrs.format_id ??
-        1.0,
-    );
+    const formatId = checkSlpFormat(metadataAttrs, options?.filename);
     const metadataJson = parseJsonAttr(metadataAttrs.json) as Record<
       string,
       unknown
@@ -297,23 +384,20 @@ export async function loadSlpMetadata(
     const sessions = Array.isArray(sessionsValue)
       ? parseSessionsMetadata(
           sessionsValue,
-          readSessionDataJsfive(file),
+          readSessionDataJsfive(file, labelsPath),
           skeletons,
         )
       : [];
 
-    // Get counts from dataset shapes (works without reading compound values)
-    const framesDs = file.get("frames");
-    const instancesDs = file.get("instances");
-    const pointsDs = file.get("points");
-    const predPointsDs = file.get("pred_points");
-
+    // Get counts from shapes (works without reading compound values)
     const counts = {
-      labeledFrames: getShape(framesDs)[0] ?? 0,
-      instances: getShape(instancesDs)[0] ?? 0,
-      points: getShape(pointsDs)[0] ?? 0,
-      predictedPoints: getShape(predPointsDs)[0] ?? 0,
+      labeledFrames: tableRows(file, "frames"),
+      instances: tableRows(file, "instances"),
+      points: tableRows(file, "points"),
+      predictedPoints: tableRows(file, "pred_points"),
     };
+
+    const provenanceDs = file.get("provenance_json");
 
     // Check for embedded images by looking at video metadata
     const hasEmbeddedImages = videos.some(
@@ -330,9 +414,9 @@ export async function loadSlpMetadata(
       sessions,
       counts,
       hasEmbeddedImages,
-      provenance: metadataJson.provenance as
-        | Record<string, unknown>
-        | undefined,
+      provenance: provenanceDs
+        ? parseProvenance(getValue(provenanceDs), metadataJson)
+        : (metadataJson.provenance as Record<string, unknown> | undefined),
     };
   } finally {
     file.close();
@@ -348,6 +432,8 @@ export async function loadSlpMetadata(
  * @param source - ArrayBuffer or Uint8Array containing the SLP file
  * @returns true if the file is a valid SLP file
  * @throws Error with details if the file is invalid
+ * @throws {UnsupportedSlpFormatError} If the file is in an SLP format newer than
+ *   this library can read (4.0 or above), or requires a feature it doesn't understand
  *
  * @example
  * ```typescript
@@ -363,6 +449,8 @@ export function validateSlpBuffer(source: JsfiveSource): boolean {
   const file = openJsfiveFile(source);
 
   try {
+    checkFileFormat(file);
+
     // Check for required SLEAP structure
     const requiredKeys = ["metadata", "frames", "instances", "points"];
     const missingKeys = requiredKeys.filter((k) => !file.keys.includes(k));

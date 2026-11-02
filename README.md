@@ -11,7 +11,7 @@ JavaScript/TypeScript utilities for reading and writing SLEAP `.slp` files with 
 
 ## Features
 
-- SLP read/write with format compatibility (format 1.0–2.2, including embedded frames via HDF5 video datasets).
+- SLP read/write with format compatibility (reads format 1.0–3.x, writes the 2.x layout, including embedded frames via HDF5 video datasets).
 - Browser-compatible SLP writing via `saveSlpToBytes()`.
 - Streaming-friendly file access (URL, `File`, `FileSystemFileHandle`, `Blob`).
 - Core data model (`Labels`, `LabeledFrame`, `Instance`, `Skeleton`, `Video`, `Centroid`, `Identity`, `Instance3D`, etc.).

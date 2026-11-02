@@ -3,6 +3,7 @@ import { LabelsSet } from "../model/labels-set.js";
 import { Video } from "../model/video.js";
 import { readSlp, readSlpLazy } from "../codecs/slp/read.js";
 import { readSlpStreaming } from "../codecs/slp/read-streaming.js";
+import { UnsupportedSlpFormatError } from "../codecs/slp/parsers.js";
 import { writeSlp, saveSlpToBytes } from "../codecs/slp/write.js";
 import { createVideoBackend, type VideoBackendType } from "../video/factory.js";
 import {
@@ -40,7 +41,10 @@ function isBrowserWithWorkerSupport(): boolean {
  * Load a SLEAP labels file (.slp).
  *
  * Automatically selects the best loading strategy:
- * - Browser with Worker support: uses streaming reader via Web Worker
+ * - Browser with Worker support: uses streaming reader via Web Worker. If that
+ *   fails, a path, URL or byte buffer is retried with the standard reader, and for
+ *   a File or FileSystemFileHandle the failure is thrown as it is. To read a picked
+ *   file on the main thread, pass `h5: { stream: "download" }`.
  * - Node.js or fallback: uses standard HDF5 reader
  *
  * @param source - Path to .slp file, ArrayBuffer, Uint8Array, File, or FileSystemFileHandle
@@ -54,6 +58,8 @@ function isBrowserWithWorkerSupport(): boolean {
  *   paths (streaming, eager, and lazy); the final call is (total, total,
  *   "Finalizing"). Stage counts differ by path (streaming is finer-grained).
  * @returns Loaded Labels object
+ * @throws {UnsupportedSlpFormatError} If the file is in an SLP format newer than
+ *   this library can read (4.0 or above), or requires a feature it doesn't understand.
  */
 export async function loadSlp(
   source: SlpSource,
@@ -64,7 +70,15 @@ export async function loadSlp(
     onProgress?: (current: number, total: number, message?: string) => void;
   },
 ): Promise<Labels> {
-  const streamMode = options?.h5?.stream ?? "auto";
+  const requestedMode = options?.h5?.stream ?? "auto";
+  // A picked file stays with the Worker, which reads only the ranges it needs. A
+  // retry on the main thread would take the whole file into memory to reach the same
+  // answer, and could replace that answer with an out-of-memory error.
+  const isPickedFile =
+    (typeof File !== "undefined" && source instanceof File) ||
+    (typeof source === "object" && "getFile" in source);
+  const streamMode =
+    requestedMode === "auto" && isPickedFile ? "range" : requestedMode;
   const openVideos = options?.openVideos ?? true;
   const lazy = options?.lazy ?? false;
 
@@ -97,7 +111,12 @@ export async function loadSlp(
           lazy,
         });
       } catch (e) {
-        if (streamMode === "auto") {
+        // A file too new to read fails the same way on every reader, so a retry on
+        // the main thread would only read the whole file first.
+        if (
+          streamMode === "auto" &&
+          !(e instanceof UnsupportedSlpFormatError)
+        ) {
           // Redact: the raw error can embed ?token= / userinfo (a remote URL).
           console.warn(
             "[sleap-io] Worker-based loading failed, falling back to main thread:",

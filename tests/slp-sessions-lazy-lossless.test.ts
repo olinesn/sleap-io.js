@@ -177,6 +177,7 @@ describe("Lossless lazy-native sessions (#197)", () => {
       eager.skeletons,
       undefined,
       false,
+      undefined,
       eager.labeledFrames.map((lf) => lf.frameIdx),
     );
     const streamedLabels = new Labels({
@@ -455,6 +456,7 @@ describe("Frame numbers of SLEAP's own multi-view groups", () => {
       eager.skeletons,
       undefined,
       false,
+      undefined,
       eager.labeledFrames.map((lf) => lf.frameIdx),
     );
     const labels = new Labels({ videos: eager.videos, sessions });

@@ -161,7 +161,7 @@ describe("a file HDF5 can't open says so", () => {
 
   it("the Worker says the same words, for every way it opens a file", () => {
     expect(H5_WORKER_CODE).not.toContain("keys: currentFile.keys()");
-    const start = H5_WORKER_CODE.indexOf("function keysOfOpenedFile()");
+    const start = H5_WORKER_CODE.indexOf("function keysOfOpenedFile(");
     const end = H5_WORKER_CODE.indexOf("\n}\n", start) + 3;
     const check = new Function(
       "currentFile",

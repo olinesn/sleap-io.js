@@ -1027,6 +1027,7 @@ export class StreamingH5Writer {
    * structure from {@link saveSlpStructureToBytes}, WITHOUT embedded images) and
    * opened append-mode; call {@link appendEmbeddedVideos} afterwards to copy the
    * big `video{i}/video` datasets from source to dest, then {@link close}.
+   * `sourceFilename` is only what an error calls the source; by default, its name.
    */
   async openAppendOpfs(
     destOpfsPath: string,

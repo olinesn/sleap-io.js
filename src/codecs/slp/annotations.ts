@@ -386,18 +386,33 @@ export interface ScoreMapTable {
 }
 
 /**
- * Decompress score maps. Returns a Map from annotation index to
- * { scoreMap, height, width }.
+ * Decompress score maps. Returns a Map from annotation index to its map, size, scale and
+ * offset (the last two default to 1 and 0: this library's older files don't have them).
  */
 function buildScoreMaps(
   table: "masks/score_maps" | "label_images/score_maps",
   index: ScoreMapTable | null,
   nOwners: number,
   labelsPath: string,
-): Map<number, { scoreMap: Float32Array; height: number; width: number }> {
+): Map<
+  number,
+  {
+    scoreMap: Float32Array;
+    height: number;
+    width: number;
+    scale: [number, number];
+    offset: [number, number];
+  }
+> {
   const result = new Map<
     number,
-    { scoreMap: Float32Array; height: number; width: number }
+    {
+      scoreMap: Float32Array;
+      height: number;
+      width: number;
+      scale: [number, number];
+      offset: [number, number];
+    }
   >();
   if (!index) return result;
 
@@ -407,6 +422,10 @@ function buildScoreMaps(
   const ends = indexData.data_end ?? [];
   const smHeights = indexData.height ?? [];
   const smWidths = indexData.width ?? [];
+  const scaleXCol = indexData.scale_x ?? [];
+  const scaleYCol = indexData.scale_y ?? [];
+  const offsetXCol = indexData.offset_x ?? [];
+  const offsetYCol = indexData.offset_y ?? [];
   const dataFlat = index.data;
 
   if (index.columnar) {
@@ -443,7 +462,19 @@ function buildScoreMaps(
       ),
     );
 
-    result.set(annotIdx, { scoreMap, height: h, width: w });
+    result.set(annotIdx, {
+      scoreMap,
+      height: h,
+      width: w,
+      scale: [
+        scaleXCol.length > i ? Number(scaleXCol[i]) : 1,
+        scaleYCol.length > i ? Number(scaleYCol[i]) : 1,
+      ],
+      offset: [
+        offsetXCol.length > i ? Number(offsetXCol[i]) : 0,
+        offsetYCol.length > i ? Number(offsetYCol[i]) : 0,
+      ],
+    });
   }
   return result;
 }
@@ -573,6 +604,9 @@ export function buildMasks(
         ...baseOptions,
         score: scoreVal,
         scoreMap: sm?.scoreMap ?? null,
+        scoreMapScale: sm?.scale,
+        scoreMapOffset: sm?.offset,
+        _scoreMapSize: sm && [sm.height, sm.width],
       });
     } else {
       mask = new UserSegmentationMask(baseOptions);
@@ -856,6 +890,9 @@ export function buildLabelImages(
         source: sources[i] ?? "",
         score: liScore,
         scoreMap: sm?.scoreMap ?? null,
+        scoreMapScale: sm?.scale,
+        scoreMapOffset: sm?.offset,
+        _scoreMapSize: sm && [sm.height, sm.width],
         scale: liScale,
         offset: liOffset,
       });

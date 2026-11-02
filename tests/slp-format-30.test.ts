@@ -267,6 +267,9 @@ function annotationSnapshot(labels: Labels) {
       m.offset,
       m.fromPredicted?.name ?? null,
       m.scoreMap ? Array.from(m.scoreMap) : null,
+      m.scoreMapScale,
+      m.scoreMapOffset,
+      m._scoreMapSize,
       perDetection(m),
       link(m),
     ]),
@@ -294,6 +297,9 @@ function annotationSnapshot(labels: Labels) {
       li.offset,
       Array.from(li.data),
       li.scoreMap ? Array.from(li.scoreMap) : null,
+      li.scoreMapScale,
+      li.scoreMapOffset,
+      li._scoreMapSize,
       [...li.objects.entries()].map(([id, o]: any) => [
         id,
         o.name,
@@ -1114,7 +1120,7 @@ const isLinks = (value: unknown): boolean =>
   (value[2] === null || Array.isArray(value[2]));
 
 describe("annotations through the streaming reader", () => {
-  /** A file as `saveSlpToBytes` writes it: flat tables, strings as JSON bytes. */
+  /** A file as `saveSlpToBytes` writes it: compound tables, boxes as columns. */
   const jsWritten = async (): Promise<ArrayBuffer> => {
     const labels = await readSlp(fixture("handbuilt_30_gzip.slp"), {
       openVideos: false,
@@ -1187,6 +1193,29 @@ describe("annotations through the streaming reader", () => {
       expect(annotationSnapshot(streamed)).toEqual(annotationSnapshot(read));
     });
   }
+
+  it("a saved score map keeps its own size, scale and offset", async () => {
+    quietWarnings();
+    const labels = await readSlp(fixture("py_written_annotations.slp"), {
+      openVideos: false,
+    });
+    const saved = new Uint8Array(await saveSlpToBytes(labels))
+      .buffer as ArrayBuffer;
+    for (const read of [
+      await readSlp(saved.slice(0), { openVideos: false }),
+      await readStreaming(saved.slice(0)),
+    ]) {
+      const owners: any[] = [...read.masks, ...read.labelImages].filter(
+        (owner: any) => owner.scoreMap,
+      );
+      expect(owners.length).toBe(2);
+      for (const owner of owners) {
+        expect(owner._scoreMapSize).toEqual([4, 6]);
+        expect(owner.scoreMapScale).toEqual([2, 2]);
+        expect(owner.scoreMapOffset).toEqual([1, 1]);
+      }
+    }
+  });
 
   const ANNOTATION_PATH =
     /^(rois|roi_|masks|mask_|bboxes|bbox_|label_image|centroid)/;

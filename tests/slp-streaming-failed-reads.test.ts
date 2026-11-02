@@ -58,7 +58,7 @@ const saved = async () =>
     ),
   );
 
-/** Saved from a lazy project: every table flat. */
+/** Saved from a lazy project: every pose table flat. */
 const savedLazy = async () => {
   const labels = await readSlpLazy(fixture(PYTHON_2X), { openVideos: false });
   return bufferOf(await saveSlpMergedFromStores([labels._lazyDataStore!]));

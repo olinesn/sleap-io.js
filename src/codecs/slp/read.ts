@@ -1667,8 +1667,9 @@ function readBboxes(
 ): Routed<BoundingBox>[] {
   const bboxesDs = file.get("bboxes");
   if (!bboxesDs) return [];
-  // Python has written /bboxes as a group of columns since format 2.0; sleap-io.js
-  // writes a flat matrix with sibling string datasets.
+  // Python (since format 2.0) and current JS: a group of columns. Older JS: a flat
+  // matrix with sibling string datasets. Python before 2.0: a compound table of centered
+  // boxes, with its strings in attributes.
   const columnar = isH5Group(bboxesDs);
   const rows = columnar
     ? (normalizeColumnarTable(

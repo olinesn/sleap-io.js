@@ -143,18 +143,7 @@ describe("Python compatibility (#76)", () => {
       expectFixedString(file.get("points"), "field_names");
 
       expectFixedString(file.get("rois"), "field_names");
-
-      // v1.9+: string metadata stored as root-level datasets with "json" attribute
-      expectFixedString(file.get("roi_categories"), "json");
-      expectFixedString(file.get("roi_names"), "json");
-      expectFixedString(file.get("roi_sources"), "json");
-      expectFixedString(file.get("mask_categories"), "json");
-      expectFixedString(file.get("mask_names"), "json");
-      expectFixedString(file.get("mask_sources"), "json");
-
-      expectFixedString(file.get("bbox_categories"), "json");
-      expectFixedString(file.get("bbox_names"), "json");
-      expectFixedString(file.get("bbox_sources"), "json");
+      expectFixedString(file.get("masks"), "field_names");
     } finally {
       file.close();
       module.FS.unlink(memPath);

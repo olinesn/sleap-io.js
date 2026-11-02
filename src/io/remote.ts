@@ -40,7 +40,15 @@ export const SENSITIVE_HEADERS = new Set([
 
 /**
  * Query-param names (lowercased) whose VALUE is masked to `***` in
- * {@link redactUrl}. Other params are left untouched.
+ * {@link redactUrl} and {@link redactUrlsInText}. Other params are left untouched,
+ * so a message still says which file failed and when its signature expires
+ * (`X-Amz-Expires`, `X-Goog-Date`, `Expires`, `se`).
+ *
+ * A name that's only sometimes a secret is still listed (`key` can be an ordinary
+ * param). In a message that costs little: the caller has the URL, and what's requested
+ * doesn't change.
+ *
+ * Python's `_SENSITIVE_QUERY_PARAMS` has only the first five.
  */
 export const SENSITIVE_QUERY_PARAMS = new Set([
   "token",
@@ -48,6 +56,23 @@ export const SENSITIVE_QUERY_PARAMS = new Set([
   "x-amz-security-token",
   "sas",
   "sig",
+  // Signed URLs: S3 and anything S3-compatible, then Cloud Storage. A credential
+  // or access ID says whose key signed it: an AWS key ID, a service account's email.
+  "x-amz-signature",
+  "x-amz-credential",
+  "awsaccesskeyid",
+  "x-goog-signature",
+  "x-goog-credential",
+  "googleaccessid",
+  // S3's and Cloud Storage's older signed URLs, and CloudFront's.
+  "signature",
+  // Backblaze B2's own signed URLs, under the same name as the header.
+  "authorization",
+  // API keys. Google's APIs take theirs as `key`.
+  "key",
+  "api_key",
+  "apikey",
+  "api-key",
 ]);
 
 /** HTTP status codes that {@link withRetries} treats as retryable. */
@@ -64,12 +89,24 @@ const URL_IN_TEXT_PATTERN =
  * Matches a sensitive query param and its value anywhere in text, URL or no URL: a
  * space or quote ends what {@link URL_IN_TEXT_PATTERN} can see of a URL, a browser
  * shortens a long one, and a name cut from one (`y.slp?token=...`) no longer looks
- * like one. The `#` is for the same param in a fragment.
+ * like one. The `#` is for the same param in a fragment. Each name is taken as plain
+ * text, whatever it holds.
  */
 const SENSITIVE_PARAM_PATTERN = new RegExp(
-  `([?&#](?:${[...SENSITIVE_QUERY_PARAMS].join("|")})=)[^\\s"'<>&#]*[^\\s"'<>&#.,;:!?)]`,
+  `([?&#](?:${[...SENSITIVE_QUERY_PARAMS]
+    .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|")})=)[^\\s"'<>&#]*[^\\s"'<>&#.,;:!?)]`,
   "gi",
 );
+
+/**
+ * Matches the end of a URL as Chromium quotes one over 1 KB: its first 511 characters,
+ * `...`, then its last 510. That end can start partway through a long value, like a
+ * Cloud Storage signature or a session token, whose name went with the middle, so
+ * nothing about it says it's a secret. Any run of 256 characters or more counts, which
+ * no single file name can be.
+ */
+const SHORTENED_URL_END_PATTERN = /\.\.\.[^\s"'<>]{255,}[^\s"'<>.,;:!?)]/g;
 
 /**
  * Whether `value` looks like a remote URL (one of {@link URL_SCHEMES}).
@@ -141,10 +178,12 @@ export function redactUrl(url: string): string {
 
 /**
  * `text` with credentials masked in every URL it quotes (see {@link redactUrl}), and
- * in whatever is left of a URL it can't recognize as one.
+ * in whatever is left of a URL it can't recognize as one. All of what follows the cut
+ * in a URL a browser shortened is masked.
  */
 export function redactUrlsInText(text: string): string {
   return text
+    .replace(SHORTENED_URL_END_PATTERN, "...***")
     .replace(SENSITIVE_PARAM_PATTERN, "$1***")
     .replace(URL_IN_TEXT_PATTERN, (m) => redactUrl(m));
 }

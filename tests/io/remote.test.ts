@@ -1,4 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "../bun-test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   isUrl,
   isGdriveUrl,
@@ -7,6 +11,7 @@ import {
   redactUrlsInText,
   redactedCauseSummary,
   RemoteIOError,
+  SENSITIVE_QUERY_PARAMS,
   statusToMessage,
   identityHeaders,
   stripCrossOriginHeaders,
@@ -14,6 +19,56 @@ import {
   headOrRangeProbe,
   urlBasename,
 } from "../../src/io/remote.js";
+import { SIGNED_QUERIES, shownPart, signedQuery } from "../signed-url-fixtures";
+
+/** Every name on the list. Spelled out, so taking one off fails a test. */
+const SENSITIVE_NAMES = [
+  "token",
+  "access_token",
+  "x-amz-security-token",
+  "sas",
+  "sig",
+  "x-amz-signature",
+  "x-amz-credential",
+  "awsaccesskeyid",
+  "x-goog-signature",
+  "x-goog-credential",
+  "googleaccessid",
+  "signature",
+  "authorization",
+  "key",
+  "api_key",
+  "apikey",
+  "api-key",
+];
+
+/** Params that only look like credentials, or say what a failure needs said. */
+const ORDINARY_NAMES = [
+  "monkey",
+  "keys",
+  "keyframe",
+  "key_frame",
+  "primary_key",
+  "signatures",
+  "signature_version",
+  "mysig",
+  "X-Amz-Algorithm",
+  "X-Amz-Date",
+  "X-Amz-Expires",
+  "X-Amz-SignedHeaders",
+  "X-Goog-Algorithm",
+  "X-Goog-Date",
+  "X-Goog-Expires",
+  "X-Goog-SignedHeaders",
+  "Expires",
+  "Key-Pair-Id",
+  "Hash-Algorithm",
+  "se",
+  "sp",
+  "sv",
+  "sr",
+  "alt",
+];
 
 describe("isUrl", () => {
   it("recognizes remote schemes", () => {
@@ -123,15 +178,39 @@ describe("redactUrl", () => {
   });
 
   it("masks each known sensitive param", () => {
-    for (const p of [
-      "token",
-      "access_token",
-      "x-amz-security-token",
-      "sas",
-      "sig",
-    ]) {
+    for (const p of SENSITIVE_NAMES) {
       const out = redactUrl(`https://h/x?${p}=zzz`);
       expect(out).not.toContain("zzz");
+    }
+  });
+
+  it("masks them in any case, in a query or a fragment", () => {
+    for (const p of SENSITIVE_NAMES) {
+      for (const name of [p, p.toUpperCase()]) {
+        const url = `https://h/x?keep=1&${name}=zzz&also=2#a=1&${name}=zzz&b=2`;
+        const out = redactUrl(url);
+        expect(out).not.toContain("zzz");
+        expect(out).toContain("keep=1");
+        expect(out).toContain("also=2");
+        expect(out).toContain(`#a=1&${name}=***&b=2`);
+      }
+    }
+  });
+
+  it("masks every credential in a signed URL, and leaves the rest", () => {
+    for (const scheme of ["https://h/x?", "s3://h/x?", "gs://h/x?"]) {
+      for (const { query, secrets, kept } of SIGNED_QUERIES) {
+        const out = redactUrl(`${scheme}${query}`);
+        expect(shownPart(out, secrets)).toBeNull();
+        for (const param of kept) expect(out).toContain(param);
+      }
+    }
+  });
+
+  it("leaves a param that only looks like a credential", () => {
+    for (const name of ORDINARY_NAMES) {
+      const url = `https://h/x?${name}=zzz#${name}=zzz`;
+      expect(redactUrl(url)).toBe(url);
     }
   });
 
@@ -219,6 +298,13 @@ describe("redactUrlsInText", () => {
       "?mytoken=abc",
       "?tokens=abc",
       "?a=token",
+      "key=abc",
+      "?key",
+      "?a=key",
+      ...ORDINARY_NAMES.map((name) => `y.slp?${name}=abc`),
+      ...ORDINARY_NAMES.map(
+        (name) => `https://h/x?a=1&${name}=abc#${name}=abc`,
+      ),
     ]) {
       expect(redactUrlsInText(text)).toBe(text);
     }
@@ -254,16 +340,110 @@ describe("redactUrlsInText", () => {
 
   it("masks each sensitive name, in any case", () => {
     for (const name of [
-      "token",
-      "TOKEN",
+      ...SENSITIVE_NAMES,
+      ...SENSITIVE_NAMES.map((n) => n.toUpperCase()),
       "Access_Token",
-      "x-amz-security-token",
-      "SAS",
-      "sig",
+      "X-Amz-Signature",
+      "X-Goog-Credential",
+      "GoogleAccessId",
+      "AWSAccessKeyId",
+      "Signature",
+      "Key",
     ]) {
       const out = redactUrlsInText(`y.slp?${name}=abc&keep=1`);
       expect(out).toBe(`y.slp?${name}=***&keep=1`);
     }
+  });
+
+  it("masks every credential in a signed URL it quotes, and leaves the rest", () => {
+    for (const { query, secrets, kept } of SIGNED_QUERIES) {
+      for (const text of [
+        `Couldn't load https://h/x?${query}. Status: 403`,
+        `Failed to load 'https://h/x?${query}'.`,
+        `name=a b&${query}`,
+        `y.slp?${query}`,
+      ]) {
+        const out = redactUrlsInText(text);
+        expect(shownPart(out, secrets)).toBeNull();
+        for (const param of kept) expect(out).toContain(param);
+      }
+      expect(
+        redactUrlsInText(`Couldn't load https://h/x?${query}. Status: 403`),
+      ).toEndWith(". Status: 403");
+    }
+  });
+
+  describe("a URL a browser shortened", () => {
+    /** As Chromium quotes a URL over 1 KB. */
+    const shorten = (url: string) =>
+      `${url.slice(0, 511)}...${url.slice(-510)}`;
+    const cloudStorage = signedQuery("Cloud Storage");
+
+    it("masks the end of a value whose name went with the middle", () => {
+      const url = `https://h/${"a".repeat(600)}/y.slp?${cloudStorage.query}`;
+      const quoted = shorten(url);
+      expect(quoted).not.toContain("X-Goog-Signature");
+      expect(shownPart(quoted, cloudStorage.secrets)).not.toBeNull();
+
+      const out = redactUrlsInText(`Failed to load '${quoted}'.`);
+      expect(shownPart(out, cloudStorage.secrets)).toBeNull();
+      expect(out).toEndWith("...***'.");
+      expect(out).toStartWith(`Failed to load 'https://h/${"a".repeat(400)}`);
+    });
+
+    it("whichever part of the URL the cut falls in", () => {
+      for (const { query, secrets } of SIGNED_QUERIES) {
+        // Every place the cut can fall, around every param.
+        for (let padding = 0; padding < 1500; padding += 7) {
+          const url = `https://h/${"a".repeat(padding)}?${query}`;
+          if (url.length <= 1024) continue;
+          const out = redactUrlsInText(`Failed to load '${shorten(url)}'.`);
+          expect(shownPart(out, secrets)).toBeNull();
+          // What's left of the last param may have gained an `=` from redactUrl.
+          expect(out).toMatch(/\*\*\*=?'\.$/);
+        }
+      }
+    });
+
+    it("still masks what's before the cut", () => {
+      const url = `https://me:abc@h/y.slp?sig=abc&a=${"b".repeat(1500)}`;
+      const out = redactUrlsInText(`Failed to load '${shorten(url)}'.`);
+      expect(out).not.toContain("abc");
+      expect(out).toContain("sig=***");
+      expect(out).toContain("https://***:***@h/y.slp");
+    });
+
+    it("needs a run too long to be anything but the end of a URL", () => {
+      const end = (length: number) => "x".repeat(length);
+      for (const text of [`a...${end(255)}`, `a... ${end(1000)}`, "a...b"]) {
+        expect(redactUrlsInText(text)).toBe(text);
+      }
+      expect(redactUrlsInText(`a...${end(256)}`)).toBe("a...***");
+      expect(redactUrlsInText(`a...${end(510)}`)).toBe("a...***");
+    });
+
+    it("every one in the text", () => {
+      const quoted = `https://h/a...${"x".repeat(510)}`;
+      expect(redactUrlsInText(`'${quoted}' and '${quoted}'`)).toBe(
+        "'https://h/a...***' and 'https://h/a...***'",
+      );
+    });
+
+    it("leaves what ends the sentence", () => {
+      const quoted = `https://h/a...${"x".repeat(510)}`;
+      for (const [before, after] of [
+        ["'", "'."],
+        ['"', '".'],
+        ["(", ")."],
+        ["at ", "."],
+        ["at ", ", then"],
+        ["at ", " then"],
+      ]) {
+        expect(redactUrlsInText(`${before}${quoted}${after}`)).toBe(
+          `${before}https://h/a...***${after}`,
+        );
+      }
+    });
   });
 
   it("masks a value holding what a URL can hold", () => {
@@ -277,6 +457,89 @@ describe("redactUrlsInText", () => {
   it("masks a token in a fragment", () => {
     const out = redactUrlsInText("at https://h/x#a=1&token=abc. Done");
     expect(out).toBe("at https://h/x#a=1&token=***. Done");
+  });
+});
+
+describe("SENSITIVE_QUERY_PARAMS", () => {
+  it("holds the names, lowercased, that its users expect", () => {
+    expect([...SENSITIVE_QUERY_PARAMS].sort()).toEqual(
+      [...SENSITIVE_NAMES].sort(),
+    );
+    for (const name of SENSITIVE_QUERY_PARAMS) {
+      expect(name).toBe(name.toLowerCase());
+    }
+  });
+
+  it("every name on it counts everywhere", () => {
+    for (const name of SENSITIVE_QUERY_PARAMS) {
+      expect(redactUrl(`https://h/x?${name}=zzz`)).not.toContain("zzz");
+      expect(redactUrl(`https://h/x#${name}=zzz`)).toBe(
+        `https://h/x#${name}=***`,
+      );
+      expect(redactUrlsInText(`a b?${name}=zzz c`)).toBe(`a b?${name}=*** c`);
+      expect(redactUrlsInText(`a b&${name}=zzz c`)).toBe(`a b&${name}=*** c`);
+      expect(redactUrlsInText(`a b#${name}=zzz c`)).toBe(`a b#${name}=*** c`);
+    }
+  });
+
+  // The pattern is built as the file loads, so this loads a copy of the file with these
+  // names on its list.
+  it("a name is plain text, whatever it holds", async () => {
+    const names = [
+      "a.b",
+      "c(d",
+      "e)f",
+      "g+h",
+      "i*j",
+      "k?l",
+      "m|n",
+      "[o",
+      "p]",
+      "{q}",
+      "r^s",
+      "$t",
+      "u\\v",
+    ];
+    const source = readFileSync(
+      fileURLToPath(new URL("../../src/io/remote.ts", import.meta.url)),
+      "utf8",
+    );
+    const list = "SENSITIVE_QUERY_PARAMS = new Set([";
+    expect(source).toContain(list);
+    const dir = mkdtempSync(join(tmpdir(), "remote-list-"));
+    try {
+      const copy = join(dir, "remote.ts");
+      writeFileSync(
+        copy,
+        source.replace(
+          list,
+          () => `${list}${JSON.stringify(names).slice(1, -1)},`,
+        ),
+      );
+      const loaded = await import(copy);
+      for (const name of names) {
+        expect(loaded.redactUrlsInText(`a b&${name}=zzz c`)).toBe(
+          `a b&${name}=*** c`,
+        );
+        expect(
+          loaded.redactUrl(`https://h/x?${encodeURIComponent(name)}=zzz`),
+        ).not.toContain("zzz");
+      }
+      // What those would mean in a pattern doesn't count.
+      for (const text of [
+        "?aXb=zzz",
+        "?gggh=zzz",
+        "?j=zzz",
+        "?l=zzz",
+        "?m=zzz",
+        "?n=zzz",
+        "?o=zzz",
+      ]) {
+        expect(loaded.redactUrlsInText(text)).toBe(text);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

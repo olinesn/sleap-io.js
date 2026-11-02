@@ -33,6 +33,7 @@ import { PredictedInstance, Track } from "../model/instance.js";
 import { LabeledFrame } from "../model/labeled-frame.js";
 import { Skeleton } from "../model/skeleton.js";
 import { Video } from "../model/video.js";
+import { maskUrlCredentials, maskUrlCredentialsDeep } from "./remote.js";
 import {
   openH5File,
   getH5Module,
@@ -776,7 +777,9 @@ export function toAnalysisArrays(
 ): AnalysisArrays {
   const lfs = labels.find({ video });
   if (!lfs.length) {
-    throw new Error(`No labeled frames in video: ${video.filename}`);
+    throw new Error(
+      `No labeled frames in video: ${maskUrlCredentialsDeep(video.filename)}`,
+    );
   }
 
   const frameIdxs = lfs.map((lf) => lf.frameIdx).sort((a, b) => a - b);
@@ -1232,11 +1235,13 @@ export async function writeLabelsToBytes(
     // Scalar metadata datasets.
     f.create_dataset({
       name: "labels_path",
-      data: options?.labelsPath ? String(options.labelsPath) : "",
+      data: options?.labelsPath
+        ? maskUrlCredentials(String(options.labelsPath))
+        : "",
     });
     f.create_dataset({
       name: "video_path",
-      data: videoFilenameString(video) || "",
+      data: maskUrlCredentials(videoFilenameString(video) || ""),
     });
     f.create_dataset({
       name: "video_ind",
@@ -1246,7 +1251,7 @@ export async function writeLabelsToBytes(
     });
     f.create_dataset({
       name: "provenance",
-      data: JSON.stringify(labels.provenance ?? {}),
+      data: JSON.stringify(maskUrlCredentialsDeep(labels.provenance ?? {})),
     });
 
     // File-level attributes (root). Always written for format identification.
@@ -1261,7 +1266,7 @@ export async function writeLabelsToBytes(
       setRootAttr(
         f,
         "video_backend_metadata",
-        JSON.stringify(video.backendMetadata ?? {}),
+        JSON.stringify(maskUrlCredentialsDeep(video.backendMetadata ?? {})),
       );
     }
   } finally {

@@ -82,7 +82,11 @@ import {
   posixBasename,
 } from "../../video/path-resolve.js";
 import { getFsResolver } from "../../model/matching.js";
-import { isUrl } from "../../io/remote.js";
+import {
+  isUrl,
+  maskUrlCredentials,
+  redactUrlsInText,
+} from "../../io/remote.js";
 import { CropVideoBackend } from "../../video/crop-backend.js";
 import { resolveSourceFrameCount } from "./frame-count.js";
 import type { CropRect } from "../../transform/points.js";
@@ -849,9 +853,9 @@ async function readVideos(
         // while unable to read a single frame (issue #213). Record the reason so
         // consumers can surface a locate/repair affordance instead of silently
         // rendering blank frames.
-        const firstStored = Array.isArray(filename)
-          ? (filename[0] ?? "")
-          : filename;
+        const firstStored = maskUrlCredentials(
+          Array.isArray(filename) ? (filename[0] ?? "") : filename,
+        );
         backendError = {
           kind: "image-sequence",
           message:
@@ -891,7 +895,9 @@ async function readVideos(
                 : isImageSource(filename)
                   ? "image-sequence"
                   : "decode",
-            message: err instanceof Error ? err.message : String(err),
+            message: redactUrlsInText(
+              err instanceof Error ? err.message : String(err),
+            ),
           };
         }
       }

@@ -156,6 +156,11 @@ export interface VideoBackendError {
 }
 
 export class Video {
+  /**
+   * Where the video is. A URL keeps its credentials here, because {@link exists} and
+   * apps go back to it. A save masks them (`maskUrlCredentials`), so a URL that needs
+   * them doesn't open from a saved file.
+   */
   filename: string | string[];
   backend: VideoBackend | null;
   /** Set when the backend failed to open during load (then `backend` is null). */
